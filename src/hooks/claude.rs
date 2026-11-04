@@ -2021,20 +2021,26 @@ pub(crate) enum StdioTurnEndOutcome {
 /// The last check rests on how Claude writes stdout, as checked on 2.1.309.
 /// It hands a turn's result to stdout before it runs the next turn's prompt
 /// hook: it holds results back only once its input has closed, when no
-/// prompt can follow. Its stdout writes whatever is queued as soon as the
-/// pipe has room, not awaiting the write, so a frame can wait unwritten only
-/// while the pipe is full. The copy counts a read as having emptied the pipe
-/// only when it took less than the pipe holds, so that nothing was waiting
-/// then; a frame read later was produced after `emitted_after`, and the next
-/// turn's prompt event, stamped later still, is seen. The current turn's own
+/// prompt can follow. It hands each frame to stdout at once, never awaiting
+/// the write, and its runtime, Bun 1.4.4, keeps what the pipe refused in one
+/// buffer, later frames behind it, and writes that whole buffer in one call
+/// as soon as the pipe has room. A pipe refuses a short write before it is
+/// full (one of at most PIPE_BUF bytes is taken whole or not at all, and
+/// Linux counts room in pages), so the copy counts a read as having emptied
+/// the pipe only when it left room for any write the pipe might have
+/// refused, or, if it ended at a line's end, once the pipe has then stayed
+/// empty for 2 s, while Bun writes what waits within milliseconds of a read
+/// that empties the pipe: nothing was waiting when that read began. A frame
+/// read later was produced after `emitted_after`, and the next turn's
+/// prompt event, stamped later still, is seen. The current turn's own
 /// prompt or delivery commits before its hook exits, and Claude writes the
-/// turn's `init` frame and output only after that (its `running` state comes
-/// before the hook); a read that empties the pipe after one of those moves
-/// the copy's empty time past the commit. When none did, as when the copy
-/// read the whole turn at once, the check cannot tell the turn's own prompt
-/// from the next one's: the turn end is deferred, leaving the status as the
-/// hooks set it until it is reconciled. Tool contexts and blocked states
-/// start no turn and never defer one.
+/// turn's `init` frame and output only after that (its `running` state
+/// comes before the hook); a read that empties the pipe after one of those
+/// moves the copy's empty time past the commit. When none did, as when the
+/// copy read the whole turn at once, the check cannot tell the turn's own
+/// prompt from the next one's: the turn end is deferred, leaving the status
+/// as the hooks set it until it is reconciled. Tool contexts and blocked
+/// states start no turn and never defer one.
 pub(crate) fn record_stdio_turn_end(
     db: &HcomDb,
     process_id: &str,
@@ -2045,24 +2051,26 @@ pub(crate) fn record_stdio_turn_end(
 
 /// Record a turn end [`record_stdio_turn_end`] deferred, once the copy has
 /// read through it (and through the idle frame after a result) and then
-/// found Claude's pipe empty and not full, at a line's end, with no frame of
-/// a later turn read in between: no `session_state_changed` other than
-/// idle, `system/init`, message, stream event or further result. The write
-/// transaction and its guards are the same, but the turn-start check counts
-/// from `read_at`, when the copy began the read that took the frame: the
-/// turn's own prompt was recorded before that (a copy stalled at that very
-/// point for the turn's whole run only leaves the turn end unrecorded), and
-/// a later turn's prompt after.
+/// found Claude's pipe empty with nothing waiting to be written, at a line's
+/// end, with no frame of a later turn read in between: no
+/// `session_state_changed` other than idle, `system/init`, message, stream
+/// event or further result. The write transaction and its guards are the
+/// same, but the turn-start check counts from `read_at`, when the copy began
+/// the read that took the frame: the turn's own prompt was recorded before
+/// that (a copy stalled at that very point for the turn's whole run only
+/// leaves the turn end unrecorded), and a later turn's prompt after.
 ///
 /// The latter rests on the writer model above and on one more fact of
 /// Claude 2.1.309: with session state events on, it writes `running` at the
 /// top of its loop, before the turn's prompt hook. The read that found the
-/// pipe empty, and not full, shows that Claude had nothing waiting to be
-/// written when that read began, no earlier than `read_at`. A later turn
-/// that had started by then would have had its `running` frame in the pipe,
-/// and the copy would have read it before finding the pipe empty; none came,
-/// so a later turn's prompt hook ran after that read began, and its prompt
-/// or delivery is seen. Without session state events, a later turn writes
+/// pipe empty left room for any write the pipe might have refused, or was
+/// followed by 2 s of an empty pipe, in which Claude would have written
+/// anything waiting, which shows that it had nothing waiting to be written
+/// when that read began, no earlier than `read_at`. A later turn that had
+/// started by then would have had its `running` frame in the pipe, and the
+/// copy would have read it before finding the pipe empty; none came, so a
+/// later turn's prompt hook ran after that read began, and its prompt or
+/// delivery is seen. Without session state events, a later turn writes
 /// nothing before its prompt hook, so the recorder reconciles only a child
 /// that has written a session state frame. Returns whether it recorded it;
 /// a refusal is final.

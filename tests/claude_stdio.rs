@@ -160,7 +160,7 @@ fn claude_stdio_cancelled_turn_becomes_listening_and_stdout_is_byte_exact() {
     let next = |kind: &str| -> Value {
         loop {
             let line = lines
-                .recv_timeout(Duration::from_secs(60))
+                .recv_timeout(Duration::from_secs(300))
                 .unwrap_or_else(|_| panic!("no {kind} frame\n{}", h.diagnostics()));
             if let Ok(frame) = serde_json::from_str::<Value>(&line)
                 && frame["type"] == kind
@@ -913,7 +913,10 @@ emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
 hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
 : > "$PWD/transcript.jsonl"
 hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
-emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+# Over 16 KiB: macOS grows the pipe for it to 64 KiB, what Linux pipes hold from
+# the start, and reports that, so that a read can show the pipe empty at once.
+tools=$(head -c 20000 /dev/zero | tr '\0' t)
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\",\"tools\":\"$tools\"}"
 IFS= read -r line
 hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
 emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"running\",\"session_id\":\"$sid\"}"
@@ -971,7 +974,7 @@ exit 0
     let next = |what: &str, matches: &dyn Fn(&Value) -> bool| -> Value {
         loop {
             let line = lines
-                .recv_timeout(Duration::from_secs(60))
+                .recv_timeout(Duration::from_secs(300))
                 .unwrap_or_else(|_| panic!("no {what} frame\n{}", h.diagnostics()));
             if let Ok(frame) = serde_json::from_str::<Value>(&line)
                 && matches(&frame)
@@ -1002,8 +1005,10 @@ exit 0
     );
     next("marker", &|frame| frame["subtype"] == "marker");
     let delivered = locked.elapsed();
+    // The old copy waited out the recorder's 5 s busy timeout before writing on; a loaded host
+    // can take a few seconds to schedule the shim, so the bound sits between the two.
     assert!(
-        delivered < Duration::from_secs(2),
+        delivered < Duration::from_secs(4),
         "frames after the result waited {delivered:?} for the database"
     );
     assert_eq!(
@@ -1011,8 +1016,8 @@ exit 0
         "prompt",
         "recorded through the lock"
     );
-    // Release well inside the recorder's busy timeout.
-    std::thread::sleep(Duration::from_millis(2500).saturating_sub(locked.elapsed()));
+    // Release inside the recorder's busy timeout (a busy refusal would be retried anyway).
+    std::thread::sleep(Duration::from_millis(4500).saturating_sub(locked.elapsed()));
     room.execute_batch("COMMIT").unwrap();
     let interrupted = Some((
         "listening".to_string(),
@@ -1094,6 +1099,11 @@ struct StalledTurn {
 
 impl StalledTurn {
     fn start(h: &Hcom) -> Self {
+        Self::start_with(h, WHOLE_TURN_CLAUDE, &[])
+    }
+
+    /// [`Self::start`] with another stand-in and its own settings.
+    fn start_with(h: &Hcom, script: &str, settings: &[(&str, &str)]) -> Self {
         use std::os::fd::AsFd;
 
         let copy = h.root_path().join("native-stdout");
@@ -1105,7 +1115,8 @@ impl StalledTurn {
             ("FAKE_WROTE_NEXT", next_written.to_str().unwrap()),
             ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
         ]);
-        install_fake_claude(h, WHOLE_TURN_CLAUDE);
+        h.set_launch_envs(settings);
+        install_fake_claude(h, script);
         let (client, sink) = std::io::pipe().unwrap();
         let filler = sink.try_clone().unwrap();
         let mut hcom = h
@@ -1290,6 +1301,248 @@ fn claude_stdio_turn_read_whole_behind_a_stalled_client_keeps_a_prompt_sent_befo
     assert_eq!(
         contexts_from_the_first_prompt(&h),
         ["prompt", "prompt", "exit:0"]
+    );
+}
+
+/// A stand-in for how Claude 2.1.309 writes stdout, which the shell shims
+/// cannot play: it hands each frame to Bun's stdout at once and never waits
+/// for it, and Bun 1.4.4 writes without blocking, keeps what the pipe
+/// refuses in one buffer with later frames behind it, and writes that whole
+/// buffer in one call whenever the pipe has room. Hooks and stdin are served
+/// while frames wait. As with [`WHOLE_TURN_CLAUDE`], the client takes nothing
+/// from before the turn's prompt hook to its last frame: one frame of
+/// exactly 64 KiB, which hcom's copy takes in one read and is then blocked
+/// on, leaves the pipe empty for the turn's frames. `FAKE_TAIL` says how
+/// those leave the pipe:
+/// - `refused_after_idle`: after the idle frame, status frames the size of a
+///   `running` frame until the pipe refuses one, which is dropped, so that
+///   the next turn's `running` frame waits;
+/// - `refused_before_result`: the same before the control response, so that
+///   the cancelled turn's result waits, with what follows it;
+/// - `exact`: they end at the idle frame's newline exactly at the pipe's
+///   capacity, in pages that Linux fills whole.
+///
+/// A next prompt runs its hook while frames wait, and the next turn's own
+/// frames follow once the client has read on.
+const BUN_CLAUDE: &str = r##"#!/usr/bin/env python3
+import fcntl, json, os, select, struct, subprocess, sys, termios, threading, time
+if sys.argv[1:2] == ["--version"]:
+    print("2.1.309 (Claude Code)")
+    sys.exit(0)
+SID = "2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e"
+TAIL = os.environ["FAKE_TAIL"]
+LINUX = sys.platform.startswith("linux")
+OUT = 1
+fcntl.fcntl(OUT, fcntl.F_SETFL, fcntl.fcntl(OUT, fcntl.F_GETFL) | os.O_NONBLOCK)
+out = bytearray()
+lock = threading.Condition()
+
+def frame(obj):
+    return json.dumps(obj, separators=(",", ":")).encode() + b"\n"
+
+def record(data):
+    with open(os.environ["FAKE_STDOUT_COPY"], "ab") as copy:
+        copy.write(data)
+
+def flush():
+    # The whole buffer in one call, again as long as the pipe takes part.
+    while out:
+        try:
+            del out[:os.write(OUT, bytes(out))]
+        except BlockingIOError:
+            break
+    lock.notify_all()
+
+def flusher():
+    while True:
+        with lock:
+            while not out:
+                lock.wait()
+        select.select([], [OUT], [])
+        # Far slower than Bun's few milliseconds, well within hcom's 2 s.
+        time.sleep(0.3)
+        with lock:
+            flush()
+
+threading.Thread(target=flusher, daemon=True).start()
+
+def emit(obj):
+    data = frame(obj)
+    record(data)
+    with lock:
+        out.extend(data)
+        flush()
+
+def emit_if_taken(obj):
+    # Written whole (it is short) if the pipe takes it now, else dropped.
+    data = frame(obj)
+    with lock:
+        if out:
+            return False
+        try:
+            os.write(OUT, data)
+        except BlockingIOError:
+            return False
+    record(data)
+    return True
+
+def flushed():
+    with lock:
+        while out:
+            lock.wait()
+
+def in_pipe():
+    if LINUX:
+        return struct.unpack("i", fcntl.ioctl(OUT, termios.FIONREAD, b"\0" * 4))[0]
+    return os.fstat(OUT).st_size
+
+def hook(name, payload):
+    subprocess.run([os.environ["FAKE_HCOM"], name], input=json.dumps(payload).encode(),
+                   stdout=subprocess.DEVNULL)
+
+def state(name):
+    return {"type": "system", "subtype": "session_state_changed", "state": name, "session_id": SID}
+
+def sized(size):
+    # A status frame of `size` bytes: it neither ends a turn nor starts one.
+    padded = {"type": "system", "subtype": "status", "session_id": SID, "pad": ""}
+    padded["pad"] = "s" * (size - len(frame(padded)))
+    return padded
+
+cwd = os.getcwd()
+open(cwd + "/transcript.jsonl", "w").close()
+hook("sessionstart", {"session_id": SID, "transcript_path": cwd + "/transcript.jsonl", "cwd": cwd,
+                      "hook_event_name": "SessionStart", "source": "startup"})
+emit({"type": "system", "subtype": "hook_response", "session_id": SID})
+stdin = sys.stdin.buffer
+stdin.readline()
+emit(sized(65536))
+with lock:
+    assert not out, "the pipe did not take 64 KiB at once"
+while in_pipe():
+    time.sleep(0.01)
+running = state("running")
+init = {"type": "system", "subtype": "init", "session_id": SID}
+assistant = {"type": "assistant", "session_id": SID}
+emit(running)
+hook("userpromptsubmit", {"session_id": SID, "hook_event_name": "UserPromptSubmit", "prompt": "one"})
+emit(init)
+emit(assistant)
+stdin.readline()
+control = {"type": "control_response", "response": {"subtype": "success", "request_id": "stop-1"}}
+result = {"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": SID,
+          "terminal_reason": "aborted_streaming", "queued_turn_count": 0}
+end = [control, result, state("idle")]
+if TAIL == "refused_before_result":
+    while emit_if_taken(sized(len(frame(running)))):
+        pass
+if TAIL == "exact":
+    page = os.sysconf("SC_PAGE_SIZE") if LINUX else 4096
+    capacity = fcntl.fcntl(OUT, getattr(fcntl, "F_GETPIPE_SZ", 1032)) if LINUX else 65536
+    held = sum(len(frame(f)) for f in (running, init, assistant))
+    emit(sized(page - held + (capacity // page - 2) * page))
+    emit(sized(page - sum(len(frame(f)) for f in end)))
+for f in end:
+    emit(f)
+if TAIL == "exact":
+    with lock:
+        assert not out and in_pipe() == capacity, "the turn's frames did not fill the pipe"
+if TAIL == "refused_after_idle":
+    while emit_if_taken(sized(len(frame(running)))):
+        pass
+open(os.environ["FAKE_WROTE"], "w").close()
+if stdin.readline():
+    emit(state("running"))
+    hook("userpromptsubmit", {"session_id": SID, "hook_event_name": "UserPromptSubmit", "prompt": "two"})
+    flushed()
+    emit(init)
+    emit({"type": "assistant", "session_id": SID, "turn": 2})
+    open(os.environ["FAKE_WROTE_NEXT"], "w").close()
+    while stdin.readline():
+        pass
+flushed()
+"##;
+
+/// The cancelled turn's frames end exactly at the pipe's capacity, at the
+/// idle frame's newline: hcom takes them in one read that fills its buffer
+/// to what the pipe holds, which cannot show that Claude had nothing more
+/// waiting, and Claude then writes nothing more. Once the pipe has stayed
+/// empty longer than Claude takes to write what waits for room, the turn
+/// settles, with Claude still waiting on an open stdin and no new prompt.
+#[test]
+fn claude_stdio_turn_read_whole_to_the_pipe_capacity_settles_once_drained() {
+    let h = Hcom::new();
+    let mut turn = StalledTurn::start_with(&h, BUN_CLAUDE, &[("FAKE_TAIL", "exact")]);
+    assert_eq!(only_status(&h).unwrap().1, "prompt");
+    turn.read_through(WHOLE_TURN_IDLE);
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    // Bounded from the drain: 2 s of an empty pipe, then the recorder.
+    h.eventually(
+        "the cancelled turn to settle once drained",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+    assert!(
+        turn.hcom.try_wait().unwrap().is_none(),
+        "Claude stopped waiting on stdin"
+    );
+    turn.finish(&h);
+    assert_eq!(
+        contexts_from_the_first_prompt(&h),
+        ["prompt", "interrupted", "exit:0"]
+    );
+}
+
+/// The client sends the next prompt before it reads on, and that turn's
+/// `running` frame, short enough to be written whole or not at all, waits
+/// in Claude's buffer while its prompt hook commits: the pipe has less room
+/// than the frame needs, though it is not full. The read that takes what
+/// the pipe held cannot show it empty, so the deferred turn end waits for
+/// that frame and is dropped.
+#[test]
+fn claude_stdio_turn_read_whole_keeps_a_prompt_whose_running_frame_waited_for_room() {
+    stalled_turn_keeps_the_next_prompt("refused_after_idle");
+}
+
+/// As above, but the cancelled turn's result waits too: the read that takes
+/// what the pipe held cannot show the result written after the next
+/// prompt, so the turn end is deferred rather than recorded, then dropped
+/// at the `running` frame behind it.
+#[test]
+fn claude_stdio_turn_end_that_waited_for_room_keeps_a_prompt_sent_before_the_drain() {
+    stalled_turn_keeps_the_next_prompt("refused_before_result");
+}
+
+fn stalled_turn_keeps_the_next_prompt(tail: &str) {
+    let h = Hcom::new();
+    let mut turn = StalledTurn::start_with(&h, BUN_CLAUDE, &[("FAKE_TAIL", tail)]);
+    turn.send(serde_json::json!({"type": "user", "message": {"role": "user", "content": "two"}}));
+    // Only preconditions: a loaded host may take long to run the hook.
+    h.eventually("the next prompt hook", Duration::from_secs(300), || {
+        let prompts = status_contexts(&h)
+            .iter()
+            .filter(|context| *context == "prompt")
+            .count();
+        Ok((prompts == 2).then_some(()))
+    });
+    // Claude writes the next turn's own frames once the client reads on.
+    turn.read_through(WHOLE_TURN_NEXT);
+    // Long enough for the recorder to have applied either frame.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        only_status(&h),
+        Some(("active".to_string(), "prompt".to_string(), String::new())),
+        "tail={tail}"
+    );
+    turn.finish(&h);
+    assert_eq!(
+        contexts_from_the_first_prompt(&h),
+        ["prompt", "prompt", "exit:0"],
+        "tail={tail}"
     );
 }
 
