@@ -138,12 +138,18 @@ fn drain_stdout(
     tx: std::sync::mpsc::SyncSender<Drained>,
     budget: usize,
     stop: Arc<AtomicBool>,
+    wait: Waiter,
 ) {
     let mut chunk = [0u8; DRAIN_CHUNK];
     let mut sent = 0usize;
     loop {
-        if !wait_readable(&out, &stop) {
-            return;
+        match wait(&out, &stop) {
+            Wait::Ready => {}
+            Wait::Stopped => return,
+            Wait::Failed => {
+                let _ = tx.send(Drained::Failed);
+                return;
+            }
         }
         match out.read(&mut chunk) {
             Ok(0) => {
@@ -169,29 +175,49 @@ fn drain_stdout(
     }
 }
 
-/// Wait until `out` has data, EOF or an error to report, checking `stop` every
-/// 50 ms. Returns false once `stop` is set.
+/// What a wait on the shell's stdout ended with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// Data, EOF or a hang-up: a read answers without blocking.
+    Ready,
+    /// The resolver asked the drain to stop.
+    Stopped,
+    /// The wait itself failed, so nothing is known about readiness.
+    Failed,
+}
+
+/// How the drain waits for stdout; a test can substitute a failing wait.
+type Waiter = fn(&std::process::ChildStdout, &AtomicBool) -> Wait;
+
+/// Wait until `out` has data, EOF or a hang-up to report, checking `stop`
+/// every 50 ms. A poll error other than EINTR says nothing about readiness,
+/// and a read taken on it could block on a quiet pipe with no way to cancel
+/// it, so it is reported as a failure instead of being read through.
 #[cfg(unix)]
-fn wait_readable(out: &std::process::ChildStdout, stop: &AtomicBool) -> bool {
+fn wait_readable(out: &std::process::ChildStdout, stop: &AtomicBool) -> Wait {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::AsFd;
     loop {
         if stop.load(Ordering::Relaxed) {
-            return false;
+            return Wait::Stopped;
         }
         let mut fds = [PollFd::new(out.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(50u16)) {
             Ok(0) => continue,
+            Ok(_) => return Wait::Ready,
             Err(nix::errno::Errno::EINTR) => continue,
-            // Readable, hung up or in error: the read answers without blocking.
-            Ok(_) | Err(_) => return true,
+            Err(_) => return Wait::Failed,
         }
     }
 }
 
 #[cfg(not(unix))]
-fn wait_readable(_out: &std::process::ChildStdout, stop: &AtomicBool) -> bool {
-    !stop.load(Ordering::Relaxed)
+fn wait_readable(_out: &std::process::ChildStdout, stop: &AtomicBool) -> Wait {
+    if stop.load(Ordering::Relaxed) {
+        Wait::Stopped
+    } else {
+        Wait::Ready
+    }
 }
 
 /// The drain thread and the parent's handles on it.
@@ -203,12 +229,20 @@ struct Drain {
 
 impl Drain {
     fn start(out: std::process::ChildStdout, budget: usize) -> std::io::Result<Self> {
+        Self::start_with(out, budget, wait_readable)
+    }
+
+    fn start_with(
+        out: std::process::ChildStdout,
+        budget: usize,
+        wait: Waiter,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(DRAIN_QUEUE_CHUNKS);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("hcom-shell-env-drain".to_string())
-            .spawn(move || drain_stdout(out, tx, budget, flag))?;
+            .spawn(move || drain_stdout(out, tx, budget, flag, wait))?;
         Ok(Self { rx, stop, handle })
     }
 
@@ -223,13 +257,27 @@ impl Drain {
     }
 }
 
-/// Whether `stdout` ends the way a complete capture does: with the closing
-/// marker right after the NUL that terminates the last `env -0` entry. A
-/// capture cut inside the marker variable's own value also ends with the
-/// marker bytes, but after `=`, so it is not mistaken for the close.
+/// Whether `stdout` holds a complete marker-framed environment: the opening
+/// marker and, after it, the closing marker right after the NUL that
+/// terminates the last `env -0` entry. Text after that close (an EXIT trap, a
+/// logout message) does not matter: the parser skips it. A capture cut inside
+/// the marker variable's own value has the marker bytes after `=`, not after a
+/// NUL, so it is not mistaken for the close.
 fn output_is_complete(stdout: &[u8], marker: &str) -> bool {
     let m = marker.as_bytes();
-    stdout.len() > m.len() && stdout.ends_with(m) && stdout[stdout.len() - m.len() - 1] == 0
+    let Some(first) = find_bytes(stdout, m) else {
+        return false;
+    };
+    let body = &stdout[first + m.len()..];
+    let mut from = 0;
+    while let Some(rel) = find_bytes(&body[from..], m) {
+        let at = from + rel;
+        if at > 0 && body[at - 1] == 0 {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }
 
 fn timed_shell_output(shell: &Path, cmd: &str, marker: &str) -> Option<ShellOutput> {
@@ -343,6 +391,9 @@ fn timed_shell_output_bounded(
                 break Verdict::Fail;
             }
             if eof || (at.elapsed() >= EXIT_GRACE && output_is_complete(&stdout, marker)) {
+                // A frame accepted here is complete and within the budget as
+                // collected; a budget crossing or read error the drain may still
+                // report concerns bytes after the frame, which are never used.
                 break Verdict::Complete;
             }
         }
@@ -684,32 +735,51 @@ mod tests {
     }
 
     /// A stand-in for the login shell for the drain tests: accepts `-lic <cmd>`
-    /// and runs the command with `/bin/sh -c`, reading no profile. Returned
-    /// with the directory that keeps it alive.
+    /// and runs the command with `/bin/sh -c`, reading no profile. One per test
+    /// process, executed once on creation: on a loaded macOS host a freshly
+    /// written executable can sit in first-launch validation for over a minute
+    /// (70 s measured on 2026-11-04), and that wait belongs to no test.
     #[cfg(unix)]
-    fn fake_shell() -> (PathBuf, tempfile::TempDir) {
+    fn fake_shell() -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fakesh");
-        fs::write(
-            &path,
-            "#!/bin/sh\n[ \"$1\" = -lic ] || exit 97\nexec /bin/sh -c \"$2\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        (path, dir)
+        use std::sync::OnceLock;
+        static SHELL: OnceLock<(PathBuf, tempfile::TempDir)> = OnceLock::new();
+        SHELL
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("fakesh");
+                fs::write(
+                    &path,
+                    "#!/bin/sh\n[ \"$1\" = -lic ] || exit 97\nexec /bin/sh -c \"$2\"\n",
+                )
+                .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                let status = Command::new(&path)
+                    .args(["-lic", "exit 0"])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "fake shell warm-up: {status}");
+                (path, dir)
+            })
+            .0
+            .clone()
     }
+
+    /// Generous: the resolver's own 10 s is the production bound; here only
+    /// the capture matters, and the host may be slow.
+    #[cfg(unix)]
+    const TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
     /// `timed_shell_output_bounded` through the fake shell with an empty HOME.
     #[cfg(unix)]
     fn fake_shell_output(cmd: &str, marker: &str, capacity: usize) -> Option<ShellOutput> {
-        let (shell, _dir) = fake_shell();
+        let shell = fake_shell();
         let home = tempfile::tempdir().unwrap();
         timed_shell_output_bounded(
             &shell,
             cmd,
             marker,
-            Duration::from_secs(30),
+            TEST_TIMEOUT,
             capacity,
             Some(home.path()),
         )
@@ -789,7 +859,7 @@ mod tests {
 
         assert!(output.is_none());
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < TEST_TIMEOUT / 5,
             "rejected by the timeout, not the budget: {elapsed:?}"
         );
         let pid: i32 = fs::read_to_string(&pid_file)
@@ -823,19 +893,20 @@ mod tests {
     #[test]
     fn resolver_returns_after_exit_when_a_background_job_keeps_stdout_open() {
         let marker = "hcom-shell-env-background-test";
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("job-done");
         let cmd = format!(
-            "(sleep 5) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"; exit 0"
+            "(sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"; exit 0",
+            done = done.display()
         );
 
-        let started = std::time::Instant::now();
         let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
         let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
 
         assert!(env.contains_key("PATH"));
         assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "the resolver waited for the background job: {:?}",
-            started.elapsed()
+            !done.exists(),
+            "the resolver returned only after the background job had finished"
         );
     }
 
@@ -927,11 +998,69 @@ mod tests {
         );
     }
 
+    /// A poll error is not readiness: the drain reports failure at once instead
+    /// of entering a read that nothing could cancel while a descendant keeps the
+    /// pipe quiet and open.
+    #[cfg(unix)]
+    #[test]
+    fn drain_reports_a_poll_error_as_failure_instead_of_reading() {
+        fn poll_fails(_: &std::process::ChildStdout, _: &AtomicBool) -> Wait {
+            Wait::Failed
+        }
+        let mut child = piped_child("(sleep 3) & exit 0");
+        let drain =
+            Drain::start_with(child.stdout.take().unwrap(), MAX_SHELL_OUTPUT, poll_fails).unwrap();
+        let _ = child.wait();
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            drain.rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Drained::Failed
+        ));
+        drain.finish();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the reader was not joined promptly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A login shell's EXIT trap or logout text after the closing marker, with a
+    /// background job still holding stdout: no EOF ever comes, and the complete
+    /// frame must still be accepted promptly.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_accepts_a_complete_frame_followed_by_shell_noise() {
+        let marker = "hcom-shell-env-noise-test";
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("job-done");
+        let cmd = format!(
+            "trap 'printf tail' EXIT; (sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"; exit 0",
+            done = done.display()
+        );
+
+        let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+        assert!(
+            output.stdout.ends_with(b"tail"),
+            "the trap's output was captured"
+        );
+        assert!(
+            !done.exists(),
+            "the resolver returned only after the background job had finished"
+        );
+    }
+
     #[test]
     fn output_is_complete_requires_the_closing_marker_after_a_nul() {
         let marker = "hcom-shell-env-m";
         let complete = format!("{marker}A=1\0{MARKER_VAR}={marker}\0{marker}");
         assert!(output_is_complete(complete.as_bytes(), marker));
+        // Trailing shell noise after the close is a complete capture.
+        let noisy = format!("{complete}tail\nlogout");
+        assert!(output_is_complete(noisy.as_bytes(), marker));
         // Cut inside the marker variable's value: ends with the marker bytes
         // after `=`, not after a NUL.
         let truncated = format!("{marker}A=1\0{MARKER_VAR}={marker}");
