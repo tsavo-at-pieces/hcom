@@ -1468,10 +1468,21 @@ impl Drop for CodexHookInspectionChild {
     }
 }
 
-#[cfg(any(not(test), unix))]
+#[cfg(not(test))]
 fn read_codex_hook_list_from_child(
     child: std::process::Child,
     cwd: &Path,
+) -> Result<Vec<CodexHookListEntry>, String> {
+    read_codex_hook_list_with_response_reader(child, cwd, read_jsonrpc_response)
+}
+
+// Keep the phase-specific deadline selection in the real exchange, while
+// allowing tests to observe it without waiting for a production timeout.
+#[cfg(any(not(test), unix))]
+fn read_codex_hook_list_with_response_reader(
+    child: std::process::Child,
+    cwd: &Path,
+    mut read_response: impl FnMut(&mpsc::Receiver<String>, i64, Duration) -> Result<Value, String>,
 ) -> Result<Vec<CodexHookListEntry>, String> {
     let mut child = CodexHookInspectionChild(child);
     let stderr_buf = child
@@ -1512,7 +1523,7 @@ fn read_codex_hook_list_from_child(
         }
     });
     writeln!(stdin, "{initialize}").map_err(|e| e.to_string())?;
-    read_jsonrpc_response(&rx, 1, CODEX_APP_SERVER_STARTUP_TIMEOUT)
+    read_response(&rx, 1, CODEX_APP_SERVER_STARTUP_TIMEOUT)
         .map_err(|e| with_app_server_stderr(e, &stderr_buf))?;
 
     writeln!(
@@ -1529,7 +1540,7 @@ fn read_codex_hook_list_from_child(
     writeln!(stdin, "{request}").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())?;
 
-    let response = read_jsonrpc_response(&rx, 2, CODEX_APP_SERVER_TIMEOUT)
+    let response = read_response(&rx, 2, CODEX_APP_SERVER_TIMEOUT)
         .map_err(|e| with_app_server_stderr(e, &stderr_buf));
     drop(stdin);
     parse_codex_hook_list_entries(&response?)
@@ -1749,6 +1760,14 @@ mod tests {
     fn run_hook_inspection_fixture(
         script: &str,
     ) -> (Result<Vec<CodexHookListEntry>, String>, bool) {
+        run_hook_inspection_fixture_with_response_reader(script, read_jsonrpc_response)
+    }
+
+    #[cfg(unix)]
+    fn run_hook_inspection_fixture_with_response_reader(
+        script: &str,
+        read_response: impl FnMut(&mpsc::Receiver<String>, i64, Duration) -> Result<Value, String>,
+    ) -> (Result<Vec<CodexHookListEntry>, String>, bool) {
         let dir = tempfile::tempdir().unwrap();
         let child = std::process::Command::new("/bin/sh")
             .args(["-c", script])
@@ -1760,7 +1779,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as libc::pid_t;
-        let result = read_codex_hook_list_from_child(child, dir.path());
+        let result = read_codex_hook_list_with_response_reader(child, dir.path(), read_response);
         // waitpid must report no remaining child: this distinguishes reaping
         // from merely signalling a process and leaving a zombie behind.
         let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
@@ -1808,6 +1827,26 @@ mod tests {
         );
         assert_eq!(result.unwrap(), Vec::new());
         assert!(reaped, "successful inspection left the child unreaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_uses_startup_budget_then_query_budget() {
+        let mut waits = Vec::new();
+        let (result, reaped) = run_hook_inspection_fixture_with_response_reader(
+            r#"read -r request; printf '%s\n' '{"id":1,"result":{}}'; read -r notification; read -r request; printf '%s\n' '{"id":2,"result":{"data":[{"hooks":[]}]}}'; exec /bin/sleep 30"#,
+            |rx, id, timeout| {
+                waits.push((id, timeout));
+                read_jsonrpc_response(rx, id, timeout)
+            },
+        );
+        assert_eq!(result.unwrap(), Vec::new());
+        assert!(reaped, "successful inspection left the child unreaped");
+        assert_eq!(
+            waits,
+            vec![(1, Duration::from_secs(60)), (2, Duration::from_secs(10))],
+            "initialize includes wrapper startup; hooks/list keeps the shorter query budget"
+        );
     }
 
     fn per_run_ctx(args: &[&str], home: &Path) -> LaunchCtx {

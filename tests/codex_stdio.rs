@@ -32,6 +32,8 @@ if os.environ.get('HCOM_LAUNCHED') != '1':
             print(json.dumps({'id': request['id'], 'result': {'data': [{'hooks': hooks}]}}), flush=True)
     sys.exit(0)
 assert not os.isatty(0) and not os.isatty(1), 'unexpected PTY'
+if os.environ.get('FIXTURE_EARLY_EXIT'):
+    sys.exit(int(os.environ['FIXTURE_EARLY_EXIT']))
 if os.environ.get('FIXTURE_RETARGET_LINK'):
     os.unlink(os.environ['FIXTURE_RETARGET_LINK'])
     os.symlink(os.environ['FIXTURE_DECOY'], os.environ['FIXTURE_RETARGET_LINK'])
@@ -101,6 +103,91 @@ fn assert_clean(h: &Hcom) {
     assert_eq!(count, 0, "native exit left a registered instance");
     let actor: String = db.query_row("SELECT instance FROM events WHERE json_extract(data, '$.action') = 'batch_launched' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     assert_eq!(actor, "pezu");
+}
+
+#[test]
+fn codex_stdio_attributes_early_exit_and_cleans_up_before_session_start() {
+    let h = Hcom::new();
+    let record = fixture(&h);
+    h.set_launch_env("FIXTURE_EARLY_EXIT", "9");
+    let output = h
+        .cmd()
+        // The supervisor may inherit these from an unrelated parent launch.
+        .env("HCOM_LAUNCHED_BY", "stale-launcher")
+        .env("HCOM_LAUNCH_BATCH_ID", "stale-batch")
+        .args([
+            "codex",
+            "--stdio",
+            "--run-here",
+            "--go",
+            "--name",
+            "pezu",
+            "--tag",
+            "acc",
+            "--",
+            "app-server",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(9), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        !record.exists(),
+        "the fixture must exit before SessionStart"
+    );
+
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    let rows: Vec<(String, Value)> = db
+        .prepare(
+            "SELECT instance, data FROM events WHERE type = 'life'
+               AND json_extract(data, '$.action') IN ('batch_launched', 'launch_failed')
+             ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                serde_json::from_str(&row.get::<_, String>(1)?).unwrap(),
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let (launched_instance, launched) = &rows[0];
+    let (failed_instance, failed) = &rows[1];
+    assert_eq!(launched["action"], "batch_launched", "{rows:?}");
+    assert_eq!(launched_instance, "pezu");
+    assert_eq!(launched["by"], "pezu");
+    assert_eq!(launched["tool"], "codex");
+    assert_eq!(launched["tag"], "acc");
+    assert_eq!(launched["stdio"], true);
+    let batch = launched["batch_id"].as_str().unwrap();
+    assert!(!batch.is_empty());
+    assert_ne!(batch, "stale-batch");
+    assert!(!failed_instance.is_empty());
+    assert_eq!(launched["instances"], serde_json::json!([failed_instance]));
+    assert_eq!(failed["action"], "launch_failed");
+    assert_eq!(failed["by"], "pezu");
+    assert_eq!(failed["batch_id"], batch);
+    assert_eq!(failed["reason"], "exited_before_ready");
+    let notice: String = db
+        .query_row(
+            "SELECT json_extract(data, '$.text') FROM events
+             WHERE type = 'message' AND instance = 'sys_[hcom-launcher]'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        notice,
+        format!(
+            "@pezu Launch failed: {failed_instance}: codex stdio exited with status 9 before SessionStart (batch: {batch})"
+        )
+    );
+    assert_clean(&h);
 }
 
 #[test]

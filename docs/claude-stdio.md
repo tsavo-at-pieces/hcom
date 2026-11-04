@@ -25,8 +25,11 @@ client is idle are delivered by the next native prompt or tool/Stop hook.
 hcom does not inject synthetic SDK prompts. Pending delivery is acknowledged
 only after hook output has been flushed, as in the other native modes.
 
-`--stdio` cannot be combined with multiple agents, another tool, a remote
-device, a terminal preset, `--headless`, `--json`, or `--no-run-here`. It is a
-launch transport; clients resume the native conversation by passing Claude's
-`--resume <session-id>` under a fresh `hcom claude --stdio` launch. Existing
-interactive and detached print modes retain their behavior.
+`--stdio` supports one local Claude print or Codex app-server process. It
+cannot be combined with multiple agents, an unsupported tool, a remote device,
+a terminal preset, `--headless`, `--json`, or `--no-run-here`. It is a launch
+transport; Claude clients resume the native conversation by passing
+`--resume <session-id>` under a fresh `hcom claude --stdio` launch. Codex clients
+use `hcom codex --stdio --run-here --go -- app-server` and choose or resume
+their thread through the native JSON-RPC protocol. Existing interactive and
+detached print modes retain their behavior.
