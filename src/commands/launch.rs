@@ -148,7 +148,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let initial_prompt = hcom_flags.initial_prompt;
 
     // Merge env config args with CLI args
-    let (merged_args, background) = if hcom_flags.stdio {
+    let (merged_args, background) = if hcom_flags.stdio && tool == "codex" {
+        // App-server has its own CLI grammar. Interactive defaults such as
+        // --full-auto or a prompt must never leak into the pipe transport.
+        (tool_args.clone(), false)
+    } else if hcom_flags.stdio {
         (
             merge_tool_args(&launch_tool, &tool_args, &hcom_config),
             false,
@@ -470,7 +474,7 @@ pub(crate) struct HcomLaunchFlags {
     pub terminal: Option<String>,
     pub device: Option<String>,
     pub headless: bool,
-    /// Keep the native Claude print process on the caller's three pipes.
+    /// Keep a native Claude print or Codex app-server process on the caller's pipes.
     pub stdio: bool,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
@@ -485,8 +489,11 @@ fn validate_stdio_flags(flags: &HcomLaunchFlags, tool: &str, count: usize) -> Re
     if !flags.stdio {
         return Ok(());
     }
-    if tool != "claude" || count != 1 {
-        bail!("--stdio requires exactly one claude process");
+    if !matches!(tool, "claude" | "codex") || count != 1 {
+        bail!("--stdio requires exactly one claude or codex process");
+    }
+    if tool == "codex" && flags.initial_prompt.is_some() {
+        bail!("--stdio app-server receives prompts from its client, not --hcom-prompt");
     }
     if flags.headless
         || flags.json

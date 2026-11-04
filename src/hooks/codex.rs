@@ -851,7 +851,33 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::relay::worker::try_spawn_worker();
     common::notify_hook_instance_with_db(db, &instance_name);
 
-    // Bootstrap is injected at launch time via developer_instructions flag.
+    if ctx
+        .raw_env
+        .get("HCOM_STDIO_MODE")
+        .is_some_and(|mode| mode == "1")
+    {
+        // There is no PTY delivery loop to announce readiness in this mode.
+        if let Some(batch_id) = ctx.launch_batch_id.as_deref()
+            && !common::launch_reached_ready(db, &instance_name, batch_id)
+            && let Err(error) = db.emit_ready_event(&instance_name, ST_LISTENING, "start")
+        {
+            log::log_warn("hooks", "codex.stdio_ready_event_fail", &error.to_string());
+        }
+        // A pipe client chooses its thread only after the app-server starts.
+        // Announce after binding so thread/resume uses its canonical hcom name,
+        // not the fresh launch placeholder. Internal threads returned above.
+        return HookResult::Allow {
+            additional_context: Some(crate::bootstrap::get_bootstrap(
+                db,
+                ctx,
+                &instance_name,
+                "codex",
+            )),
+            system_message: None,
+            delivery_ack: None,
+        };
+    }
+    // Interactive bootstrap is injected at launch via developer_instructions.
     hook_noop()
 }
 
