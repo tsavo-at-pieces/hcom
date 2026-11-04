@@ -508,9 +508,14 @@ impl ScreenTracker {
     /// viewer, which is navigable but not an approval blocker.
     pub fn is_codex_approval_visible(&self) -> bool {
         let lines = self.get_screen_lines();
+        // Ultra uses » instead of ›. Both delimit the live composer, so
+        // quoted approval dialogs in earlier tool output stay out of the scan.
         let start = lines
             .iter()
-            .rposition(|line| line.trim_start().starts_with('›'))
+            .rposition(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with('›') || trimmed.starts_with('»')
+            })
             .unwrap_or(0);
         let visible = lines[start..].join("\n").to_lowercase();
 
