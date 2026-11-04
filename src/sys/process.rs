@@ -14,10 +14,11 @@ use std::process::Command;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub trait StdoutTap: Send + Sync {
     /// A complete line without its `\n`. The child wrote all of it after
-    /// `emitted_after`, a time at which its stdout pipe was seen empty and
-    /// not full, so that a child writing whatever it has as soon as the pipe
-    /// has room had nothing waiting. `read_at` is when the copy began the
-    /// read that took the line's first byte.
+    /// `emitted_after`, a time at which its stdout pipe was seen empty with
+    /// room for any write it might have refused, so that a child writing
+    /// whatever it has as soon as the pipe has room had nothing waiting.
+    /// `read_at` is when the copy began the read that took the line's first
+    /// byte.
     fn observe(
         &self,
         line: &[u8],
@@ -26,10 +27,11 @@ pub trait StdoutTap: Send + Sync {
     );
     /// A complete line too long to be shown. It was copied whole.
     fn skipped(&self);
-    /// The copy found the pipe empty, and not full, with a read that ended
-    /// at a line's end: the tap has been shown, or told it skipped, every
-    /// line read so far, and a child writing whatever it has as soon as the
-    /// pipe has room had nothing waiting when that read began.
+    /// The copy found the pipe empty, with room for any write it might have
+    /// refused, with a read that ended at a line's end: the tap has been
+    /// shown, or told it skipped, every line read so far, and a child
+    /// writing whatever it has as soon as the pipe has room had nothing
+    /// waiting when that read began.
     fn emptied(&self);
     /// The child has been reaped; its remaining output drains next.
     fn child_exited(&self);
@@ -482,14 +484,16 @@ mod tapped_stdout {
     /// tap each complete line. Ends at EOF or a failed write, or, once
     /// `exited` reports the child reaped, as [`DrainLimits`] allow.
     ///
-    /// Each line carries the last time the pipe was seen empty, and not
-    /// full, before its first byte was read: a child that writes what it has
-    /// whenever the pipe has room wrote the line later. The time is taken
-    /// just before a read that poll has reported ready, so the read never
-    /// waits. Only a read shorter than the pipe's capacity (and the buffer)
-    /// shows that: a full pipe may have left the child more to write. Such a
-    /// read that ends at a line's end is reported to the tap as well, once
-    /// it has been shown the lines the read completed.
+    /// Each line carries the last time the pipe was seen empty, with nothing
+    /// waiting to be written, before its first byte was read: a child that
+    /// writes what it has whenever the pipe has room wrote the line later.
+    /// The time is taken just before a read that poll has reported ready, so
+    /// the read never waits. Only a read that left room for any write the
+    /// pipe might have refused shows that ([`left_room_for_any_write`]): a
+    /// pipe refuses a short write before it is full, so a read that took
+    /// little less than the pipe holds may have left the child more to
+    /// write. Such a read that ends at a line's end is reported to the tap as
+    /// well, once it has been shown the lines the read completed.
     fn forward(
         source: BorrowedFd<'_>,
         exited: BorrowedFd<'_>,
@@ -525,7 +529,7 @@ mod tapped_stdout {
             if fds[0].revents().is_none_or(|events| events.is_empty()) {
                 continue;
             }
-            let capacity = pipe_capacity(source).min(buf.len());
+            let capacity = pipe_capacity(source);
             let before = SystemTime::now();
             let read = match nix::unistd::read(source, &mut buf) {
                 Ok(0) => return End::Eof,
@@ -539,17 +543,48 @@ mod tapped_stdout {
                 return End::WriteFailed(error);
             }
             lines.push(&buf[..read], empty_at, before);
-            let drained = read < capacity;
-            if drained {
+            if left_room_for_any_write(read, capacity, buf.len()) {
                 empty_at = before;
                 lines.emptied();
             }
+            // Short of what the pipe or the buffer holds, the read took all
+            // the pipe held.
+            let empty = read < capacity.min(buf.len());
             if let Some(drain) = &mut drain
-                && drain.read(read, drained)
+                && drain.read(read, empty)
             {
                 return End::Drained("it was empty once the cap had passed");
             }
         }
+    }
+
+    /// Whether a read that took `read` bytes, of a pipe that could hold
+    /// `capacity` (see [`pipe_capacity`]) when it began, into a buffer of
+    /// `buffer`, left room for any write that the pipe might have refused
+    /// before it began: then a child that writes what it has as soon as the
+    /// pipe has room had nothing waiting. That holds when the read before it
+    /// took all the pipe held, as each read of a pipe no larger than the
+    /// buffer does, so that what this one took was all written since.
+    ///
+    /// Linux counts a pipe's room in pages: a write goes into the last page
+    /// only if what it does not fill of a page fits there whole, and
+    /// otherwise takes pages of its own, so any two adjacent pages hold more
+    /// than one page, and a pipe of two pages or more that refuses a write,
+    /// or takes part of one, holds more than half its capacity.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn left_room_for_any_write(read: usize, capacity: usize, buffer: usize) -> bool {
+        // SAFETY: sysconf only reads a system setting.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) });
+        capacity <= buffer && page.is_ok_and(|page| capacity / 2 >= page) && read <= capacity / 2
+    }
+
+    /// [`left_room_for_any_write`] elsewhere: a write of at most PIPE_BUF
+    /// bytes is taken whole or refused, so a pipe that refused one may be
+    /// short of full by PIPE_BUF - 1 bytes, while a longer one is taken as
+    /// far as there is room.
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    fn left_room_for_any_write(read: usize, capacity: usize, buffer: usize) -> bool {
+        read + libc::PIPE_BUF <= capacity.min(buffer)
     }
 
     /// How many bytes the pipe can hold now, or 0 when that is unknown, so
@@ -1156,6 +1191,63 @@ mod tapped_stdout {
             let mut expected = vec!["skipped"; capacity / chunk.len()];
             expected.extend(["late", "emptied"]);
             assert_eq!(told(&copied), expected);
+        }
+
+        /// A pipe refuses a short write that does not fit the room it has
+        /// left, although it is not full: one of at most PIPE_BUF bytes is
+        /// taken whole or not at all, and Linux, which counts room in
+        /// pages, refuses it once the last page cannot take it and no page
+        /// is free. A child whose next frame waits so does not show the
+        /// pipe empty in the read that takes what the pipe held; the read
+        /// after the waiting frame does.
+        #[test]
+        fn a_read_that_leaves_too_little_room_for_a_waiting_write_does_not_show_the_pipe_empty() {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+            let (source, child) = std::io::pipe().unwrap();
+            let flags = OFlag::from_bits_truncate(fcntl(child.as_fd(), FcntlArg::F_GETFL).unwrap());
+            fcntl(child.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+            let mut line = vec![b'x'; 99];
+            line.push(b'\n');
+            let mut held = 0;
+            while let Ok(written) = nix::unistd::write(child.as_fd(), &line) {
+                assert_eq!(written, line.len());
+                held += written;
+            }
+            // Claude's next `running` state frame.
+            let frame = concat!(
+                r#"{"type":"system","subtype":"session_state_changed","state":"running","#,
+                r#""session_id":"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e"}"#,
+                "\n"
+            )
+            .as_bytes();
+            assert_eq!(
+                nix::unistd::write(child.as_fd(), frame),
+                Err(Errno::EAGAIN),
+                "the frame fit"
+            );
+            assert!(held < pipe_capacity(source.as_fd()), "the pipe is full");
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording_on((source, child), &log, false, FAST);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while written(&log.lock().unwrap()).len() < held {
+                assert!(Instant::now() < deadline, "the pipe was not copied");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The child writes the frame once the pipe has room for it.
+            fcntl(copy.child().as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+            copy.child().write_all(frame).unwrap();
+            copy.child.take();
+            let told = told(&copy.wait());
+            let lines = told.iter().take_while(|told| told.len() == 99).count();
+            assert_eq!(lines, held / 100);
+            assert_eq!(
+                told[lines..],
+                [
+                    String::from_utf8_lossy(&frame[..frame.len() - 1]).into_owned(),
+                    "emptied".to_string()
+                ]
+            );
         }
 
         #[test]

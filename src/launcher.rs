@@ -2796,7 +2796,8 @@ struct StdioTurnTap {
 enum StdioCopied {
     TurnEnd(crate::hooks::claude::StdioTurnEnd),
     /// After the turn ends handed over since the last of these, the copy
-    /// found Claude's pipe empty and not full, at a line's end, and read no
+    /// found Claude's pipe empty with nothing waiting to be written, at a
+    /// line's end ([`crate::sys::process::StdoutTap::emptied`]), and read no
     /// frame of a later turn in between: a deferred one is reconciled
     /// ([`crate::hooks::claude::reconcile_stdio_turn_end`]).
     Drained,

@@ -75,18 +75,23 @@ timeout is tried again while Claude runs, before anything read after it,
 until it is recorded or refused. It is recorded only while the row is still
 this launch's, in the frame's session and `active` or `blocked`, with no
 prompt or prompt delivery recorded since the frame may have been written:
-the last time hcom saw the pipe empty, and not full, before reading it. That
-keeps a turn end from overwriting the next turn's prompt as long as Claude
-writes a turn's result before it runs the next prompt hook, and writes what
-it has queued as soon as the pipe has room, as Claude 2.1.309 does (it holds
-results back only once its input has closed).
+the last time hcom saw the pipe empty, with nothing waiting to be written,
+before reading it. A pipe refuses a short write before it is full (one of
+up to `PIPE_BUF` bytes is taken whole or not at all, and Linux counts room
+in pages), so a read shows that only when it left room for any write the
+pipe may have refused: `PIPE_BUF` bytes on macOS, half the pipe on Linux.
+That keeps a turn end from overwriting the next turn's prompt as long as
+Claude writes a turn's result before it runs the next prompt hook, and
+writes what waits, with the frames queued behind it, in one call as soon as
+the pipe has room, as Claude 2.1.309 does on Bun 1.4.4 (it holds results
+back only once its input has closed).
 
 When hcom saw no empty pipe between a turn's prompt and its end, because it
 read the whole turn at once or the client took nothing for the whole turn,
 that prompt may be the turn's own or the next one's, so the turn end waits
 and the status stays as the hooks left it. Once hcom has read through the
 turn end (and the idle frame after a result) and then finds the pipe empty,
-and not full, at the end of a line, with no frame of a later turn read in
+with that room, at the end of a line, with no frame of a later turn read in
 between (a session state other than `idle`, `init`, a message, a stream
 event or another result), it records the turn end under the same
 conditions, but counts prompts and deliveries only from when it began the
