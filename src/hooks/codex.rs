@@ -192,7 +192,15 @@ fn merged_per_run_hooks(ctx: &LaunchCtx) -> AnyResult<(Vec<String>, toml::Value)
         }
         i += consumed;
     }
-    let expected = build_expected_hook_json();
+    let expected = if ctx.var("HCOM_STDIO_MODE") == Some("1") {
+        // A pipe launch may outlive a PATH or symlink update. Its hooks must
+        // continue running the image that owns this native process.
+        let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+        let executable = crate::shared::platform::child_process_path(&executable);
+        build_expected_hook_json_for(Some(&executable.to_string_lossy()))
+    } else {
+        build_expected_hook_json()
+    };
     let table = hooks
         .as_table_mut()
         .context("Codex -c hooks must be a TOML table")?;
@@ -239,6 +247,18 @@ fn json_to_toml_literal(value: &Value) -> String {
 
 fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
     let (mut args, mut hooks) = merged_per_run_hooks(ctx)?;
+    // merged_per_run_hooks appends our own group last for each event. Match
+    // those exact commands, including a stdio launch's canonical image path,
+    // rather than recomputing a bare PATH-based invocation during preflight.
+    let expected: HashSet<String> = CODEX_HOOK_COMMANDS
+        .iter()
+        .map(|(event, _, _)| {
+            hooks[*event].as_array().unwrap().last().unwrap()["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
     // Codex merges hooks.state per key across the user and session-flag layers
     // (codex-rs/hooks/src/config_rules.rs), so only hcom's entries and the
     // caller's own -c state belong here. Copying config.toml's state would pin
@@ -278,10 +298,6 @@ fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
             fetch_codex_hook_list_with_overrides(&ctx.cwd, &per_run_home(ctx), &preflight)
                 .map_err(anyhow::Error::msg)
                 .context("Codex hooks/list preflight failed")?;
-        let expected: HashSet<String> = CODEX_HOOK_COMMANDS
-            .iter()
-            .map(|(_, suffix, _)| build_codex_hook_command(suffix))
-            .collect();
         let owned: Vec<CodexHookTrustEntry> = entries
             .into_iter()
             .filter(|entry| {
@@ -895,6 +911,15 @@ fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload
 
     if prompt.trim() != HCOM_TRIGGER {
         set_prompt_active(db, &instance.name);
+        // Pipe clients have no PTY wakeup loop. Deliver at the next ordinary
+        // turn even when the model never calls a tool during that turn.
+        if ctx
+            .raw_env
+            .get("HCOM_STDIO_MODE")
+            .is_some_and(|mode| mode == "1")
+        {
+            return prepare_codex_delivery(db, &instance.name).unwrap_or_else(hook_noop);
+        }
         return hook_noop();
     }
 
@@ -1217,6 +1242,10 @@ fn build_codex_hook_command(command: &str) -> String {
 }
 
 fn build_expected_hook_json() -> Value {
+    build_expected_hook_json_for(None)
+}
+
+fn build_expected_hook_json_for(executable: Option<&str>) -> Value {
     let mut hooks = serde_json::Map::new();
     for (event, command, matcher) in CODEX_HOOK_COMMANDS {
         let mut group = serde_json::Map::new();
@@ -1227,7 +1256,10 @@ fn build_expected_hook_json() -> Value {
             "hooks".into(),
             Value::Array(vec![serde_json::json!({
                 "type": "command",
-                "command": build_codex_hook_command(command),
+                "command": executable.map_or_else(
+                    || build_codex_hook_command(command),
+                    |path| format!("{} {command}", crate::tools::args_common::shell_quote(path)),
+                ),
             })]),
         );
         hooks.insert(
@@ -1955,6 +1987,21 @@ mod tests {
     }
 
     #[test]
+    fn pinned_stdio_hook_image_is_one_shell_word() {
+        let path = "/a path/owner's hcom";
+        let hooks = build_expected_hook_json_for(Some(path));
+        for (event, command, _) in CODEX_HOOK_COMMANDS {
+            let rendered = hooks["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                crate::tools::args_common::shell_split(rendered, false).unwrap(),
+                [path, command],
+            );
+        }
+    }
+
+    #[test]
     fn hcom_command_match_requires_hcom_prefix() {
         assert!(is_hcom_codex_command("hcom codex-stop"));
         assert!(is_hcom_codex_command("/old/bin/hcom codex-stop"));
@@ -2003,6 +2050,130 @@ mod tests {
         assert_eq!(row.session_id.as_deref(), Some("main-sid"), "{label}");
         assert_eq!(row.directory, "/work", "{label}");
         assert_eq!(db.get_session_binding("mem-sid").unwrap(), None, "{label}");
+    }
+
+    fn queue_prompt_message(db: &HcomDb) {
+        db.log_event(
+            "message",
+            "pezu",
+            &serde_json::json!({
+                "from": "pezu", "text": "queued before a tool-less turn", "scope": "broadcast",
+            }),
+        )
+        .unwrap();
+    }
+
+    fn ordinary_prompt() -> HookPayload {
+        HookPayload::from_codex_native(
+            "UserPromptSubmit",
+            serde_json::json!({
+                "session_id": "main-sid", "transcript_path": "/rollout-main.jsonl",
+                "cwd": "/work", "prompt": "Reply without calling a tool",
+            }),
+        )
+    }
+
+    #[test]
+    fn stdio_prompt_delivers_pending_messages_without_a_tool_call() {
+        let (_dir, db, mut ctx) = db_with_listening_codex();
+        ctx.raw_env.insert("HCOM_STDIO_MODE".into(), "1".into());
+        queue_prompt_message(&db);
+        let HookResult::Allow {
+            additional_context,
+            system_message,
+            delivery_ack,
+        } = handle_userpromptsubmit(&db, &ctx, &ordinary_prompt())
+        else {
+            panic!("prompt refused")
+        };
+        assert!(
+            additional_context
+                .as_deref()
+                .unwrap()
+                .contains("queued before a tool-less turn")
+        );
+        assert_eq!(additional_context, system_message);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "prompt");
+        assert_eq!(
+            row.last_event_id, 0,
+            "delivery must wait for successful output"
+        );
+        common::commit_delivery_ack(&db, &delivery_ack.unwrap());
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &ordinary_prompt())
+        else {
+            panic!("prompt refused")
+        };
+        assert!(
+            additional_context.is_none(),
+            "already delivered message repeated"
+        );
+        assert!(delivery_ack.is_none());
+    }
+
+    #[test]
+    fn stdio_prompt_change_preserves_interactive_trigger_delivery() {
+        let (_dir, db, ctx) = db_with_listening_codex();
+        queue_prompt_message(&db);
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &ordinary_prompt())
+        else {
+            panic!("prompt refused")
+        };
+        assert!(additional_context.is_none());
+        assert!(delivery_ack.is_none());
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().last_event_id,
+            0
+        );
+        let mut trigger = ordinary_prompt();
+        trigger.raw["prompt"] = serde_json::json!(HCOM_TRIGGER);
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &trigger)
+        else {
+            panic!("trigger refused")
+        };
+        assert!(
+            additional_context
+                .unwrap()
+                .contains("queued before a tool-less turn")
+        );
+        assert!(delivery_ack.is_some());
+    }
+
+    #[test]
+    fn stdio_prompt_from_internal_thread_does_not_consume_main_messages() {
+        let (_dir, db, mut ctx) = db_with_listening_codex();
+        ctx.raw_env.insert("HCOM_STDIO_MODE".into(), "1".into());
+        queue_prompt_message(&db);
+        let mut prompt = ordinary_prompt();
+        prompt.raw["agent_id"] = serde_json::json!("internal-agent");
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &prompt)
+        else {
+            panic!("prompt refused")
+        };
+        assert!(additional_context.is_none());
+        assert!(delivery_ack.is_none());
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().last_event_id,
+            0
+        );
+        assert_main_thread_untouched(&db, "stdio internal prompt");
     }
 
     #[test]

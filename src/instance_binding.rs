@@ -361,6 +361,24 @@ fn migrate_placeholder_runtime_state(
         }
         if let Some(ref ctx) = ph.launch_context {
             db.store_launch_context(canonical_name, ctx)?;
+            if let Some(process_id) = serde_json::from_str::<serde_json::Value>(ctx)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("process_id")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                })
+            {
+                // Unlike late-bound metadata, the launch token is ownership.
+                // It must follow the transferred PID even when the canonical
+                // row still has a nonempty token from an earlier supervisor.
+                db.conn().execute(
+                    "UPDATE instances SET launch_context =                      json_set(launch_context, '$.process_id', ?1) WHERE name = ?2",
+                    rusqlite::params![process_id, canonical_name],
+                )?;
+            }
         }
         db.promote_terminal_presets(Some(canonical_name))?;
         Ok(())
@@ -1903,6 +1921,66 @@ mod tests {
         assert_eq!(zumi.status_context, "exit:session_switch");
         assert_eq!(zumi.pid, None);
 
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_existing_canonical_takeover_transfers_process_token() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let canonical = serde_json::json!({
+            "tool": "codex", "created_at": 1.0, "status": "listening",
+            "session_id": "existing-codex-session"
+        });
+        db.save_instance_named("fano", canonical.as_object().unwrap())
+            .unwrap();
+        db.rebind_session("existing-codex-session", "fano").unwrap();
+        db.set_process_binding("old-process", "existing-codex-session", "fano")
+            .unwrap();
+        db.store_launch_context(
+            "fano",
+            r#"{"process_id":"old-process","branch":"retained-context"}"#,
+        )
+        .unwrap();
+        db.update_instance_pid_with_identity("fano", 4141, Some("old-incarnation"))
+            .unwrap();
+
+        let placeholder = serde_json::json!({
+            "tool": "codex", "created_at": 2.0,
+            "status": "pending", "status_context": "new"
+        });
+        db.save_instance_named("mozi", placeholder.as_object().unwrap())
+            .unwrap();
+        db.set_process_binding("new-process", "", "mozi").unwrap();
+        db.store_launch_context(
+            "mozi",
+            r#"{"process_id":"new-process","pane_id":"new-pane","branch":"placeholder"}"#,
+        )
+        .unwrap();
+        db.update_instance_pid_with_identity("mozi", 4242, Some("new-incarnation"))
+            .unwrap();
+
+        assert_eq!(
+            bind_session_to_process_checked(&db, "existing-codex-session", Some("new-process"))
+                .unwrap(),
+            Some("fano".to_string())
+        );
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let row = db.get_instance_full("fano").unwrap().unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["process_id"], "new-process");
+        assert_eq!(context["branch"], "retained-context");
+        assert_eq!(context["pane_id"], "new-pane");
+        assert_eq!(row.pid, Some(4242));
+        assert_eq!(
+            db.get_instance_pid_identity("fano").unwrap().as_deref(),
+            Some("new-incarnation")
+        );
+        assert_eq!(
+            db.get_process_binding("new-process").unwrap().as_deref(),
+            Some("fano")
+        );
         cleanup(path);
     }
 

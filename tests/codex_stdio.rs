@@ -32,6 +32,9 @@ if os.environ.get('HCOM_LAUNCHED') != '1':
             print(json.dumps({'id': request['id'], 'result': {'data': [{'hooks': hooks}]}}), flush=True)
     sys.exit(0)
 assert not os.isatty(0) and not os.isatty(1), 'unexpected PTY'
+if os.environ.get('FIXTURE_RETARGET_LINK'):
+    os.unlink(os.environ['FIXTURE_RETARGET_LINK'])
+    os.symlink(os.environ['FIXTURE_DECOY'], os.environ['FIXTURE_RETARGET_LINK'])
 command = next(c for c in commands if c.endswith('codex-sessionstart'))
 payload = {'session_id': '00000000-0000-0000-0000-000000000007', 'cwd': os.getcwd(), 'source': 'startup', 'transcript_path': os.path.join(os.getcwd(), 'fixture.jsonl')}
 def hook(suffix, data):
@@ -205,6 +208,52 @@ fn codex_stdio_preserves_protocol_hooks_identity_and_exit() {
         assert!(!h.hcom_dir.join(".tmp/launch").exists());
         assert_clean(&h);
     }
+}
+
+#[test]
+fn codex_stdio_hooks_keep_the_launch_image_after_path_and_symlink_change() {
+    let h = Hcom::new();
+    fixture(&h);
+    let decoy = h.root_path().join("pipe-tools/hcom");
+    fs::write(&decoy, "#!/bin/sh\necho wrong-hcom-image >&2\nexit 42\n").unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
+    let link = h.root_path().join("hcom launch 'link");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_hcom"), &link).unwrap();
+    h.set_launch_env("FIXTURE_RETARGET_LINK", link.to_str().unwrap());
+    h.set_launch_env("FIXTURE_DECOY", decoy.to_str().unwrap());
+    let template = h.cmd();
+    let mut command = std::process::Command::new(&link);
+    command.env_clear();
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    command.current_dir(template.get_current_dir().unwrap());
+    let mut child = command
+        .args([
+            "codex",
+            "--stdio",
+            "--run-here",
+            "--go",
+            "--name",
+            "pezu",
+            "--",
+            "app-server",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wire = b"{\"id\":7}\n";
+    child.stdin.take().unwrap().write_all(wire).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    assert_eq!(output.stdout, wire);
+    assert_eq!(output.stderr, b"native diagnostic\n");
+    assert_eq!(fs::read_link(&link).unwrap(), decoy);
+    assert_clean(&h);
 }
 
 #[test]
