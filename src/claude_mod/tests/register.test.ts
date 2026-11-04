@@ -9,6 +9,7 @@ function harness() {
   let response = { wake: true }
   let resolvePrompt: Function
   let now = 1000
+  let monotonic = 1000
   const api = {
     env: { get: async (key: string) => key === 'HCOM_PROCESS_ID' ? 'process-1' : key === 'HCOM_PTY_MODE' ? '1' : key === 'HCOM_CLAUDE_DELIVERY' ? 'native' : '["hcom"]' },
     clock: { now: async () => now, every: (_: number, fn: Function) => { tick = fn; return { cancel: () => { cancelled = true } } } },
@@ -18,14 +19,15 @@ function harness() {
     // Claude's $.ui.log is synchronous and returns undefined.
     ui: { log: (_: string) => {} },
   }
-  register((event: string, fn: Function) => { handlers[event] = fn })
+  register((event: string, fn: Function) => { handlers[event] = fn }, () => monotonic)
   return {
     api, handlers, prompts,
     tick: () => tick(api),
     cancelled: () => cancelled,
     response: (value: any) => { response = value },
     finishPrompt: () => resolvePrompt({ text: '<hcom>', asUser: true }),
-    advance: (ms: number) => { now += ms },
+    advance: (ms: number) => { now += ms; monotonic += ms },
+    stepWall: (ms: number) => { now += ms },
   }
 }
 const next = async (event: any) => event
@@ -226,10 +228,11 @@ test('BUSY past sixty seconds reports each retry with transient context and logs
   const h = harness()
   const reports = [] as string[][]
   const logs = [] as string[]
+  let busy = true
   h.api.ui.log = text => { logs.push(text) }
   h.api.process.run = async (argv: string[]) => {
     if (argv.includes('--event')) { reports.push(argv); return { exitCode: 0, stdout: '{}' } }
-    return { exitCode: 75, stdout: '{"busy":true,"error":"database is locked"}' }
+    return busy ? { exitCode: 75, stdout: '{"busy":true}' } : { exitCode: 0, stdout: '{"wake":false}' }
   }
   await h.handlers['session.start'](h.api, interactive, next)
   await fail(h, 3)
@@ -239,11 +242,56 @@ test('BUSY past sixty seconds reports each retry with transient context and logs
   expect(reports.length).toBe(2)
   expect(reports.every(r => r.includes('poll-failed') && r.includes('--busy'))).toBe(true)
   expect(logs.length).toBe(1)
-  h.api.process.run = async () => ({ exitCode: 0, stdout: '{"wake":false}' })
+  busy = false
   await h.tick()
-  h.api.process.run = async () => ({ exitCode: 75, stdout: '{"busy":true}' })
+  busy = true
   await fail(h, 4)
   expect(reports.length).toBe(2)
+})
+
+test('BUSY elapsed threshold ignores forward and backward wall-clock steps', async () => {
+  const h = harness()
+  const reports = [] as string[][]
+  h.api.process.run = async (argv: string[]) => {
+    if (argv.includes('--event')) { reports.push(argv); return { exitCode: 0, stdout: '{}' } }
+    return { exitCode: 75, stdout: '{"busy":true}' }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await fail(h, 1)
+  h.advance(5000)
+  h.stepWall(3600000)
+  await fail(h, 1)
+  expect(reports.length).toBe(0)
+  h.stepWall(-7200000)
+  h.advance(55000)
+  await fail(h, 1)
+  expect(reports.length).toBe(1)
+})
+
+test('BUSY switches session identity and reports at exactly sixty elapsed seconds', async () => {
+  const h = harness()
+  const reports = [] as string[][]
+  let session = 'session-1'
+  h.api.session.id = async () => session
+  h.api.process.run = async (argv: string[]) => {
+    if (argv.includes('--event')) { reports.push(argv); return { exitCode: 0, stdout: '{}' } }
+    return { exitCode: 75, stdout: '{"busy":true}' }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await fail(h, 1)
+  h.advance(60000)
+  await fail(h, 1)
+  expect(reports.length).toBe(1)
+  session = 'session-2'
+  await fail(h, 1)
+  expect(reports.length).toBe(1)
+  h.advance(59999)
+  await fail(h, 1)
+  expect(reports.length).toBe(1)
+  h.advance(1)
+  await fail(h, 1)
+  expect(reports.length).toBe(2)
+  expect(reports[1][reports[1].indexOf('--session-id') + 1]).toBe('session-2')
 })
 
 test('BUSY does not count toward the ordinary consecutive failure threshold', async () => {
