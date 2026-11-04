@@ -215,7 +215,11 @@ pub fn publish() -> Result<PathBuf> {
 }
 
 pub fn dispatch(args: &[String]) -> (i32, String) {
-    match poll(args) {
+    poll_result(poll(args))
+}
+
+fn poll_result(result: Result<serde_json::Value>) -> (i32, String) {
+    match result {
         Ok(value) => (0, value.to_string()),
         Err(error) => {
             crate::log::log_warn("hooks", "claude.mod_poll_failed", &error.to_string());
@@ -435,6 +439,57 @@ fn validated_owner(db: &HcomDb, session: &str, process: &str) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_contention_is_a_transient_poll_result() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("database is locked".into()),
+            ))
+            .context("poll write failed");
+            let (exit, output) = poll_result(Err(error));
+            assert_eq!(exit, 75);
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["busy"], true);
+        }
+        assert_eq!(poll_result(Err(anyhow::anyhow!("notify failed"))).0, 1);
+    }
+
+    #[test]
+    fn recent_busy_health_has_no_inject_hint_and_does_not_refresh_success() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        finish(&db, "session-1", "process-1", false).unwrap();
+        let mut current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        current.checked_at -= HEALTH_TIMEOUT + 1.0;
+        let checked_at = current.checked_at;
+        db.kv_set(
+            &key("session-1", "process-1"),
+            Some(&serde_json::to_string(&current).unwrap()),
+        )
+        .unwrap();
+        record_report(
+            &db,
+            "session-1",
+            "process-1",
+            "poll-busy",
+            "database is locked",
+        )
+        .unwrap();
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.status_context, "tui:mod-busy");
+        assert!(!row.status_detail.contains(INJECT_HINT));
+        assert_eq!(
+            state(&db, "session-1", "process-1")
+                .unwrap()
+                .unwrap()
+                .checked_at,
+            checked_at
+        );
+        assert_eq!(db.get_cursor("nova"), 0);
+    }
 
     fn database() -> (tempfile::TempDir, HcomDb) {
         let dir = tempfile::tempdir().unwrap();

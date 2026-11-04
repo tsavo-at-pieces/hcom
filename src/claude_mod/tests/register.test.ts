@@ -8,9 +8,10 @@ function harness() {
   const prompts = [] as any[]
   let response = { wake: true }
   let resolvePrompt: Function
+  let now = 1000
   const api = {
     env: { get: async (key: string) => key === 'HCOM_PROCESS_ID' ? 'process-1' : key === 'HCOM_PTY_MODE' ? '1' : key === 'HCOM_CLAUDE_DELIVERY' ? 'native' : '["hcom"]' },
-    clock: { every: (_: number, fn: Function) => { tick = fn; return { cancel: () => { cancelled = true } } } },
+    clock: { now: async () => now, every: (_: number, fn: Function) => { tick = fn; return { cancel: () => { cancelled = true } } } },
     session: { id: async () => 'session-1' },
     process: { run: async () => ({ exitCode: 0, stdout: JSON.stringify(response) }) },
     prompt: { submit: (value: any) => { prompts.push(value); return new Promise(resolve => { resolvePrompt = resolve }) } },
@@ -24,6 +25,7 @@ function harness() {
     cancelled: () => cancelled,
     response: (value: any) => { response = value },
     finishPrompt: () => resolvePrompt({ text: '<hcom>', asUser: true }),
+    advance: (ms: number) => { now += ms },
   }
 }
 const next = async (event: any) => event
@@ -197,6 +199,72 @@ test('a failed poll backs off instead of respawning every tick', async () => {
 async function fail(h: ReturnType<typeof harness>, n: number) {
   for (let i = 0; i < n * 21; i++) await h.tick()
 }
+
+test('transient BUSY stays quiet inside its window and keeps the backoff cadence', async () => {
+  const h = harness()
+  const reports = [] as string[][]
+  const logs = [] as string[]
+  let polls = 0
+  h.api.ui.log = text => { logs.push(text) }
+  h.api.process.run = async (argv: string[]) => {
+    if (argv.includes('--event')) { reports.push(argv); return { exitCode: 0, stdout: '{}' } }
+    polls++
+    return { exitCode: 75, stdout: '{"busy":true,"error":"database is locked"}' }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await fail(h, 4)
+  expect(polls).toBe(4)
+  expect(reports.length).toBe(0)
+  expect(logs.length).toBe(0)
+  h.api.process.run = async () => ({ exitCode: 0, stdout: '{"wake":true}' })
+  await h.tick()
+  expect(h.prompts.length).toBe(1)
+  h.finishPrompt()
+})
+
+test('BUSY past sixty seconds reports each retry with transient context and logs once', async () => {
+  const h = harness()
+  const reports = [] as string[][]
+  const logs = [] as string[]
+  h.api.ui.log = text => { logs.push(text) }
+  h.api.process.run = async (argv: string[]) => {
+    if (argv.includes('--event')) { reports.push(argv); return { exitCode: 0, stdout: '{}' } }
+    return { exitCode: 75, stdout: '{"busy":true,"error":"database is locked"}' }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await fail(h, 3)
+  expect(reports.length).toBe(0)
+  h.advance(60001)
+  await fail(h, 2)
+  expect(reports.length).toBe(2)
+  expect(reports.every(r => r.includes('poll-failed') && r.includes('--busy'))).toBe(true)
+  expect(logs.length).toBe(1)
+  h.api.process.run = async () => ({ exitCode: 0, stdout: '{"wake":false}' })
+  await h.tick()
+  h.api.process.run = async () => ({ exitCode: 75, stdout: '{"busy":true}' })
+  await fail(h, 4)
+  expect(reports.length).toBe(2)
+})
+
+test('BUSY does not count toward the ordinary consecutive failure threshold', async () => {
+  const h = harness()
+  const reports = [] as string[][]
+  let busy = true
+  h.api.process.run = async (argv: string[]) => {
+    if (argv.includes('--event')) { reports.push(argv); return { exitCode: 0, stdout: '{}' } }
+    return busy ? { exitCode: 75, stdout: '{"busy":true}' }
+      : { exitCode: 1, stdout: '', stderr: 'notify bind failed' }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await fail(h, 4)
+  busy = false
+  await fail(h, 2)
+  expect(reports.length).toBe(0)
+  await fail(h, 1)
+  expect(reports.length).toBe(1)
+  expect(reports[0].includes('--busy')).toBe(false)
+  expect(reports[0].includes('Error: notify bind failed')).toBe(true)
+})
 
 test('an isolated failed poll, as after host sleep, stays silent', async () => {
   const h = harness()
