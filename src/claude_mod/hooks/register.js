@@ -13,6 +13,7 @@ const BUSY_WINDOW_MS = 60000;
 let busySince;
 let busySession;
 let busyReported = false;
+let elapsedNow = () => performance.now();
 // Ticks to skip after a failed poll, so a broken hcom is not respawned 4x/s.
 let backoff = 0;
 // process.run starts in the session's working directory by default. Claude
@@ -52,7 +53,7 @@ async function poll($) {
     );
     if (result.exitCode === 75) {
       backoff = 20;
-      const now = await $.clock.now();
+      const now = elapsedNow();
       if (busySince === undefined || busySession !== session) {
         busySince = now;
         busySession = session;
@@ -121,7 +122,8 @@ async function poll($) {
   }
 }
 
-export function register(on) {
+export function register(on, monotonicNow = () => performance.now()) {
+  elapsedNow = monotonicNow;
   timer?.cancel();
   timer = undefined;
   probing = false;

@@ -16,6 +16,9 @@ const WAIT: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT: f64 = 40.0;
 // Match the mod's bounded BUSY retry window. Evidence expires if retries stop.
 const BUSY_WINDOW: f64 = 60.0;
+// Diagnostics must not grow with session churn. A busy/full directory falls
+// back to ordinary health; it never changes a poll or delivery result.
+const MAX_BUSY_MARKERS: usize = 256;
 /// Time for Claude to start and load the mod before health is reported.
 pub const CONNECT_GRACE: Duration = Duration::from_secs(15);
 /// Launch env and `claude_delivery` config values; the launch freezes one.
@@ -100,12 +103,64 @@ fn busy_path(db_path: &Path, session: &str, process: &str) -> PathBuf {
 
 fn mark_busy(db_path: &Path, session: &str, process: &str) {
     let path = busy_path(db_path, session, process);
-    if let Some(parent) = path.parent() {
-        let _ = crate::paths::ensure_private_directory(parent);
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    if crate::paths::ensure_private_directory(directory).is_err() {
+        return;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let Ok(lock) = options.open(directory.join(".maintenance.lock")) else {
+        return;
+    };
+    // Nonblocking and released on process exit, including crashes. Serialize
+    // capacity checks with creates so overlapping polls cannot exceed the cap.
+    if lock.try_lock().is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let now = now_epoch_f64();
+    let mut retained = 0;
+    let mut scanned = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return;
+        };
+        scanned += 1;
+        if scanned > MAX_BUSY_MARKERS * 2 {
+            return;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(digest) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if digest.len() != 32 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if !busy_marker_current(&entry.path(), 0.0, now)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            continue;
+        }
+        retained += 1;
+    }
+    if retained >= MAX_BUSY_MARKERS && !path.is_file() {
+        return;
     }
     let _ = crate::paths::atomic_write_io(
         &path,
-        &serde_json::json!({"kind": "busy", "at": now_epoch_f64()}).to_string(),
+        &serde_json::json!({"kind": "busy", "at": now}).to_string(),
     );
 }
 
@@ -114,13 +169,25 @@ fn clear_busy(db_path: &Path, session: &str, process: &str) {
 }
 
 fn recently_busy(db_path: &Path, session: &str, process: &str, checked_at: f64) -> bool {
+    recently_busy_at(db_path, session, process, checked_at, now_epoch_f64())
+}
+
+fn recently_busy_at(
+    db_path: &Path,
+    session: &str,
+    process: &str,
+    checked_at: f64,
+    now: f64,
+) -> bool {
+    busy_marker_current(&busy_path(db_path, session, process), checked_at, now)
+}
+
+fn busy_marker_current(path: &Path, checked_at: f64, now: f64) -> bool {
     let read = || -> Option<bool> {
-        let value: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(busy_path(db_path, session, process)).ok()?,
-        )
-        .ok()?;
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
         let at = value.get("at")?.as_f64()?;
-        let age = now_epoch_f64() - at;
+        let age = now - at;
         Some(
             value.get("kind")?.as_str()? == "busy"
                 && at > checked_at
@@ -727,6 +794,143 @@ mod tests {
         let blocked_db = dir.path().join("not-a-directory/hcom.db");
         std::fs::write(blocked_db.parent().unwrap(), "file").unwrap();
         mark_busy(&blocked_db, "session-1", "process-1");
+    }
+
+    #[test]
+    fn a_busy_write_reclaims_expired_abandoned_markers_and_preserves_fresh_ones() {
+        let (_dir, db) = database();
+        mark_busy(db.path(), "abandoned", "old-process");
+        let old = busy_path(db.path(), "abandoned", "old-process");
+        std::fs::write(
+            &old,
+            serde_json::json!({"kind":"busy", "at": now_epoch_f64() - 61.0}).to_string(),
+        )
+        .unwrap();
+        mark_busy(db.path(), "active", "active-process");
+        assert!(
+            !old.exists(),
+            "expiry must reclaim the file, not only ignore it"
+        );
+        assert!(recently_busy(db.path(), "active", "active-process", 0.0));
+    }
+
+    #[test]
+    fn busy_markers_do_not_grow_without_bound_when_the_directory_is_full() {
+        let (_dir, db) = database();
+        let target = busy_path(db.path(), "new-session", "new-process");
+        let directory = target.parent().unwrap();
+        std::fs::create_dir_all(directory).unwrap();
+        let marker = serde_json::json!({"kind":"busy", "at": now_epoch_f64()}).to_string();
+        for i in 0..256 {
+            std::fs::write(directory.join(format!("{i:032x}.json")), &marker).unwrap();
+        }
+        mark_busy(db.path(), "new-session", "new-process");
+        assert!(
+            !target.exists(),
+            "diagnostic capacity must fall back to normal health"
+        );
+    }
+
+    #[test]
+    fn diagnostic_marker_lock_is_nonblocking_and_does_not_leave_a_stale_lock() {
+        let (_dir, db) = database();
+        let path = busy_path(db.path(), "session-1", "process-1");
+        let directory = path.parent().unwrap();
+        std::fs::create_dir_all(directory).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(".maintenance.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        assert!(
+            !path.exists(),
+            "contended diagnostics must be skipped without waiting"
+        );
+        drop(lock);
+        mark_busy(db.path(), "session-1", "process-1");
+        assert!(
+            path.exists(),
+            "closing a handle releases capacity maintenance"
+        );
+    }
+
+    #[test]
+    fn busy_timestamp_boundaries_reject_future_and_pre_success_evidence() {
+        let (_dir, db) = database();
+        let path = busy_path(db.path(), "session-1", "process-1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (at, checked, expected) in [
+            (100.0, 99.0, true),
+            (40.0, 39.0, true),
+            (39.999, 0.0, false),
+            (100.001, 0.0, false),
+            (80.0, 80.0, false),
+            (79.0, 80.0, false),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::json!({"kind":"busy", "at":at}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                recently_busy_at(db.path(), "session-1", "process-1", checked, 100.0),
+                expected,
+                "at={at}, checked={checked}"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_busy_codes_are_transient_but_deceptive_text_is_not() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+            rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE,
+        ] {
+            let error = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+            .context("wrapped");
+            assert_eq!(poll_result(Err(error)).0, 75);
+        }
+        assert_eq!(
+            poll_result(Err(anyhow::anyhow!("database is locked: SQLITE_BUSY"))).0,
+            1
+        );
+        let io = std::io::Error::other("database is locked");
+        assert_eq!(poll_result(Err(anyhow::Error::from(io))).0, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_clears_nonbusy_poll_markers_but_preserves_event_reports() {
+        use crate::hooks::test_helpers::{EnvVarGuard, isolated_test_env};
+        let (_dir, hcom, _home, _guard) = isolated_test_env();
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "process-1");
+        let path = hcom.join("hcom.db");
+        let args = vec!["--session-id".into(), "session-1".into()];
+        mark_busy(&path, "session-1", "process-1");
+        assert_eq!(dispatch(&args).0, 0);
+        assert!(!busy_path(&path, "session-1", "process-1").exists());
+        mark_busy(&path, "session-1", "process-1");
+        let mut report = args.clone();
+        report.extend(["--event".into(), "submitted".into()]);
+        assert_eq!(dispatch(&report).0, 0);
+        assert!(busy_path(&path, "session-1", "process-1").exists());
+        std::fs::write(&path, b"invalid SQLite database").unwrap();
+        assert_eq!(
+            dispatch(&args).0,
+            1,
+            "a non-BUSY failure stays an ordinary failure"
+        );
+        assert!(
+            !busy_path(&path, "session-1", "process-1").exists(),
+            "ordinary failures clear stale BUSY evidence too"
+        );
     }
 
     fn database() -> (tempfile::TempDir, HcomDb) {
