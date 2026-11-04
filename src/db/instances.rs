@@ -1214,11 +1214,12 @@ impl HcomDb {
             .optional()?)
     }
 
-    /// Refresh the heartbeat of the row [`Self::get_stdio_owned_instance`]
-    /// names, unless it stopped. One statement, so ownership is checked where
-    /// it is written. Unlike [`Self::update_heartbeat`], this claims no TCP
-    /// listener and never touches status. Returns whether a row was refreshed.
-    pub fn update_stdio_heartbeat(&self, process_id: &str) -> Result<bool> {
+    /// Set the heartbeat of the row [`Self::get_stdio_owned_instance`] names
+    /// to `now` (epoch seconds), unless it stopped. One statement, so
+    /// ownership is checked where it is written. Unlike
+    /// [`Self::update_heartbeat`], this claims no TCP listener and never
+    /// touches status. Returns whether a row was refreshed.
+    pub fn update_stdio_heartbeat(&self, process_id: &str, now: i64) -> Result<bool> {
         let changed = self.conn.execute(
             "UPDATE instances SET last_stop = ?2
              WHERE status != ?3
@@ -1226,7 +1227,7 @@ impl HcomDb {
                AND created_at <= (SELECT updated_at FROM process_bindings WHERE process_id = ?1)
                AND CASE WHEN json_valid(launch_context)
                    THEN json_extract(launch_context, '$.process_id') = ?1 ELSE 0 END",
-            params![process_id, now_epoch_i64(), ST_INACTIVE],
+            params![process_id, now, ST_INACTIVE],
         )?;
         Ok(changed > 0)
     }
@@ -1245,6 +1246,7 @@ impl HcomDb {
 mod tests {
     use super::super::HcomDb;
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
+    use crate::shared::time::now_epoch_i64;
     use rusqlite::params;
 
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
@@ -1792,12 +1794,18 @@ mod tests {
             db.get_stdio_owned_instance("proc-a").unwrap().unwrap().name,
             "nova"
         );
-        assert!(db.update_stdio_heartbeat("proc-a").unwrap());
+        assert!(
+            db.update_stdio_heartbeat("proc-a", now_epoch_i64())
+                .unwrap()
+        );
         let (last_stop, tcp_mode, status) = heartbeat(&db);
         assert!(last_stop > 1);
         assert_eq!(tcp_mode, 0, "a pipe client has no TCP listener");
         assert_eq!(status, "listening");
-        assert!(!db.update_stdio_heartbeat("proc-other").unwrap());
+        assert!(
+            !db.update_stdio_heartbeat("proc-other", now_epoch_i64())
+                .unwrap()
+        );
         cleanup_test_db(db_path);
 
         type Change = (&'static str, fn(&HcomDb));
@@ -1832,7 +1840,11 @@ mod tests {
             stdio_owned_row(&db, "nova", "proc-a");
             apply(&db);
             let before = heartbeat(&db);
-            assert!(!db.update_stdio_heartbeat("proc-a").unwrap(), "{change}");
+            assert!(
+                !db.update_stdio_heartbeat("proc-a", now_epoch_i64())
+                    .unwrap(),
+                "{change}"
+            );
             // A stopped row is still the launch's own, but never refreshed.
             assert_eq!(
                 db.get_stdio_owned_instance("proc-a").unwrap().is_some(),

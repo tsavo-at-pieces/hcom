@@ -2809,8 +2809,9 @@ impl StdioTurnTap {
 }
 
 /// The recorder thread: applies queued turn ends in order and, while the
-/// child runs, refreshes the heartbeat every `interval`. A refresh already
-/// under way when the child is reaped records a time from before the reap.
+/// child runs, refreshes the heartbeat every `interval`. A refresh that
+/// passed its check before the reap was reported may land after it, but
+/// records a time taken before that report.
 fn record_stdio_turns(
     mut db: HcomDb,
     process_id: &str,
@@ -2833,9 +2834,10 @@ fn record_stdio_turns(
             }
             Err(RecvTimeoutError::Timeout) => {
                 next_beat = std::time::Instant::now() + interval;
+                let now = crate::shared::time::now_epoch_i64();
                 if running.load(std::sync::atomic::Ordering::Acquire) {
                     db.reconnect_if_stale();
-                    if let Err(error) = db.update_stdio_heartbeat(process_id) {
+                    if let Err(error) = db.update_stdio_heartbeat(process_id, now) {
                         crate::log::log_warn(
                             "launcher",
                             "stdio.heartbeat_failed",
@@ -4874,27 +4876,37 @@ mod tests {
 
     #[test]
     fn stdio_tap_heartbeat_never_touches_a_row_another_launch_recreated() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        let last_stop = || db.get_instance_full("kole").unwrap().unwrap().last_stop;
-        // A native `--resume` bound the process to the restored identity.
-        stdio_launch_row(&db, "kole", "stdio-proc", "sess-r");
-        let tap =
-            StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20)).unwrap();
-        wait_until("no heartbeat", || last_stop() > 1);
+        for bindings_kept in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+            let last_stop = || db.get_instance_full("kole").unwrap().unwrap().last_stop;
+            // A native `--resume` bound the process to the restored identity.
+            stdio_launch_row(&db, "kole", "stdio-proc", "sess-r");
+            let tap = StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20))
+                .unwrap();
+            wait_until("no heartbeat", || last_stop() > 1);
 
-        // Stopped with its bindings between two ticks, then recreated by a
-        // newer launch of the same conversation.
-        db.delete_instance("kole").unwrap();
-        db.delete_process_bindings_for_instance("kole").unwrap();
-        stdio_launch_row(&db, "kole", "next-proc", "sess-r");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(
-            last_stop(),
-            1,
-            "the old launch refreshed its successor's row"
-        );
-        drop(tap);
+            // Stopped between two ticks, then recreated by a newer launch of
+            // the same conversation. With its binding kept, this launch's
+            // binding still names the row: the name, and the incarnation read
+            // back by that name, match the successor.
+            db.delete_instance("kole").unwrap();
+            if !bindings_kept {
+                db.delete_process_bindings_for_instance("kole").unwrap();
+            }
+            stdio_launch_row(&db, "kole", "next-proc", "sess-r");
+            assert_eq!(
+                db.get_process_binding("stdio-proc").unwrap().is_some(),
+                bindings_kept
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(
+                last_stop(),
+                1,
+                "bindings_kept={bindings_kept}: the old launch refreshed its successor's row"
+            );
+            drop(tap);
+        }
     }
 
     #[test]
