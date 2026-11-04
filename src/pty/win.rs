@@ -610,6 +610,8 @@ impl Proxy {
             let local_cursor_reports = !headless && console_input == ConsoleInput::Records;
             filter.set_local_cursor_reports(local_cursor_reports);
             let mut last_child = String::new();
+            let mut child_title_observation =
+                shared::ChildTitleObservation::new(crate::config::Config::get().process_id);
 
             // `hcom term` snapshot refresh (see should_refresh_snapshot). Under
             // sustained output we render at most once per SNAPSHOT_THROTTLE;
@@ -645,6 +647,14 @@ impl Proxy {
                     inject_port,
                     "Periodic dump (win reader loop)",
                 );
+                if let Some(title) = screen.child_title() {
+                    let name = current_name
+                        .read()
+                        .ok()
+                        .map(|name| name.clone())
+                        .unwrap_or_default();
+                    child_title_observation.observe(&name, Some(title));
+                }
                 match rx.recv_timeout(SNAPSHOT_DEBOUNCE) {
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         // Output has been quiet for SNAPSHOT_DEBOUNCE. If a frame

@@ -173,6 +173,63 @@ pub fn refresh_paradev_binding_for_root_hook(
     }
 }
 
+/// Persist a wrapped tool's observed title for its current top-level owner.
+/// Returns whether the observation was accepted (including an unchanged title).
+pub fn persist_observed_child_title(
+    db: &HcomDb,
+    process_id: &str,
+    title: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some(title) = title.filter(|_| !process_id.is_empty()) else {
+        return Ok(false);
+    };
+    let title = crate::pty::screen::sanitize_child_title(title);
+    db.with_write_scope(|| {
+        let Some((Some(session), name)) = db.get_process_binding_full(process_id)? else {
+            return Ok(false);
+        };
+        let Some(row) = db.get_instance_full(&name)? else {
+            return Ok(false);
+        };
+        if session.is_empty()
+            || row.session_id.as_deref() != Some(session.as_str())
+            || crate::instances::is_subagent_instance(&row)
+            || crate::instances::is_remote_instance(&row)
+            || row.status == "stopped"
+        {
+            return Ok(false);
+        }
+        let mut context = match row.launch_context.as_deref().filter(|raw| !raw.is_empty()) {
+            Some(raw) => {
+                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
+                    Ok(context) => context,
+                    Err(_) => return Ok(false),
+                }
+            }
+            None => serde_json::Map::new(),
+        };
+        if context
+            .get("observed_child_title")
+            .and_then(|value| value.as_str())
+            == Some(title.as_str())
+        {
+            return Ok(true);
+        }
+        context.insert("observed_child_title".into(), serde_json::json!(title));
+        context.insert(
+            "observed_child_title_at".into(),
+            serde_json::json!(now_epoch_f64()),
+        );
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::to_string(&context)?),
+        );
+        db.update_instance_fields(&name, &updates)?;
+        Ok(true)
+    })
+}
+
 /// Capture environment context and store it for the instance.
 ///
 /// Captures git branch, terminal program, tty, and relevant env vars.
@@ -187,6 +244,8 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         "process_id",
         "terminal_preset_effective",
         "pid_identity",
+        "observed_child_title",
+        "observed_child_title_at",
     ];
     let missing: Vec<&str> = preserve_keys
         .iter()
@@ -211,7 +270,8 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         {
             for k in &missing {
                 if let Some(val) = old_ctx.get(*k)
-                    && !launch_context_value_missing(Some(val))
+                    && (!launch_context_value_missing(Some(val))
+                        || (*k == "observed_child_title" && val.as_str() == Some("")))
                 {
                     ctx.insert(k.to_string(), val.clone());
                 }
@@ -1434,6 +1494,237 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    fn observed_title_db() -> (HcomDb, PathBuf) {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                r#"INSERT INTO instances
+               (name, tool, session_id, status, status_context, created_at, tag, launch_context)
+               VALUES ('luna', 'codex', 'title-session', 'active', 'tool:exec_command', 1, 'review',
+                       '{"env":{"KEEP":"yes"},"custom":[1,2]}')"#,
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("title-process", "title-session", "luna")
+            .unwrap();
+        (db, path)
+    }
+
+    fn observed_title_identity(db: &HcomDb) -> Vec<rusqlite::types::Value> {
+        let mut statement = db
+            .conn()
+            .prepare("SELECT * FROM instances WHERE name='luna'")
+            .unwrap();
+        let columns: Vec<usize> = statement
+            .column_names()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| (*name != "launch_context").then_some(i))
+            .collect();
+        statement
+            .query_row([], |row| columns.iter().map(|i| row.get(*i)).collect())
+            .unwrap()
+    }
+
+    #[test]
+    fn observed_title_persists_sanitized_change_without_identity_or_status_mutation() {
+        let (db, path) = observed_title_db();
+        let identity = observed_title_identity(&db);
+        assert!(
+            persist_observed_child_title(
+                &db,
+                "title-process",
+                Some("  #1852\nreview\u{0007}\u{202e}  ")
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["observed_child_title"], "#1852 review");
+        assert!(context["observed_child_title_at"].as_f64().unwrap() > 0.0);
+        assert_eq!(context["env"]["KEEP"], "yes");
+        assert_eq!(context["custom"], serde_json::json!([1, 2]));
+        assert_eq!(observed_title_identity(&db), identity);
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_unchanged_has_no_database_write_or_timestamp_refresh() {
+        let (db, path) = observed_title_db();
+        assert!(persist_observed_child_title(&db, "title-process", Some("same title")).unwrap());
+        let original = db
+            .get_instance_full("luna")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        let changes = db.conn().total_changes();
+        assert!(
+            persist_observed_child_title(&db, "title-process", Some("  same   title ")).unwrap()
+        );
+        assert_eq!(db.conn().total_changes(), changes);
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_tracks_ref_to_no_ref_and_explicit_clear() {
+        let (db, path) = observed_title_db();
+        for title in ["#1852 issue review", "ready for next task", ""] {
+            assert!(persist_observed_child_title(&db, "title-process", Some(title)).unwrap());
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(context["observed_child_title"], title);
+            assert!(context.get("observed_child_title_at").is_some());
+        }
+        let original = db
+            .get_instance_full("luna")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        assert!(!persist_observed_child_title(&db, "title-process", None).unwrap());
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_skips_child_stopped_and_stale_process_rows() {
+        for rejection in ["child", "stopped", "stale", "missing"] {
+            let (db, path) = observed_title_db();
+            match rejection {
+                "child" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET parent_name='parent' WHERE name='luna'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "stopped" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET status='stopped' WHERE name='luna'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "stale" => {
+                    db.set_process_binding("title-process", "older-session", "luna")
+                        .unwrap();
+                }
+                "missing" => {
+                    db.delete_process_binding("title-process").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let original = db
+                .get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context;
+            let changes = db.conn().total_changes();
+            assert!(
+                !persist_observed_child_title(&db, "title-process", Some("#1852 stale")).unwrap()
+            );
+            assert_eq!(db.conn().total_changes(), changes, "{rejection}");
+            assert_eq!(
+                db.get_instance_full("luna")
+                    .unwrap()
+                    .unwrap()
+                    .launch_context,
+                original
+            );
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn observed_title_uses_current_process_owner_and_caps_long_titles() {
+        let (db, path) = observed_title_db();
+        let original = db
+            .get_instance_full("luna")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        db.conn().execute("INSERT INTO instances (name, tool, session_id, status, created_at) VALUES ('nova', 'codex', 'new-session', 'listening', 1)", []).unwrap();
+        db.set_process_binding("title-process", "new-session", "nova")
+            .unwrap();
+        assert!(
+            persist_observed_child_title(&db, "title-process", Some(&"a".repeat(500))).unwrap()
+        );
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            context["observed_child_title"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            160
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn observed_title_pair_survives_context_recapture_even_when_cleared() {
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "");
+        for title in ["#1852 issue review", ""] {
+            let (db, path) = observed_title_db();
+            let context =
+                serde_json::json!({"observed_child_title":title,"observed_child_title_at":12.5});
+            db.conn()
+                .execute(
+                    "UPDATE instances SET launch_context=?1 WHERE name='luna'",
+                    [context.to_string()],
+                )
+                .unwrap();
+            capture_and_store_launch_context(&db, "luna");
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let actual: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(actual["observed_child_title"], title);
+            assert_eq!(actual["observed_child_title_at"], 12.5);
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn observed_title_old_row_without_observation_reads_without_writing() {
+        let (db, path) = observed_title_db();
+        let changes = db.conn().total_changes();
+        assert!(!persist_observed_child_title(&db, "title-process", None).unwrap());
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert!(context.get("observed_child_title").is_none());
+        assert!(context.get("observed_child_title_at").is_none());
+        assert_eq!(db.conn().total_changes(), changes);
+        cleanup(path);
     }
 
     #[test]

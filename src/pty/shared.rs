@@ -30,6 +30,39 @@ use crate::tool::Tool;
 use super::PtyTarget;
 use super::screen::ScreenTracker;
 
+/// Independent of the displayed title mode: custom tab titles can hide OSC.
+pub(super) struct ChildTitleObservation {
+    process_id: Option<String>,
+    last: Option<(String, String)>,
+}
+
+impl ChildTitleObservation {
+    pub(super) fn new(process_id: Option<String>) -> Self {
+        Self {
+            process_id,
+            last: None,
+        }
+    }
+
+    pub(super) fn observe(&mut self, display_name: &str, title: Option<&str>) {
+        let (Some(process_id), Some(title)) = (self.process_id.as_deref(), title) else {
+            return;
+        };
+        let observation = (display_name.to_string(), title.to_string());
+        if self.last.as_ref() == Some(&observation) {
+            return;
+        }
+        let result = HcomDb::open().and_then(|db| {
+            crate::instance_binding::persist_observed_child_title(&db, process_id, Some(title))
+        });
+        match result {
+            Ok(true) => self.last = Some(observation),
+            Ok(false) => {} // Retry after a launch placeholder binds, even without more output.
+            Err(error) => log_error("pty", "observe_child_title", &error.to_string()),
+        }
+    }
+}
+
 /// User-activity cooldown applied uniformly across tools (0.5s). Dim detection
 /// enables this for Claude.
 pub(super) const USER_ACTIVITY_COOLDOWN_MS: u64 = 500;
@@ -1318,6 +1351,46 @@ fn advance_pending_utf8(mut pending: u8, data: &[u8]) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn observed_title_retries_unbound_launch_and_follows_rebind_and_clear() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut observation = ChildTitleObservation::new(Some("title-process".into()));
+        observation.observe("review-luna", Some("#1852 issue review"));
+        for (name, session) in [("luna", "luna-session"), ("nova", "nova-session")] {
+            db.conn().execute(
+                "INSERT INTO instances (name, tool, session_id, status, created_at) VALUES (?1, 'codex', ?2, 'listening', 1)",
+                rusqlite::params![name, session],
+            ).unwrap();
+            db.set_process_binding("title-process", session, name)
+                .unwrap();
+            observation.observe(&format!("review-{name}"), Some("#1852 issue review"));
+            let row = db.get_instance_full(name).unwrap().unwrap();
+            let context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(context["observed_child_title"], "#1852 issue review");
+        }
+        observation.observe("review-nova", Some(""));
+        let original = db
+            .get_instance_full("nova")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        let context: serde_json::Value =
+            serde_json::from_str(original.as_deref().unwrap()).unwrap();
+        assert_eq!(context["observed_child_title"], "");
+        observation.observe("review-nova", None);
+        observation.observe("review-nova", Some(""));
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn intentional_kill_is_not_a_launch_failure_even_after_row_deletion() {
