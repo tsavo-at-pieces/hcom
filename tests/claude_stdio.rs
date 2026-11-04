@@ -327,12 +327,9 @@ exit 3
     assert_no_registered_instances(&h);
 }
 
-#[test]
-fn claude_stdio_listening_row_stays_live_while_the_child_runs() {
-    let h = Hcom::new();
-    install_fake_claude(
-        &h,
-        r##"#!/bin/sh
+/// A Claude that completes one turn through its hooks, prints `idle` and runs
+/// no further hook until stdin closes.
+const IDLE_CLAUDE: &str = r##"#!/bin/sh
 if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
 sid=7d1e5a2b-3c4f-4a6b-8d9e-0f1a2b3c4d5e
 hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
@@ -343,13 +340,32 @@ hook poll "{\"session_id\":\"$sid\",\"hook_event_name\":\"Stop\",\"stop_hook_act
 printf 'idle\n'
 IFS= read -r line
 exit 0
-"##,
-    );
+"##;
+
+/// `last_stop`, the heartbeat column, of the only registered instance.
+fn only_last_stop(h: &Hcom) -> i64 {
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    db.query_row("SELECT last_stop FROM instances", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn claude_stdio_listening_row_stays_live_while_the_child_runs() {
+    let h = Hcom::new();
+    install_fake_claude(&h, IDLE_CLAUDE);
     h.set_launch_env("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom"));
-    // Text output has no stdout tap; the heartbeat covers every stdio launch.
+    // The heartbeat belongs to the stream-json tap.
     let mut child = h
         .cmd()
-        .args(["claude", "--stdio", "--go", "--", "-p"])
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -366,6 +382,39 @@ exit 0
     let rows = h.list_json().unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["status"], "listening", "{rows:?}");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    assert_no_registered_instances(&h);
+}
+
+/// Only the stream-json tap refreshes the heartbeat: any other output format
+/// keeps the inherited stdout and the row's liveness as Stop left it.
+#[test]
+fn claude_stdio_text_output_starts_no_heartbeat() {
+    let h = Hcom::new();
+    install_fake_claude(&h, IDLE_CLAUDE);
+    h.set_launch_env("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom"));
+    let mut child = h
+        .cmd()
+        .args(["claude", "--stdio", "--go", "--", "-p"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "idle\n");
+    let stopped = only_last_stop(&h);
+    // Longer than one heartbeat interval.
+    std::thread::sleep(Duration::from_secs(7));
+    assert_eq!(
+        only_last_stop(&h),
+        stopped,
+        "a text-output launch heartbeats"
+    );
     drop(stdin);
     assert!(child.wait().unwrap().success());
     assert_no_registered_instances(&h);

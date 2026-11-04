@@ -2585,7 +2585,6 @@ fn launch_stdio(
         .created_at;
     let stdout_tap = stdio_stdout_tap(tool, db, &params.args, process_id);
     let mut child_pid = 0;
-    let mut heartbeat = None;
     let exit_code = crate::sys::process::run_stdio_child(&mut command, stdout_tap, |pid| {
         child_pid = pid;
         db.store_launch_context(
@@ -2627,12 +2626,8 @@ fn launch_stdio(
                 "background": false, "stdio": true, "tag": tag, "instances": [instance_name],
             }),
         )?;
-        if tool == "claude" {
-            heartbeat = StdioHeartbeat::start(db, process_id, STDIO_HEARTBEAT_INTERVAL);
-        }
         Ok(())
     })?;
-    drop(heartbeat);
     let bound_name = db
         .get_process_binding(process_id)?
         .unwrap_or_else(|| instance_name.to_string());
@@ -2750,69 +2745,6 @@ fn valid_codex_stdio_args(args: &[String]) -> bool {
 /// looks stale ([`crate::instance_lifecycle::HEARTBEAT_THRESHOLD_NO_TCP`]).
 const STDIO_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Refreshes the heartbeat of the row a stdio launch's process is bound to,
-/// until dropped. This transport has no delivery loop or notify endpoint, so
-/// nothing else shows that an idle pipe client is still alive.
-struct StdioHeartbeat {
-    stop: Option<std::sync::mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl StdioHeartbeat {
-    fn start(db: &HcomDb, process_id: &str, interval: std::time::Duration) -> Option<Self> {
-        let started = HcomDb::open_at(db.path()).and_then(|mut db| {
-            let process_id = process_id.to_string();
-            let (stop, stopped) = std::sync::mpsc::channel::<()>();
-            let thread = std::thread::Builder::new()
-                .name("stdio-heartbeat".into())
-                .spawn(move || {
-                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-                        stopped.recv_timeout(interval)
-                    {
-                        db.reconnect_if_stale();
-                        if let Err(error) = refresh_stdio_heartbeat(&db, &process_id) {
-                            crate::log::log_warn(
-                                "launcher",
-                                "stdio.heartbeat_failed",
-                                &error.to_string(),
-                            );
-                        }
-                    }
-                })?;
-            Ok(Self {
-                stop: Some(stop),
-                thread: Some(thread),
-            })
-        });
-        started
-            .inspect_err(|error| {
-                crate::log::log_warn("launcher", "stdio.heartbeat_failed", &error.to_string());
-            })
-            .ok()
-    }
-}
-
-impl Drop for StdioHeartbeat {
-    fn drop(&mut self) {
-        self.stop.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// The process binding names the row: SessionStart of a native `--resume`
-/// moves the process from its launch placeholder to the restored identity.
-fn refresh_stdio_heartbeat(db: &HcomDb, process_id: &str) -> Result<bool> {
-    let Some(name) = db.get_process_binding(process_id)? else {
-        return Ok(false);
-    };
-    let Some(row) = db.get_instance_full(&name)? else {
-        return Ok(false);
-    };
-    db.update_stdio_heartbeat(&name, row.created_at)
-}
-
 /// How long the post-exit cleanup waits for the tap's recorder to apply what
 /// it has queued.
 const STDIO_RECORDER_FINISH: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2833,7 +2765,7 @@ fn stdio_stdout_tap(
     if formats.last().map(String::as_str) != Some("stream-json") {
         return None;
     }
-    match StdioTurnTap::start(db, process_id) {
+    match StdioTurnTap::start(db, process_id, STDIO_HEARTBEAT_INTERVAL) {
         Ok(tap) => Some(Box::new(tap)),
         Err(error) => {
             crate::log::log_warn("launcher", "stdio.turn_tap_failed", &error.to_string());
@@ -2842,43 +2774,78 @@ fn stdio_stdout_tap(
     }
 }
 
-/// Reads a Claude stream-json client's turn ends off its copied stdout. The
-/// copy thread only classifies lines and queues the few that end a turn; a
-/// recorder thread with its own connection makes every database read and
-/// write, in the order the frames were read.
+/// Reads a Claude stream-json client's turn ends off its copied stdout and
+/// keeps the idle row live. The copy thread only classifies lines and queues
+/// the few that end a turn; a recorder thread with its own connection makes
+/// every database read and write, in the order the frames were read.
 struct StdioTurnTap {
     turn_ends: Option<std::sync::mpsc::Sender<crate::hooks::claude::StdioTurnEnd>>,
+    /// Cleared once the child is reaped: no heartbeat after that.
+    child_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Disconnects when the recorder thread exits. (A receiver is not `Sync`.)
     recorder_done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl StdioTurnTap {
-    fn start(db: &HcomDb, process_id: &str) -> Result<Self> {
-        let mut recorder_db = HcomDb::open_at(db.path())?;
-        let (turn_ends, queue) = std::sync::mpsc::channel::<crate::hooks::claude::StdioTurnEnd>();
+    fn start(db: &HcomDb, process_id: &str, heartbeat: std::time::Duration) -> Result<Self> {
+        let recorder_db = HcomDb::open_at(db.path())?;
+        let (turn_ends, queue) = std::sync::mpsc::channel();
         let (done, recorder_done) = std::sync::mpsc::channel::<()>();
+        let child_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running = child_running.clone();
         let process_id = process_id.to_string();
         std::thread::Builder::new()
             .name("stdio-recorder".into())
             .spawn(move || {
                 let _done = done;
-                for end in queue {
-                    recorder_db.reconnect_if_stale();
-                    if let Err(error) =
-                        crate::hooks::claude::record_stdio_turn_end(&recorder_db, &process_id, &end)
-                    {
+                record_stdio_turns(recorder_db, &process_id, &queue, &running, heartbeat);
+            })?;
+        Ok(Self {
+            turn_ends: Some(turn_ends),
+            child_running,
+            recorder_done: std::sync::Mutex::new(recorder_done),
+        })
+    }
+}
+
+/// The recorder thread: applies queued turn ends in order and, while the
+/// child runs, refreshes the heartbeat every `interval`. A refresh already
+/// under way when the child is reaped records a time from before the reap.
+fn record_stdio_turns(
+    mut db: HcomDb,
+    process_id: &str,
+    queue: &std::sync::mpsc::Receiver<crate::hooks::claude::StdioTurnEnd>,
+    running: &std::sync::atomic::AtomicBool,
+    interval: std::time::Duration,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut next_beat = std::time::Instant::now() + interval;
+    loop {
+        match queue.recv_timeout(next_beat.saturating_duration_since(std::time::Instant::now())) {
+            Ok(end) => {
+                db.reconnect_if_stale();
+                if let Err(error) =
+                    crate::hooks::claude::record_stdio_turn_end(&db, process_id, &end)
+                {
+                    crate::log::log_warn("launcher", "stdio.turn_end_failed", &error.to_string());
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                next_beat = std::time::Instant::now() + interval;
+                if running.load(std::sync::atomic::Ordering::Acquire) {
+                    db.reconnect_if_stale();
+                    if let Err(error) = db.update_stdio_heartbeat(process_id) {
                         crate::log::log_warn(
                             "launcher",
-                            "stdio.turn_end_failed",
+                            "stdio.heartbeat_failed",
                             &error.to_string(),
                         );
                     }
                 }
-            })?;
-        Ok(Self {
-            turn_ends: Some(turn_ends),
-            recorder_done: std::sync::Mutex::new(recorder_done),
-        })
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
@@ -2892,8 +2859,10 @@ impl crate::sys::process::StdoutTap for StdioTurnTap {
         }
     }
 
-    /// Recording needs no live child: frames read during the drain still count.
-    fn child_exited(&self) {}
+    fn child_exited(&self) {
+        self.child_running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl Drop for StdioTurnTap {
@@ -4877,38 +4846,6 @@ mod tests {
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
     }
 
-    #[test]
-    fn stdio_heartbeat_follows_the_process_binding_until_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        // A native `--resume` rebound the process from its launch row.
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, session_id, tool, status, status_context, created_at, last_stop)
-                 VALUES ('kole', 'sess-r', 'claude', 'listening', '', 1700000000.25, 1)",
-                [],
-            )
-            .unwrap();
-        db.set_process_binding("stdio-proc", "sess-r", "kole")
-            .unwrap();
-        let last_stop = || db.get_instance_full("kole").unwrap().unwrap().last_stop;
-
-        let heartbeat =
-            StdioHeartbeat::start(&db, "stdio-proc", std::time::Duration::from_millis(20)).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while last_stop() == 1 {
-            assert!(std::time::Instant::now() < deadline, "no heartbeat");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        drop(heartbeat);
-        db.conn()
-            .execute("UPDATE instances SET last_stop = 1 WHERE name = 'kole'", [])
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert_eq!(last_stop(), 1, "heartbeat continued after the child exited");
-        assert!(!refresh_stdio_heartbeat(&db, "other-proc").unwrap());
-    }
-
     /// `name` as a stdio launch of `process_id` leaves it: bound, with its token.
     fn stdio_launch_row(db: &HcomDb, name: &str, process_id: &str, session_id: &str) {
         db.conn()
@@ -4927,6 +4864,61 @@ mod tests {
             .unwrap();
     }
 
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn stdio_tap_heartbeat_never_touches_a_row_another_launch_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let last_stop = || db.get_instance_full("kole").unwrap().unwrap().last_stop;
+        // A native `--resume` bound the process to the restored identity.
+        stdio_launch_row(&db, "kole", "stdio-proc", "sess-r");
+        let tap =
+            StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20)).unwrap();
+        wait_until("no heartbeat", || last_stop() > 1);
+
+        // Stopped with its bindings between two ticks, then recreated by a
+        // newer launch of the same conversation.
+        db.delete_instance("kole").unwrap();
+        db.delete_process_bindings_for_instance("kole").unwrap();
+        stdio_launch_row(&db, "kole", "next-proc", "sess-r");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            last_stop(),
+            1,
+            "the old launch refreshed its successor's row"
+        );
+        drop(tap);
+    }
+
+    #[test]
+    fn stdio_tap_heartbeat_stops_when_the_child_is_reaped() {
+        use crate::sys::process::StdoutTap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let last_stop = || db.get_instance_full("nova").unwrap().unwrap().last_stop;
+        stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
+        let tap =
+            StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20)).unwrap();
+        wait_until("no heartbeat", || last_stop() > 1);
+        tap.child_exited();
+        // A refresh already under way may still land; none starts after it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        db.conn()
+            .execute("UPDATE instances SET last_stop = 1 WHERE name = 'nova'", [])
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(last_stop(), 1, "heartbeat continued after the reap");
+        drop(tap);
+    }
+
     #[test]
     fn stdio_tap_records_turn_ends_in_order_off_the_copy_thread() {
         use crate::sys::process::StdoutTap;
@@ -4937,7 +4929,8 @@ mod tests {
         crate::instance_lifecycle::set_status(&db, "nova", "active", "prompt", Default::default());
         std::thread::sleep(std::time::Duration::from_millis(2));
         let emitted_after = std::time::SystemTime::now();
-        let tap = StdioTurnTap::start(&db, "stdio-proc").unwrap();
+        let tap =
+            StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_secs(60)).unwrap();
         // Held for the whole recording: observe never waits for the database.
         db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
         let started = std::time::Instant::now();
