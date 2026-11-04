@@ -564,6 +564,155 @@ exit 5
     }
 }
 
+/// Wait up to `limit` for hcom to exit. One still running then is killed, so
+/// the test fails instead of hanging.
+fn wait_for_hcom(
+    h: &Hcom,
+    hcom: &mut std::process::Child,
+    limit: Duration,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = hcom.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = hcom.kill();
+            let _ = hcom.wait();
+            panic!("hcom still ran after {limit:?}\n{}", h.diagnostics());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The PID a shim wrote to `file`, once it has.
+fn shim_pid(h: &Hcom, file: &std::path::Path) -> i32 {
+    // Only a precondition: a loaded host may take long to exec the shim.
+    h.eventually("the child to start", Duration::from_secs(300), || {
+        Ok(fs::read_to_string(file)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok()))
+    })
+}
+
+/// A cancellation that hcom forwards while Claude runs still ends hcom with
+/// Claude when the client has stopped reading: a write the client has not
+/// taken for the drain's idle bound is not waited for, as hcom would not
+/// wait for a Claude blocked writing to that client.
+#[test]
+fn claude_stdio_forwarded_cancellation_ends_a_copy_the_client_stopped_taking() {
+    let h = Hcom::new();
+    let started = h.root_path().join("started");
+    h.set_launch_env("FAKE_STARTED", started.to_str().unwrap());
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+pad=$(head -c 30000 /dev/zero | tr '\0' z)
+printf '{"type":"stream_event","pad":"%s"}\n' "$pad"
+printf '%s\n' "$$" > "$FAKE_STARTED"
+while :; do printf '{"type":"stream_event","pad":"%s"}\n' "$pad"; done
+"#,
+    );
+    // The client's pipe starts full and is never read: the copy blocks on
+    // its first write, and Claude then blocks writing as well.
+    let (client, sink, _) = full_client_pipe();
+    let mut hcom = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(sink)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = shim_pid(&h, &started);
+    assert_eq!(unsafe { libc::kill(hcom.id() as i32, libc::SIGTERM) }, 0);
+    let status = wait_for_hcom(&h, &mut hcom, Duration::from_secs(60));
+    // hcom forwarded the TERM, and the child died of it.
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM));
+    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the child outlived hcom");
+    drop(client);
+    assert_no_registered_instances(&h);
+}
+
+/// Whether `pid` has exited and waits to be reaped.
+fn is_zombie(pid: i32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
+}
+
+/// TERM that reaches hcom together with the child's exit, so that hcom finds
+/// the child already exited, ends the wait for a client that is not reading
+/// at once, as one arriving during the drain does. hcom is stopped while the
+/// child exits, so both signals are pending when it resumes, and it takes
+/// them in signal-number order: TERM before CHLD.
+#[test]
+fn claude_stdio_signal_arriving_with_the_exit_ends_a_stalled_copy() {
+    let h = Hcom::new();
+    let started = h.root_path().join("started");
+    let go = h.root_path().join("go");
+    h.set_launch_envs(&[
+        ("FAKE_STARTED", started.to_str().unwrap()),
+        ("FAKE_GO", go.to_str().unwrap()),
+    ]);
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+printf '%s\n' "$$" > "$FAKE_STARTED"
+while [ ! -e "$FAKE_GO" ]; do sleep 0.05; done
+printf '{"type":"result","subtype":"success","is_error":false}\n'
+exit 5
+"#,
+    );
+    // Small enough for the child's pipe while hcom is stopped; the client's
+    // full pipe then holds it in the copy.
+    let (client, sink, _) = full_client_pipe();
+    let mut hcom = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(sink)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = shim_pid(&h, &started);
+    let supervisor = hcom.id() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGSTOP) }, 0);
+    fs::write(&go, "").unwrap();
+    h.eventually("the child to exit", Duration::from_secs(300), || {
+        Ok(is_zombie(pid).then_some(()))
+    });
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGCONT) }, 0);
+    let status = wait_for_hcom(&h, &mut hcom, Duration::from_secs(60));
+    assert_eq!(status.code(), Some(5));
+    drop(client);
+    assert_no_registered_instances(&h);
+}
+
 /// HUP, INT and TERM reach a stream-json child's process group exactly as
 /// they reach an untapped one, and what it writes on the way out arrives.
 #[test]

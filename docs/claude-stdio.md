@@ -13,9 +13,12 @@ held back for a whole line. hcom reads the copied lines only to find the
 frames that end a turn. A caller that closes stdout gives Claude the broken
 pipe it would otherwise get. Everything Claude wrote before it exited reaches
 a caller that keeps stdout open, however slowly it reads, before hcom exits,
-unless SIGHUP, SIGINT or SIGTERM reaches hcom once Claude has exited: hcom
-then stops without the rest, as the signal would have stopped a Claude still
-blocked writing to the caller. If a descendant of Claude still holds the
+with two exceptions that stop hcom without the output the caller has not
+taken, as they would have stopped a Claude still blocked writing to the
+caller: SIGHUP, SIGINT or SIGTERM reaching hcom once Claude has exited stops
+it at once, and after hcom has forwarded one of them to Claude (or killed
+Claude after a failed launch), it stops once Claude has exited and one write
+to the caller has waited 5 seconds. If a descendant of Claude still holds the
 pipe, hcom stops copying once it has been empty for 5 seconds or, while the
 descendant keeps writing, the next time it is empty after 30 seconds. stdin
 and stderr are inherited, and so is stdout for any other output format and

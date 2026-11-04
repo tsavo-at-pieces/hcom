@@ -29,8 +29,9 @@ pub trait StdoutTap: Send + Sync {
 /// hcom's own stdout; otherwise it inherits that stdout directly. The copy
 /// delivers everything the child wrote before it was reaped and is joined
 /// before this returns, unless HUP, INT or TERM reaches hcom once the child
-/// has exited: that ends the wait, as it would end a child still blocked
-/// writing to the client.
+/// has exited, or hcom signalled the child and the client then takes nothing
+/// for the drain's idle bound. Either ends the wait, as hcom would not wait
+/// for a child blocked writing to that client.
 #[cfg(unix)]
 pub fn run_stdio_child(
     command: &mut Command,
@@ -44,6 +45,7 @@ pub fn run_stdio_child(
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::Stdio;
     use std::sync::Arc;
+    use tapped_stdout::DrainWait;
 
     let mut signals = Signals::new([SIGCHLD, SIGHUP, SIGINT, SIGTERM])?;
     let tap = stdout_tap.map(Arc::<dyn StdoutTap>::from);
@@ -66,8 +68,7 @@ pub fn run_stdio_child(
     let mut child = command.spawn()?;
     let pid = child.id();
     let mut forwarder = None;
-    // A cancellation that found the child already exited ends the drain.
-    let mut unforwarded = None;
+    let mut drain_wait = DrainWait::Delivered;
     let result = (|| {
         if let (Some(source), Some(sink), Some(tap)) = (child.stdout.take(), sink, tap.clone()) {
             forwarder = Some(tapped_stdout::Forwarder::spawn(
@@ -86,7 +87,7 @@ pub fn run_stdio_child(
                 // observes it. Never signal after a successful wait.
                 if let Some(status) = child.try_wait()? {
                     if signal != SIGCHLD {
-                        unforwarded = Some(signal);
+                        drain_wait = DrainWait::Signalled(signal);
                     }
                     return Ok(status
                         .code()
@@ -97,6 +98,7 @@ pub fn run_stdio_child(
                     unsafe {
                         libc::kill(-(pid as i32), signal);
                     }
+                    drain_wait = DrainWait::Cancelled;
                 }
             }
         }
@@ -104,6 +106,9 @@ pub fn run_stdio_child(
     if result.is_err() {
         kill_group(pid);
         let _ = child.wait();
+        if let DrainWait::Delivered = drain_wait {
+            drain_wait = DrainWait::Cancelled;
+        }
     }
     // Reaped on every path: whatever needs a live child stops before the
     // drain, which has no deadline while the client takes the output.
@@ -111,7 +116,7 @@ pub fn run_stdio_child(
         let _ = catch_unwind(AssertUnwindSafe(|| tap.child_exited()));
     }
     if let Some(forwarder) = forwarder {
-        forwarder.finish(&mut signals, unforwarded);
+        forwarder.finish(&mut signals, drain_wait);
     }
     drop(tap);
     result
@@ -167,12 +172,32 @@ mod tapped_stdout {
         ended: Arc<Mutex<Ended>>,
     }
 
-    /// Whether the copy has ended. A supervisor waiting for signals leaves
-    /// its handle here, so that the end wakes it.
+    /// What ends the wait for an exited child's output besides its delivery
+    /// and HUP, INT or TERM reaching hcom meanwhile.
+    #[derive(Clone, Copy)]
+    pub(super) enum DrainWait {
+        /// Nothing else: the client gets it however slowly it reads.
+        Delivered,
+        /// One write to hcom's stdout under way for the idle bound. hcom
+        /// signalled the child (forwarding HUP, INT or TERM, or killing it
+        /// after a failed launch), so it does not wait for a client that
+        /// takes nothing that long, as it would not have waited for a child
+        /// blocked writing to that client.
+        Cancelled,
+        /// This signal, which reached hcom once the child had exited.
+        Signalled(libc::c_int),
+    }
+
+    /// Whether the copy has ended, or has stalled writing to hcom's stdout.
+    /// A supervisor waiting for signals leaves its handle here, so that
+    /// either wakes it.
     #[derive(Default)]
     struct Ended {
         done: bool,
+        stalled: bool,
         waiter: Option<Handle>,
+        /// When the write to hcom's stdout now under way began.
+        writing_since: Option<Instant>,
     }
 
     fn lock(ended: &Mutex<Ended>) -> MutexGuard<'_, Ended> {
@@ -203,6 +228,7 @@ mod tapped_stdout {
             let lines = LineTap::new(tap, LINE_LIMIT);
             let ended = Arc::new(Mutex::new(Ended::default()));
             let guard = EndGuard(ended.clone());
+            let writes = ended.clone();
             let thread = std::thread::Builder::new()
                 .name("stdio-stdout".into())
                 .spawn(move || {
@@ -210,7 +236,12 @@ mod tapped_stdout {
                     forward(
                         source.as_fd(),
                         exit_notice.as_fd(),
-                        |bytes| write_all(sink.as_fd(), bytes),
+                        |bytes| {
+                            lock(&writes).writing_since = Some(Instant::now());
+                            let written = write_all(sink.as_fd(), bytes);
+                            lock(&writes).writing_since = None;
+                            written
+                        },
                         lines,
                         spawned_at,
                         DRAIN,
@@ -223,11 +254,10 @@ mod tapped_stdout {
             })
         }
 
-        /// Report the child's exit and wait until its output is delivered.
-        /// HUP, INT or TERM (`stop`, or one arriving meanwhile) ends the wait
-        /// instead. The copy, perhaps blocked writing to a client that is not
-        /// reading, is then left to end with hcom.
-        pub(super) fn finish(self, signals: &mut Signals, mut stop: Option<libc::c_int>) {
+        /// Report the child's exit and wait until its output is delivered,
+        /// or as `wait` allows. The copy, perhaps blocked writing to a client
+        /// that is not reading, is then left to end with hcom.
+        pub(super) fn finish(self, signals: &mut Signals, wait: DrainWait) {
             {
                 let mut ended = lock(&self.ended);
                 if !ended.done {
@@ -235,24 +265,81 @@ mod tapped_stdout {
                 }
             }
             drop(self.exited);
+            let mut stop = None;
+            match wait {
+                DrainWait::Delivered => {}
+                DrainWait::Cancelled => watch_for_a_stall(self.ended.clone(), DRAIN.idle),
+                DrainWait::Signalled(signal) => stop = Some(signal),
+            }
             loop {
-                if lock(&self.ended).done {
+                let (done, stalled) = {
+                    let ended = lock(&self.ended);
+                    (ended.done, ended.stalled)
+                };
+                if done {
                     let _ = self.thread.join();
                     return;
                 }
-                // Closing the handle at the end of the copy wakes this wait.
+                if stalled {
+                    copy_stopped(&format!(
+                        "hcom signalled the child and one write waited {}s for the client",
+                        DRAIN.idle.as_secs()
+                    ));
+                    return;
+                }
+                // Closing the handle at the end of the copy, or once it
+                // stalls, wakes this wait.
                 let signal = stop
                     .take()
                     .or_else(|| signals.wait().find(|&signal| signal != SIGCHLD));
                 if let Some(signal) = signal {
-                    crate::log::log_warn(
-                        "launcher",
-                        "stdio.stdout_copy_stopped",
-                        &format!("signal {signal} ended the copy of the exited child's stdout"),
-                    );
+                    copy_stopped(&format!("signal {signal} reached hcom"));
                     return;
                 }
             }
+        }
+    }
+
+    /// The supervisor stopped waiting for the exited child's stdout copy.
+    fn copy_stopped(why: &str) {
+        crate::log::log_warn(
+            "launcher",
+            "stdio.stdout_copy_stopped",
+            &format!("stopped waiting for the copy of the exited child's stdout: {why}"),
+        );
+    }
+
+    /// Mark the copy stalled and wake the supervisor once one write to
+    /// hcom's stdout has been under way for `idle`.
+    fn watch_for_a_stall(ended: Arc<Mutex<Ended>>, idle: Duration) {
+        let watch = move || {
+            loop {
+                let wait = {
+                    let mut ended = lock(&ended);
+                    if ended.done {
+                        return;
+                    }
+                    match ended.writing_since.map(|since| since.elapsed()) {
+                        Some(waited) if waited >= idle => {
+                            ended.stalled = true;
+                            if let Some(waiter) = ended.waiter.take() {
+                                waiter.close();
+                            }
+                            return;
+                        }
+                        Some(waited) => idle - waited,
+                        None => idle,
+                    }
+                };
+                std::thread::sleep(wait);
+            }
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("stdio-stall".into())
+            .spawn(watch)
+        {
+            // Without the watch, only the copy's end or a signal ends the wait.
+            crate::log::log_warn("launcher", "stdio.stall_watch_failed", &error.to_string());
         }
     }
 
