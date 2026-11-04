@@ -7,7 +7,13 @@ The client must supply its own native Claude flags, including `-p`/`--print`.
 hcom preserves the native arguments and does not add stream format defaults.
 
 hcom prepares its usual per-launch hooks, reserves a fresh process identity,
-and remains the native child's parent. It does not create a terminal, print a
+and remains the native child's parent. The child runs the executable hcom's
+install check resolved, with the launched environment minus a parent Claude's
+instance state (`CLAUDE_CODE_CHILD_SESSION` and the messaging socket and token
+belong to that parent and would stop the new session's transcript). Its hooks
+name the canonical path of the hcom image that launched it, and its batch and
+launch-failure events carry the launcher and batch that hcom resolved for it,
+not the environment of the hcom process itself. It does not create a terminal, print a
 launch banner, or redirect output to a background log. Native `SessionStart`
 binds the real session ID. Signals reach the child's process group; hcom returns
 its exit status and cleans up its registration if `SessionEnd` was not emitted.

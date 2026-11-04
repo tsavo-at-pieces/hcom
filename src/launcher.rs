@@ -2061,6 +2061,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         if params.stdio {
             instance_env.insert("HCOM_PTY_MODE".into(), "0".into());
             instance_env.remove("HCOM_BACKGROUND");
+            // The runner scripts `unset` the tool's instance state before exec
+            // (a parent Claude's CHILD_SESSION turns off transcript saving; its
+            // messaging socket and token belong to that parent). The stdio
+            // spawn has no runner, so drop them from the map it passes, after
+            // every overlay.
+            for var in normalized.tool().spec().instance_state_env {
+                instance_env.remove(*var);
+            }
         }
         // A resume's message cursor predates its previous incarnation's
         // events (e.g. the kill that stopped it), so "did this launch get
@@ -2209,9 +2217,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 db,
                 &params,
                 &instance_env,
-                &instance_name,
-                &process_id,
-                &batch_id,
+                StdioLaunchIdentity {
+                    instance_name: &instance_name,
+                    process_id: &process_id,
+                    batch_id: &batch_id,
+                    launcher_name: &launcher_name,
+                    tag: &effective_tag,
+                },
             );
             if result.is_err() {
                 cleanup_instance(db, &instance_name, &process_id);
@@ -2497,6 +2509,18 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     })
 }
 
+/// What one stdio launch is, as the launcher resolved it: the registered row, its
+/// fresh process id and batch, and who launched it. The supervising hcom process
+/// may itself run inside another launch, whose `HCOM_LAUNCHED_BY` and batch must
+/// never be reported for the child it supervises.
+struct StdioLaunchIdentity<'a> {
+    instance_name: &'a str,
+    process_id: &'a str,
+    batch_id: &'a str,
+    launcher_name: &'a str,
+    tag: &'a str,
+}
+
 /// A pipe client owns the native streams and process lifetime. Keep registration
 /// in the ordinary launcher, but bypass terminal scripts, banners and readiness
 /// output. Native SessionStart is still what establishes the session identity.
@@ -2504,12 +2528,22 @@ fn launch_stdio(
     db: &HcomDb,
     params: &LaunchParams,
     env: &HashMap<String, String>,
-    instance_name: &str,
-    process_id: &str,
-    batch_id: &str,
+    identity: StdioLaunchIdentity<'_>,
 ) -> Result<LaunchResult> {
+    let StdioLaunchIdentity {
+        instance_name,
+        process_id,
+        batch_id,
+        launcher_name,
+        tag,
+    } = identity;
     let working_dir = params.cwd.as_deref().unwrap_or(".");
-    let mut command = std::process::Command::new("claude");
+    // Run the executable the install gate validated (PATH, then the per-user
+    // install directories), as the runner scripts do: resolving the bare name
+    // through the child's PATH alone misses a fallback-only install that
+    // `hcom claude -p` launches.
+    let program = find_tool_path("claude").unwrap_or_else(|| "claude".to_string());
+    let mut command = std::process::Command::new(&program);
     command
         .args(&params.args)
         .env_clear()
@@ -2541,20 +2575,27 @@ fn launch_stdio(
                 working_dir,
             )
         });
+        // The ordinary batch envelope (launcher.rs batch_launched) plus the
+        // transport marker; `check_batch_completion` looks the batch up under
+        // the launcher's name.
         db.log_event(
             "life",
-            params.launcher.as_deref().unwrap_or("user"),
+            launcher_name,
             &json!({
-                "action": "batch_launched", "batch_id": batch_id, "tool": "claude",
-                "count_requested": 1, "launched": 1, "failed": 0,
-                "background": false, "stdio": true, "instances": [instance_name],
+                "action": "batch_launched", "by": launcher_name, "batch_id": batch_id,
+                "tool": "claude", "count_requested": 1, "launched": 1, "failed": 0,
+                "background": false, "stdio": true, "tag": tag, "instances": [instance_name],
             }),
         )?;
         Ok(())
     })?;
     if !crate::hooks::common::launch_reached_ready(db, instance_name, batch_id) {
-        let _ = db.emit_launch_failed_event(
+        let _ = db.emit_launch_failed_event_as(
             instance_name,
+            crate::db::LaunchAttribution {
+                launcher: launcher_name,
+                batch_id,
+            },
             crate::shared::ST_INACTIVE,
             "launch_failed",
             "exited_before_ready",

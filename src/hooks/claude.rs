@@ -2876,8 +2876,9 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     // A foreground pipe build may coexist with an older hcom on PATH. Its
     // Stop hook must run this exact implementation, or it could block the
     // SDK turn using the old detached-print polling behavior.
+    // Pin the image, not the name it was invoked by (runtime_env explains).
     let hook_executable = if ctx.var("HCOM_STDIO_MODE") == Some("1") {
-        Some(std::env::current_exe()?.to_string_lossy().into_owned())
+        Some(crate::runtime_env::pinned_hook_executable()?)
     } else {
         None
     };
