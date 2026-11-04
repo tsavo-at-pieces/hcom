@@ -477,8 +477,8 @@ mod tapped_stdout {
         };
 
         /// Run [`forward`] on its own thread over a fresh pipe, as the
-        /// launcher does: `feed` plays the child, holding the write end.
-        struct Copy {
+        /// launcher does; the test plays the child, holding the write end.
+        struct Copier {
             log: Arc<Mutex<Vec<Copied>>>,
             child: Option<std::io::PipeWriter>,
             /// Dropping it reports the child's exit.
@@ -486,7 +486,7 @@ mod tapped_stdout {
             copier: Option<std::thread::JoinHandle<()>>,
         }
 
-        impl Copy {
+        impl Copier {
             fn start(
                 sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
                 log: &Arc<Mutex<Vec<Copied>>>,
@@ -639,7 +639,7 @@ mod tapped_stdout {
                 data.push(b'\n');
             }
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copy::recording(&log, false, FAST);
+            let mut copy = Copier::recording(&log, false, FAST);
             let mut state = 0x9e37_79b9_u64;
             let mut offset = 0;
             while offset < data.len() {
@@ -674,7 +674,7 @@ mod tapped_stdout {
         #[test]
         fn a_line_follows_the_time_the_pipe_was_last_seen_empty() {
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copy::recording(&log, false, FAST);
+            let mut copy = Copier::recording(&log, false, FAST);
             let delivered = |count: usize| {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while observed(&log.lock().unwrap()).len() < count {
@@ -702,7 +702,7 @@ mod tapped_stdout {
         #[test]
         fn a_failed_tap_never_interrupts_the_copy() {
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copy::recording(&log, true, FAST);
+            let mut copy = Copier::recording(&log, true, FAST);
             copy.child().write_all(b"one\ntwo\nthree\n").unwrap();
             copy.child.take();
             let copied = copy.wait();
@@ -716,7 +716,7 @@ mod tapped_stdout {
             let (client, sink) = std::io::pipe().unwrap();
             drop(client);
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copy::start(
+            let mut copy = Copier::start(
                 move |bytes| write_all(sink.as_fd(), bytes),
                 &log,
                 false,
@@ -774,7 +774,7 @@ mod tapped_stdout {
                 let (mut client, sink) = std::io::pipe().unwrap();
                 let filler = fill(&sink);
                 let log = Arc::new(Mutex::new(Vec::new()));
-                let mut copy = Copy::start(
+                let mut copy = Copier::start(
                     move |bytes| write_all(sink.as_fd(), bytes),
                     &log,
                     false,
@@ -816,7 +816,7 @@ mod tapped_stdout {
         #[test]
         fn a_descendant_holding_an_empty_pipe_ends_the_drain_at_the_idle_bound() {
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copy::recording(&log, false, FAST);
+            let mut copy = Copier::recording(&log, false, FAST);
             copy.child().write_all(b"last\n").unwrap();
             let _descendant = copy.child.take();
             std::thread::sleep(Duration::from_millis(50));
@@ -836,7 +836,7 @@ mod tapped_stdout {
                 cap: Duration::from_millis(300),
             };
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copy::recording(&log, false, limits);
+            let mut copy = Copier::recording(&log, false, limits);
             let mut descendant = copy.child.take().unwrap();
             let writer = std::thread::spawn(move || {
                 let mut sent = 0;
