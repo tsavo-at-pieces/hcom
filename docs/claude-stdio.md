@@ -58,13 +58,15 @@ state `idle`, which Claude writes after each result when the client enables
 session state events, marks a session that is still busy `listening`. A result
 followed by a queued turn, or written during a shutdown, changes nothing.
 hcom records these off the stdout copy, so a busy database never delays
-output, and only while the row is still this launch's, in the frame's session
-and `active` or `blocked`, with no prompt or prompt delivery recorded since
-the frame may have been written (the last time hcom saw the pipe empty before
-reading it). When hcom cannot tell, for example because it read a whole turn
-at once, the status stays as the hooks left it. Nothing on stdout stops a
-session or delivers a message: queued messages still wait for the next native
-prompt.
+output; one that another writer's lock keeps out past the 5 second busy
+timeout is tried again while Claude runs, before anything read after it,
+until it is recorded or refused. It is recorded only while the row is still
+this launch's, in the frame's session and `active` or `blocked`, with no
+prompt or prompt delivery recorded since the frame may have been written
+(the last time hcom saw the pipe empty before reading it). When hcom cannot
+tell, for example because it read a whole turn at once, the status stays as
+the hooks left it. Nothing on stdout stops a session or delivers a message:
+queued messages still wait for the next native prompt.
 
 `--stdio` supports one local Claude print or Codex app-server process. It
 cannot be combined with multiple agents, an unsupported tool, a remote device,

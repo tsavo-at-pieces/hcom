@@ -2749,6 +2749,10 @@ const STDIO_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// it has queued.
 const STDIO_RECORDER_FINISH: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The pause before the recorder tries again a turn end that another room
+/// writer's lock refused; each try already waits out the busy timeout.
+const STDIO_BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Only a Claude stream-json client needs its turn ends read from stdout:
 /// a cancelled turn there runs no Stop hook, while Codex reports one through
 /// its own Interrupt hook. Every other launch keeps the inherited stdout.
@@ -2788,7 +2792,15 @@ struct StdioTurnTap {
 
 impl StdioTurnTap {
     fn start(db: &HcomDb, process_id: &str, heartbeat: std::time::Duration) -> Result<Self> {
-        let recorder_db = HcomDb::open_at(db.path())?;
+        Self::start_recording(HcomDb::open_at(db.path())?, process_id, heartbeat)
+    }
+
+    /// [`Self::start`] with the recorder's own connection.
+    fn start_recording(
+        recorder_db: HcomDb,
+        process_id: &str,
+        heartbeat: std::time::Duration,
+    ) -> Result<Self> {
         let (turn_ends, queue) = std::sync::mpsc::channel();
         let (done, recorder_done) = std::sync::mpsc::channel::<()>();
         let child_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -2812,6 +2824,12 @@ impl StdioTurnTap {
 /// child runs, refreshes the heartbeat every `interval`. A refresh that
 /// passed its check before the reap was reported may land after it, but
 /// records a time taken before that report.
+///
+/// A turn end that another room writer's lock kept out past the busy
+/// timeout is tried again, before anything queued after it, until it is
+/// recorded or refused, while the child runs. That is safe however late:
+/// its guards refuse it once a later turn has started or the row has
+/// moved on. Once the child is reaped, the post-exit cleanup takes over.
 fn record_stdio_turns(
     mut db: HcomDb,
     process_id: &str,
@@ -2822,14 +2840,31 @@ fn record_stdio_turns(
     use std::sync::mpsc::RecvTimeoutError;
 
     let mut next_beat = std::time::Instant::now() + interval;
+    let mut refused = None;
     loop {
-        match queue.recv_timeout(next_beat.saturating_duration_since(std::time::Instant::now())) {
+        let next = match refused.take() {
+            Some(end) => Ok(end),
+            None => {
+                queue.recv_timeout(next_beat.saturating_duration_since(std::time::Instant::now()))
+            }
+        };
+        match next {
             Ok(end) => {
                 db.reconnect_if_stale();
                 if let Err(error) =
                     crate::hooks::claude::record_stdio_turn_end(&db, process_id, &end)
                 {
-                    crate::log::log_warn("launcher", "stdio.turn_end_failed", &error.to_string());
+                    if room_busy(&error) && running.load(std::sync::atomic::Ordering::Acquire) {
+                        crate::log::log_info("launcher", "stdio.turn_end_busy", &error.to_string());
+                        refused = Some(end);
+                        std::thread::sleep(STDIO_BUSY_RETRY);
+                    } else {
+                        crate::log::log_warn(
+                            "launcher",
+                            "stdio.turn_end_failed",
+                            &error.to_string(),
+                        );
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -2849,6 +2884,21 @@ fn record_stdio_turns(
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Whether another room writer's lock kept `error`'s write out.
+fn room_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    })
 }
 
 impl crate::sys::process::StdoutTap for StdioTurnTap {
@@ -4968,6 +5018,47 @@ mod tests {
             ),
             ("listening", "interrupted", "aborted_streaming")
         );
+    }
+
+    #[test]
+    fn stdio_tap_retries_a_turn_end_the_busy_room_kept_out() {
+        use crate::sys::process::StdoutTap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
+        crate::instance_lifecycle::set_status(&db, "nova", "active", "prompt", Default::default());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let emitted_after = std::time::SystemTime::now();
+        // A short busy timeout stands in for the room's 5 s one.
+        let recorder = HcomDb::open_at(db.path()).unwrap();
+        recorder
+            .conn()
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        let tap = StdioTurnTap::start_recording(
+            recorder,
+            "stdio-proc",
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let status = || {
+            let row = db.get_instance_full("nova").unwrap().unwrap();
+            (row.status, row.status_context)
+        };
+        // Another room writer holds the lock for many busy timeouts.
+        db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        tap.observe(
+            br#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-1","terminal_reason":"aborted_streaming","queued_turn_count":0}"#,
+            emitted_after,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(status(), ("active".to_string(), "prompt".to_string()));
+        db.conn().execute_batch("COMMIT").unwrap();
+        wait_until("the turn end to land once the lock was released", || {
+            status() == ("listening".to_string(), "interrupted".to_string())
+        });
+        drop(tap);
     }
 
     #[test]
