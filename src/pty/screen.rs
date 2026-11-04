@@ -1700,6 +1700,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_quoted_approval_above_the_latest_composer_is_not_approval() {
+        for composer in ["›", "»"] {
+            for history in ["", "› Check the other session\r\n"] {
+                let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
+                t.process(
+                    format!(
+                        "{history}Tool output: Do you want to proceed? ❯ 1. Yes\r\n\
+                         The other session is waiting; this session is done.\r\n\
+                         {composer} \x1b[2mAsk Codex to do anything\x1b[0m\r\n\
+                           ? for shortcuts\r\n"
+                    )
+                    .as_bytes(),
+                );
+                assert_eq!(t.get_codex_input_text().as_deref(), Some(""));
+                assert!(
+                    !t.is_codex_approval_visible(),
+                    "quoted history above {composer} must not block the current composer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_live_approval_after_an_ultra_history_prompt_is_still_approval() {
+        let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
+        t.process(
+            "» Run the requested command\r\n\
+             Allow command?\r\n\
+             › 1. Yes, proceed (y)\r\n\
+               2. No (esc)\r\n\
+             Press enter to confirm or esc to cancel\r\n"
+                .as_bytes(),
+        );
+        assert!(t.is_codex_approval_visible());
+    }
+
+    #[test]
     fn codex_transcript_viewer_is_not_approval() {
         let mut t = make_tracker(24, 80, "");
         t.process("Transcript\r\n↑/↓ to scroll  q to quit  esc to edit prev\r\n".as_bytes());
