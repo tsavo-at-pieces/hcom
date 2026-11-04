@@ -1346,6 +1346,58 @@ mod tapped_stdout {
             assert!(started <= emitted_after && emitted_after <= copied);
         }
 
+        /// A read before the settle has passed cancels it: the pipe did not
+        /// stay empty. Here the child, blocked on the full pipe, writes its
+        /// next line as soon as the full read makes room, and the read that
+        /// takes that line shows the pipe empty at once. Once the full
+        /// read's settle would have passed, nothing reports the pipe empty
+        /// again, and a line read later carries the start of the read that
+        /// took the waiting line, not the full read's.
+        #[test]
+        fn a_read_before_the_settle_passes_cancels_it() {
+            let (source, mut child) = grown_pipe();
+            let capacity = pipe_capacity(source.as_fd());
+            let mut chunk = vec![b'x'; 4096 - 1];
+            chunk.push(b'\n');
+            for _ in 0..capacity / chunk.len() {
+                child.write_all(&chunk).unwrap();
+            }
+            assert_eq!(pending(source.as_fd()), capacity, "the pipe is not full");
+            let mut waiting = child.try_clone().unwrap();
+            let next = std::thread::spawn(move || waiting.write_all(b"next\n").unwrap());
+            // Let the child block on the full pipe first.
+            std::thread::sleep(Duration::from_millis(50));
+            let settle = Duration::from_secs(1);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::settling_on((source, child), &log, false, FAST, settle);
+            next.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while observed(&log.lock().unwrap()).is_empty() {
+                assert!(Instant::now() < deadline, "the waiting line was not copied");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Well past the end of the full read's settle.
+            std::thread::sleep(settle * 2);
+            copy.child().write_all(b"late\n").unwrap();
+            copy.child.take();
+            let copied = copy.wait();
+            let mut expected = vec!["skipped"; capacity / chunk.len()];
+            expected.extend(["next", "emptied", "late", "emptied"]);
+            assert_eq!(told(&copied), expected);
+            let read_next = copied
+                .iter()
+                .find_map(|event| match event {
+                    Copied::Observed(line, _, read_at) if line == b"next" => Some(*read_at),
+                    _ => None,
+                })
+                .unwrap();
+            // The full read showed nothing; the read of `next` did.
+            assert_eq!(
+                observed(&copied),
+                [(b"next".to_vec(), at(1)), (b"late".to_vec(), read_next)]
+            );
+        }
+
         /// A pipe refuses a short write that does not fit the room it has
         /// left, although it is not full: one of at most PIPE_BUF bytes is
         /// taken whole or not at all, and Linux, which counts room in
