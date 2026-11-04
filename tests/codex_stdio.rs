@@ -105,6 +105,23 @@ fn codex_stdio_preserves_protocol_hooks_identity_and_exit() {
     for native in [
         vec!["app-server"],
         vec![
+            "app-server",
+            "--cloud-skills-snapshot",
+            "/tmp/cloud skills.json",
+            "--code-mode-host",
+            "http://localhost:9876",
+            "--strict-config",
+            "--stdio",
+            "--startup-client-info",
+            r#"{"name":"paradev"}"#,
+        ],
+        vec![
+            "app-server",
+            "--cloud-skills-snapshot=/tmp/cloud skills.json",
+            "--code-mode-host=http://localhost:9876",
+            "--listen=stdio://",
+        ],
+        vec![
             "-c",
             "model=\"fixture\"",
             "--enable",

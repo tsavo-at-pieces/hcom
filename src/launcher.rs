@@ -2681,6 +2681,18 @@ fn launch_stdio(
 /// Accept only the long-running app-server pipe command. In particular, do not
 /// mistake a config value or a schema-generation subcommand for app-server.
 fn valid_codex_stdio_args(args: &[String]) -> bool {
+    const APP_SERVER_VALUE_FLAGS: &[&str] = &[
+        "--startup-client-info",
+        "--cloud-skills-snapshot",
+        "--code-mode-host",
+        "--ws-auth",
+        "--ws-token-file",
+        "--ws-token-sha256",
+        "--ws-shared-secret-file",
+        "--ws-issuer",
+        "--ws-audience",
+        "--ws-max-clock-skew-seconds",
+    ];
     let mut app_server = false;
     let mut i = 0;
     while i < args.len() {
@@ -2700,7 +2712,22 @@ fn valid_codex_stdio_args(args: &[String]) -> bool {
                     return false;
                 }
             }
-            "--listen=stdio://" | "--analytics-default-enabled" if app_server => {}
+            "--listen=stdio://"
+            | "--stdio"
+            | "--strict-config"
+            | "--startup-sign-out"
+            | "--analytics-default-enabled"
+                if app_server => {}
+            _ if app_server && APP_SERVER_VALUE_FLAGS.contains(&arg) => {
+                i += 1;
+                if args.get(i).is_none_or(|value| value.is_empty()) {
+                    return false;
+                }
+            }
+            _ if app_server
+                && arg.split_once('=').is_some_and(|(flag, value)| {
+                    APP_SERVER_VALUE_FLAGS.contains(&flag) && !value.is_empty()
+                }) => {}
             _ if arg.starts_with("--config=")
                 || arg.starts_with("--enable=")
                 || arg.starts_with("--disable=")
@@ -2769,6 +2796,87 @@ mod tests {
                 .filter(|key| key.starts_with("CARGO_")),
         );
         EnvVarGuard::remove(keys)
+    }
+
+    #[test]
+    fn test_codex_stdio_accepts_native_server_options() {
+        for (flag, value) in [
+            ("--startup-client-info", r#"{"name":"paradev"}"#),
+            ("--cloud-skills-snapshot", "/tmp/cloud skills.json"),
+            ("--code-mode-host", "http://localhost:9876"),
+            ("--ws-auth", "capability-token"),
+            ("--ws-token-file", "/tmp/token"),
+            ("--ws-token-sha256", "deadbeef"),
+            ("--ws-shared-secret-file", "/tmp/secret"),
+            ("--ws-issuer", "issuer"),
+            ("--ws-audience", "audience"),
+            ("--ws-max-clock-skew-seconds", "30"),
+        ] {
+            for args in [
+                vec!["app-server".to_owned(), flag.to_owned(), value.to_owned()],
+                vec!["app-server".to_owned(), format!("{flag}={value}")],
+            ] {
+                assert!(valid_codex_stdio_args(&args), "{args:?}");
+            }
+            // These flags belong to app-server, not the top-level parser.
+            assert!(!valid_codex_stdio_args(&[
+                flag.to_owned(),
+                value.to_owned(),
+                "app-server".to_owned(),
+            ]));
+            assert!(!valid_codex_stdio_args(&[
+                "app-server".to_owned(),
+                flag.to_owned()
+            ]));
+            assert!(!valid_codex_stdio_args(&[
+                "app-server".to_owned(),
+                format!("{flag}=")
+            ]));
+        }
+        for flag in [
+            "--strict-config",
+            "--stdio",
+            "--startup-sign-out",
+            "--analytics-default-enabled",
+        ] {
+            assert!(
+                valid_codex_stdio_args(&["app-server".to_owned(), flag.to_owned()]),
+                "{flag}"
+            );
+            assert!(!valid_codex_stdio_args(&[
+                flag.to_owned(),
+                "app-server".to_owned()
+            ]));
+        }
+    }
+
+    #[test]
+    fn test_codex_stdio_rejects_one_shot_helpers_and_unknown_options() {
+        for tail in [
+            vec!["--print-startup-config"],
+            vec!["--print-startup-config=false"],
+            vec!["--unknown-option", "value"],
+            vec!["--unknown-option=value"],
+            vec!["generate-ts"],
+            vec!["generate-json-schema"],
+            vec!["help"],
+            vec!["daemon"],
+            vec!["proxy"],
+            vec!["--cloud-skills-snapshot", "/tmp/skills.json", "generate-ts"],
+            vec!["--code-mode-host=/tmp/host", "generate-json-schema"],
+            vec![
+                "--cloud-skills-snapshot",
+                "/tmp/skills.json",
+                "--listen",
+                "ws://127.0.0.1:9000",
+            ],
+        ] {
+            let args = std::iter::once("app-server")
+                .chain(tail)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(!valid_codex_stdio_args(&args), "{args:?}");
+        }
     }
 
     #[test]
