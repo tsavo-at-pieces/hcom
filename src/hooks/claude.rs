@@ -1953,16 +1953,22 @@ pub(crate) fn stdio_turn_end(line: &[u8], emitted_after: SystemTime) -> Option<S
 /// transaction commits, as Stop's do. Nothing is delivered: queued messages
 /// wait for the next native prompt.
 ///
-/// The last check is sound because the child wrote the frame after
-/// `emitted_after`, while the next turn's prompt hook can only run once the
-/// turn has ended, so its status event is stamped later. The current turn's
-/// own prompt or delivery commits before its hook exits, and Claude writes
-/// the turn's next frame (session state `running`, `init` or assistant output)
-/// only after that; the read that drains that frame moves the copy's empty
-/// time past the commit. When the copy read the whole turn at once, that time
-/// is still before the prompt and the turn end is skipped, leaving the status
-/// as it was before stdout was read. Tool contexts and blocked states start
-/// no turn and never cause a skip.
+/// The last check rests on how Claude writes stdout, as checked on 2.1.309.
+/// It hands a turn's result to stdout before it runs the next turn's prompt
+/// hook: it holds results back only once its input has closed, when no
+/// prompt can follow. Its stdout writes whatever is queued as soon as the
+/// pipe has room, not awaiting the write, so a frame can wait unwritten only
+/// while the pipe is full. The copy counts a read as having emptied the pipe
+/// only when it took less than the pipe holds, so that nothing was waiting
+/// then; a frame read later was produced after `emitted_after`, and the next
+/// turn's prompt event, stamped later still, is seen. The current turn's own
+/// prompt or delivery commits before its hook exits, and Claude writes the
+/// turn's `init` frame and output only after that (its `running` state comes
+/// before the hook); a read that empties the pipe after one of those moves
+/// the copy's empty time past the commit. When none did, as when the copy
+/// read the whole turn at once, the turn end is skipped, leaving the status
+/// as the hooks set it. Tool contexts and blocked states start no turn and
+/// never cause a skip.
 pub(crate) fn record_stdio_turn_end(
     db: &HcomDb,
     process_id: &str,

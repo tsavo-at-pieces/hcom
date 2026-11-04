@@ -62,11 +62,15 @@ output; one that another writer's lock keeps out past the 5 second busy
 timeout is tried again while Claude runs, before anything read after it,
 until it is recorded or refused. It is recorded only while the row is still
 this launch's, in the frame's session and `active` or `blocked`, with no
-prompt or prompt delivery recorded since the frame may have been written
-(the last time hcom saw the pipe empty before reading it). When hcom cannot
-tell, for example because it read a whole turn at once, the status stays as
-the hooks left it. Nothing on stdout stops a session or delivers a message:
-queued messages still wait for the next native prompt.
+prompt or prompt delivery recorded since the frame may have been written:
+the last time hcom saw the pipe empty, and not full, before reading it. That
+keeps a turn end from overwriting the next turn's prompt as long as Claude
+writes a turn's result before it runs the next prompt hook, and writes what
+it has queued as soon as the pipe has room, as Claude 2.1.309 does (it holds
+results back only once its input has closed). When hcom cannot tell, for
+example because it read a whole turn at once, the status stays as the hooks
+left it. Nothing on stdout stops a session or delivers a message: queued
+messages still wait for the next native prompt.
 
 `--stdio` supports one local Claude print or Codex app-server process. It
 cannot be combined with multiple agents, an unsupported tool, a remote device,
