@@ -2,7 +2,7 @@
 # bump them: install-mock-tools.{sh,ps1}, tests/support/pins.rs and the CI
 # cache key all read this file.
 #
-# After a bump: just ci mock-tools real_tool_codex real_tool_claude test_relay_roundtrip
+# After a bump: just ci mock-tools real_tool_codex real_tool_claude test_relay_roundtrip claude_stdio
 @openai/codex@0.162.1
 # Claude must stay >= 2.1.198: the first release with both `prompt_id` and
 # backgrounded Agent/Task calls (tool_response.status="async_launched"), which
