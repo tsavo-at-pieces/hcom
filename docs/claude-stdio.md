@@ -10,8 +10,11 @@ With `--output-format stream-json`, the SDK protocol, Claude writes stdout
 into a pipe that hcom copies to the caller byte for byte: each chunk is
 written as soon as it is read, and nothing is added, changed, reordered or
 held back for a whole line. hcom reads the copied lines only to find the
-frames that end a turn. A caller that closes stdout gives Claude the broken
-pipe it would otherwise get. Everything Claude wrote before it exited reaches
+frames that end a turn. A caller that closes stdout gives Claude a broken
+pipe, one write later than writing to the caller directly would: hcom finds
+the close only when its own write fails and then closes Claude's pipe, so
+Claude's first write after an idle close is accepted and dropped, and its
+next write fails. Everything Claude wrote before it exited reaches
 a caller that keeps stdout open, however slowly it reads, before hcom exits,
 with two exceptions that stop hcom without the output the caller has not
 taken, as they would have stopped a Claude still blocked writing to the
@@ -41,8 +44,12 @@ seconds until the child is reaped, so an idle pipe client is not reported
 stale. A single statement sets only the heartbeat, on the row that this
 launch's process binding, launch token and row incarnation still name: a
 stopped row, or one another launch replaced or took over, is never touched.
-Other output formats get no heartbeat, so their idle rows read as stale after
-10 seconds.
+Like a PTY's delivery loop, it keeps any row that has not stopped live, busy
+ones included: a turn running one tool for more than 5 minutes stays
+`active` rather than reading as stale, and so does a row whose turn end hcom
+could not record (below), until the next hook or until Claude exits. Other
+output formats get no heartbeat, so their idle rows read as stale after 10
+seconds.
 
 The client owns turn completion and idle input. `Stop` drains messages already
 queued, then returns immediately when none remain. Messages arriving while the
