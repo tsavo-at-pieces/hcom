@@ -98,6 +98,43 @@ struct ShellOutput {
     stdout: Vec<u8>,
 }
 
+/// Upper bound on what the resolver keeps from the shell. A login environment
+/// is a few kilobytes; a shell that keeps streaming (an rc file that tails a
+/// log, a prompt hook in a loop) is killed instead of being read without limit.
+const MAX_SHELL_OUTPUT: usize = 8 * 1024 * 1024;
+
+/// What the drain thread hands over, piece by piece.
+enum Drained {
+    Chunk(Vec<u8>),
+    Eof,
+    Failed,
+}
+
+/// Read the shell's stdout to EOF on its own thread, handing each chunk over as
+/// it arrives, so the shell never sits in a blocked write on a full pipe while
+/// the parent waits for it to exit (#7).
+fn drain_stdout(mut out: std::process::ChildStdout, tx: std::sync::mpsc::Sender<Drained>) {
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        match out.read(&mut chunk) {
+            Ok(0) => {
+                let _ = tx.send(Drained::Eof);
+                return;
+            }
+            Ok(n) => {
+                if tx.send(Drained::Chunk(chunk[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                let _ = tx.send(Drained::Failed);
+                return;
+            }
+        }
+    }
+}
+
 fn timed_shell_output(shell: &Path, cmd: &str, marker: &str) -> Option<ShellOutput> {
     timed_shell_output_with_timeout(shell, cmd, marker, SHELL_TIMEOUT)
 }
@@ -108,33 +145,90 @@ fn timed_shell_output_with_timeout(
     marker: &str,
     timeout: Duration,
 ) -> Option<ShellOutput> {
+    timed_shell_output_bounded(shell, cmd, marker, timeout, MAX_SHELL_OUTPUT)
+}
+
+/// Run the shell and collect its stdout while waiting for it to exit.
+///
+/// The read and the wait run together: a drain thread reads the pipe and this
+/// thread polls for the exit, so an environment larger than the pipe buffer
+/// (16 KB on macOS) or a slow writer can no longer park the shell in a blocked
+/// write until the timeout kills it. One deadline covers both halves; when it
+/// runs out the shell's process group is killed. `capacity` bounds what is
+/// kept: over it the shell is killed and the resolution fails instead of
+/// growing without limit.
+///
+/// Once the shell has exited, what its stdout still carries is drained for a
+/// short grace and the output is returned, so a background job started by an
+/// rc file that inherited the pipe delays the result by that grace rather than
+/// holding the resolver until the job ends; the job itself is left alone.
+fn timed_shell_output_bounded(
+    shell: &Path,
+    cmd: &str,
+    marker: &str,
+    timeout: Duration,
+    capacity: usize,
+) -> Option<ShellOutput> {
+    const POLL: Duration = Duration::from_millis(25);
+    const EXIT_GRACE: Duration = Duration::from_millis(200);
+
+    fn fail(child: &mut std::process::Child) -> Option<ShellOutput> {
+        crate::sys::process::kill_child_group(child);
+        let _ = child.wait();
+        None
+    }
+
     let mut child = shell_command(shell, cmd, marker).spawn().ok()?;
+    let Some(out) = child.stdout.take() else {
+        return fail(&mut child);
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name("hcom-shell-env-drain".to_string())
+        .spawn(move || drain_stdout(out, tx))
+        .is_err()
+    {
+        return fail(&mut child);
+    }
+
     let start = std::time::Instant::now();
+    let mut stdout = Vec::new();
+    let mut eof = false;
+    let mut exited: Option<(std::process::ExitStatus, std::time::Instant)> = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_end(&mut stdout);
+        // After EOF the drain thread is gone and its sender with it; only the
+        // exit is still awaited.
+        if eof {
+            std::thread::sleep(POLL);
+        } else {
+            match rx.recv_timeout(POLL) {
+                Ok(Drained::Chunk(bytes)) => {
+                    if stdout.len() + bytes.len() > capacity {
+                        return fail(&mut child);
+                    }
+                    stdout.extend_from_slice(&bytes);
                 }
-                if !status.success() {
-                    return None;
+                Ok(Drained::Eof) => eof = true,
+                Ok(Drained::Failed) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return fail(&mut child);
                 }
-                return Some(ShellOutput { stdout });
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    crate::sys::process::kill_child_group(&mut child);
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
+        }
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some((status, std::time::Instant::now())),
+                Ok(None) => {}
+                Err(_) => return fail(&mut child),
             }
-            Err(_) => {
-                crate::sys::process::kill_child_group(&mut child);
-                let _ = child.wait();
-                return None;
-            }
+        }
+        if let Some((status, at)) = exited
+            && (eof || at.elapsed() >= EXIT_GRACE)
+        {
+            return status.success().then_some(ShellOutput { stdout });
+        }
+        if start.elapsed() >= timeout {
+            return fail(&mut child);
         }
     }
 }
@@ -443,6 +537,108 @@ mod tests {
         assert_eq!(
             env.get("SHELL").map(String::as_str),
             Some(expected_shell.as_ref())
+        );
+    }
+
+    /// Issue #7's shape: an environment larger than the pipe buffer. Reading
+    /// only after exit parked `env -0` in its final write until the timeout
+    /// killed it; the concurrent drain reads it through.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_reads_an_environment_larger_than_the_pipe_buffer() {
+        let shell = test_shell_path();
+        let marker = "hcom-shell-env-large-test";
+        // 256 KiB in one variable: 16x the macOS pipe buffer, 4x the Linux
+        // default, and under ARG_MAX for the `env` exec.
+        let cmd = format!(
+            "chunk=x; i=0; while [ \"$i\" -lt 18 ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; \
+             SHELL_ENV_TEST_BIG=\"$chunk\"; export SHELL_ENV_TEST_BIG; \
+             printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
+        );
+
+        let output =
+            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(30)).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert_eq!(
+            env.get("SHELL_ENV_TEST_BIG").map(String::len),
+            Some(1 << 18)
+        );
+        assert!(env.contains_key("PATH"));
+    }
+
+    /// Over the capacity the shell is killed and nothing is returned, instead
+    /// of the resolver growing with whatever the shell keeps streaming.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_rejects_output_over_capacity_and_kills_the_shell() {
+        let shell = test_shell_path();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("shell.pid");
+        // 1 MiB from the printf builtin against a 64 KiB capacity, then a sleep
+        // that outlives the test: a shell still alive afterwards was not killed.
+        let cmd = format!(
+            "echo $$ > {pid}; chunk=x; i=0; while [ \"$i\" -lt 20 ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; \
+             printf %s \"$chunk\"; sleep 30",
+            pid = pid_file.display()
+        );
+
+        let output = timed_shell_output_bounded(
+            &shell,
+            &cmd,
+            "hcom-shell-env-capacity-test",
+            Duration::from_secs(30),
+            64 * 1024,
+        );
+
+        assert!(output.is_none());
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(wait_for_process_exit(pid));
+    }
+
+    /// A quiet pipe is not the end of the output: the drain waits for the
+    /// closing marker from a writer that pauses after the environment.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_waits_for_a_writer_that_pauses_mid_stream() {
+        let shell = test_shell_path();
+        let marker = "hcom-shell-env-pause-test";
+        let cmd =
+            format!("printf %s \"${MARKER_VAR}\"; env -0; sleep 1; printf %s \"${MARKER_VAR}\"");
+
+        let output =
+            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(30)).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+    }
+
+    /// A background job from an rc file that inherited stdout keeps the pipe
+    /// open after the shell exits. The resolver returns the complete output
+    /// after its grace instead of waiting for that job, and leaves it alone.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_returns_after_exit_when_a_background_job_keeps_stdout_open() {
+        let shell = test_shell_path();
+        let marker = "hcom-shell-env-background-test";
+        let cmd = format!(
+            "(sleep 5) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"; exit 0"
+        );
+
+        let started = std::time::Instant::now();
+        let output =
+            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(30)).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the resolver waited for the background job: {:?}",
+            started.elapsed()
         );
     }
 
