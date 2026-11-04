@@ -184,29 +184,21 @@ pub fn persist_observed_child_title(
         return Ok(false);
     };
     let title = crate::pty::screen::sanitize_child_title(title);
+    let Some((_, context)) = observed_child_title_owner(db, process_id)? else {
+        return Ok(false);
+    };
+    if context
+        .get("observed_child_title")
+        .and_then(|value| value.as_str())
+        == Some(title.as_str())
+    {
+        return Ok(true);
+    }
     db.with_write_scope(|| {
-        let Some((Some(session), name)) = db.get_process_binding_full(process_id)? else {
+        // The binding, row or context may have changed while acquiring the
+        // write lock. Read them again before deciding which row to update.
+        let Some((name, mut context)) = observed_child_title_owner(db, process_id)? else {
             return Ok(false);
-        };
-        let Some(row) = db.get_instance_full(&name)? else {
-            return Ok(false);
-        };
-        if session.is_empty()
-            || row.session_id.as_deref() != Some(session.as_str())
-            || crate::instances::is_subagent_instance(&row)
-            || crate::instances::is_remote_instance(&row)
-            || row.status == "stopped"
-        {
-            return Ok(false);
-        }
-        let mut context = match row.launch_context.as_deref().filter(|raw| !raw.is_empty()) {
-            Some(raw) => {
-                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
-                    Ok(context) => context,
-                    Err(_) => return Ok(false),
-                }
-            }
-            None => serde_json::Map::new(),
         };
         if context
             .get("observed_child_title")
@@ -228,6 +220,36 @@ pub fn persist_observed_child_title(
         db.update_instance_fields(&name, &updates)?;
         Ok(true)
     })
+}
+
+fn observed_child_title_owner(
+    db: &HcomDb,
+    process_id: &str,
+) -> anyhow::Result<Option<(String, serde_json::Map<String, serde_json::Value>)>> {
+    let Some((Some(session), name)) = db.get_process_binding_full(process_id)? else {
+        return Ok(None);
+    };
+    let Some(row) = db.get_instance_full(&name)? else {
+        return Ok(None);
+    };
+    if session.is_empty()
+        || row.session_id.as_deref() != Some(session.as_str())
+        || crate::instances::is_subagent_instance(&row)
+        || crate::instances::is_remote_instance(&row)
+        || row.status == "stopped"
+    {
+        return Ok(None);
+    }
+    let context = match row.launch_context.as_deref().filter(|raw| !raw.is_empty()) {
+        Some(raw) => {
+            match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
+                Ok(context) => context,
+                Err(_) => return Ok(None),
+            }
+        }
+        None => serde_json::Map::new(),
+    };
+    Ok(Some((name, context)))
 }
 
 /// Capture environment context and store it for the instance.
@@ -1572,6 +1594,37 @@ mod tests {
                 .launch_context,
             original
         );
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_performance_ineligible_never_takes_write_lock() {
+        let (db, path) = observed_title_db();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status='stopped' WHERE name='luna'",
+                [],
+            )
+            .unwrap();
+        let blocker = HcomDb::open_at(&path).unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        db.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+        for process in ["title-process", "not-bound"] {
+            assert!(!persist_observed_child_title(&db, process, Some("#1852 review")).unwrap());
+        }
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_performance_unchanged_never_takes_write_lock() {
+        let (db, path) = observed_title_db();
+        assert!(persist_observed_child_title(&db, "title-process", Some("same title")).unwrap());
+        let blocker = HcomDb::open_at(&path).unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        db.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert!(persist_observed_child_title(&db, "title-process", Some("same title")).unwrap());
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
         cleanup(path);
     }
 
