@@ -192,8 +192,8 @@ mod tapped_stdout {
     };
 
     /// How long the pipe must stay empty after a read that ended at a
-    /// line's end, but left too little room to show that the child had
-    /// nothing waiting, for that read to count as having emptied it: far
+    /// line's end, but did not show that it left room for anything the
+    /// child had waiting, for that read to count as having emptied it: far
     /// longer than a child writing what it has as soon as the pipe has room
     /// takes once a read has emptied it (Bun 1.4.4 took at most 6 ms).
     const SETTLE: Duration = Duration::from_secs(2);
@@ -499,8 +499,9 @@ mod tapped_stdout {
     /// The time is taken just before a read that poll has reported ready, so
     /// the read never waits. A read that left room for any write the pipe
     /// might have refused shows that at once ([`left_room_for_any_write`]).
-    /// One that took little less than the pipe holds may have left the child
-    /// more to write, as a pipe refuses a short write before it is full; if
+    /// One that took little less than the pipe holds, or one of a pipe that
+    /// does not show how much it holds, may have left the child more to
+    /// write, as a pipe refuses a short write before it is full; if
     /// it ended at a line's end, it shows that too once the pipe has then
     /// stayed empty for `settle`, which such a child would not have left
     /// empty so long. Either is reported to the tap as well, once it has been
@@ -623,11 +624,19 @@ mod tapped_stdout {
     /// [`left_room_for_any_write`] elsewhere: a write of at most PIPE_BUF
     /// bytes is taken whole or refused, so a pipe that refused one may be
     /// short of full by PIPE_BUF - 1 bytes, while a longer one is taken as
-    /// far as there is room.
+    /// far as there is room. A capacity of at most
+    /// [`LEAST_REPORTED_CAPACITY`] does not show how much the pipe holds, so
+    /// no read of such a pipe counts.
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
     fn left_room_for_any_write(read: usize, capacity: usize, buffer: usize) -> bool {
-        read + libc::PIPE_BUF <= capacity.min(buffer)
+        capacity > LEAST_REPORTED_CAPACITY && read + libc::PIPE_BUF <= capacity.min(buffer)
     }
+
+    /// The least capacity macOS reports for a pipe, XNU's `PIPE_SIZE`: it
+    /// reports a pipe's buffer as `MAX(PIPE_SIZE, size)`, so a report of
+    /// this much shows only that the pipe holds no more.
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    const LEAST_REPORTED_CAPACITY: usize = 16 * 1024;
 
     /// How many bytes the pipe can hold now, or 0 when that is unknown, so
     /// that no read counts as emptying it. Linux pipes hold 64 KiB unless
@@ -640,9 +649,14 @@ mod tapped_stdout {
 
     /// How many bytes the pipe can hold now, or 0 when that is unknown, so
     /// that no read counts as emptying it. macOS reports a pipe's buffer as
-    /// its block size: 16 KiB at first, 64 KiB once a write needed more room
-    /// and the kernel had it to give. Elsewhere the block size may be
-    /// smaller than the buffer, which only counts fewer reads as emptying it.
+    /// its block size, but never less than 16 KiB
+    /// ([`LEAST_REPORTED_CAPACITY`]): a buffer starts at 512 bytes and grows,
+    /// to at most 64 KiB, only when a write needs more room while the
+    /// kernel's pipe memory is under its 16 MB cap. A report of 16 KiB thus
+    /// shows only that the pipe holds no more, which is all the drain needs:
+    /// a read of a pipe no larger than the copy's buffer takes all it holds.
+    /// Elsewhere the block size may be smaller than the buffer, which only
+    /// counts fewer reads as emptying it.
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
     fn pipe_capacity(fd: BorrowedFd<'_>) -> usize {
         nix::sys::stat::fstat(fd).map_or(0, |stat| usize::try_from(stat.st_blksize).unwrap_or(0))
@@ -1121,6 +1135,28 @@ mod tapped_stdout {
                 .collect()
         }
 
+        /// An empty pipe that has held more than 16 KiB, so that macOS has
+        /// grown it to 64 KiB, what a Linux pipe holds from the start: macOS
+        /// reports any smaller pipe as 16 KiB, so that no read of it shows
+        /// it empty at once.
+        fn grown_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+            let (mut source, child) = std::io::pipe().unwrap();
+            // Without blocking: a pipe that cannot grow takes only part.
+            let flags = OFlag::from_bits_truncate(fcntl(child.as_fd(), FcntlArg::F_GETFL).unwrap());
+            fcntl(child.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+            let taken = nix::unistd::write(child.as_fd(), &[b'g'; 16 * 1024 + 1]).unwrap();
+            fcntl(child.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+            source.read_exact(&mut vec![0; taken]).unwrap();
+            assert_eq!(
+                pipe_capacity(source.as_fd()),
+                64 * 1024,
+                "the pipe did not grow to 64 KiB"
+            );
+            (source, child)
+        }
+
         /// The tap hears that a read found the pipe empty only when that
         /// read ended at a line's end, after the lines it completed: a read
         /// that ends inside a line leaves it to the read that ends it. A
@@ -1128,7 +1164,7 @@ mod tapped_stdout {
         #[test]
         fn the_tap_hears_of_an_empty_pipe_only_when_a_read_ends_a_line() {
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copier::recording(&log, false, FAST);
+            let mut copy = Copier::recording_on(grown_pipe(), &log, false, FAST);
             let copied_up_to = |bytes: &[u8]| {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while written(&log.lock().unwrap()) != bytes {
@@ -1167,7 +1203,7 @@ mod tapped_stdout {
         #[test]
         fn a_line_follows_the_time_the_pipe_was_last_seen_empty() {
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut copy = Copier::recording(&log, false, FAST);
+            let mut copy = Copier::recording_on(grown_pipe(), &log, false, FAST);
             let delivered = |count: usize| {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while observed(&log.lock().unwrap()).len() < count {
@@ -1223,15 +1259,16 @@ mod tapped_stdout {
         #[test]
         fn a_read_that_takes_a_full_pipe_leaves_the_empty_time() {
             let (source, mut child) = std::io::pipe().unwrap();
-            // macOS pipes start at 16 KiB. Linux ones hold the copy's 64 KiB
-            // buffer, so shrink this one to what macOS starts with.
+            // macOS grows a pipe from 512 bytes as far as writes need, here
+            // to the 16 KiB it reports from the start. Linux ones hold the
+            // copy's 64 KiB buffer, so shrink this one to 16 KiB too.
             #[cfg(any(target_os = "android", target_os = "linux"))]
             nix::fcntl::fcntl(child.as_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(16 * 1024))
                 .unwrap();
             let capacity = pipe_capacity(source.as_fd());
             assert!(capacity > 0 && capacity < 64 * 1024, "{capacity}");
             // Filled before the copy starts, so its first read takes all of
-            // it, in writes small enough not to grow the pipe.
+            // it, in writes small enough not to grow the pipe past that.
             let mut chunk = vec![b'x'; 4096 - 1];
             chunk.push(b'\n');
             for _ in 0..capacity / chunk.len() {
@@ -1254,8 +1291,13 @@ mod tapped_stdout {
             // pipe was last seen empty at the spawn.
             assert_eq!(observed(&copied), [(b"late".to_vec(), at(1))]);
             // Nor does the tap hear of an empty pipe before `late` is read.
+            // On Linux it hears of one then; macOS, which reports this pipe
+            // as it would a smaller one, shows no read of it empty at once.
             let mut expected = vec!["skipped"; capacity / chunk.len()];
-            expected.extend(["late", "emptied"]);
+            expected.push("late");
+            if cfg!(any(target_os = "android", target_os = "linux")) {
+                expected.push("emptied");
+            }
             assert_eq!(told(&copied), expected);
         }
 
@@ -1265,7 +1307,7 @@ mod tapped_stdout {
         /// line read later carries that read's start.
         #[test]
         fn a_full_read_ending_a_line_shows_the_pipe_empty_once_it_stays_empty() {
-            let (source, mut child) = std::io::pipe().unwrap();
+            let (source, mut child) = grown_pipe();
             let capacity = pipe_capacity(source.as_fd());
             let mut chunk = vec![b'x'; 4096 - 1];
             chunk.push(b'\n');
@@ -1359,6 +1401,67 @@ mod tapped_stdout {
                     "emptied".to_string()
                 ]
             );
+        }
+
+        /// macOS reports a pipe's buffer as no less than 16 KiB, though the
+        /// buffer starts at 512 bytes and grows only as far as writes need:
+        /// two lines of 4 KiB leave this one full at 8 KiB. The read that
+        /// takes them left no room for a write the pipe might have refused,
+        /// so it does not show the pipe empty, and nor does any read while
+        /// the pipe reports 16 KiB. A pipe reported larger holds that much:
+        /// once one has grown, the same reads show it empty at once.
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        #[test]
+        fn only_a_pipe_reported_past_16_kib_shows_a_read_empty_at_once() {
+            for grown in [false, true] {
+                let (source, mut child) = if grown {
+                    grown_pipe()
+                } else {
+                    std::io::pipe().unwrap()
+                };
+                let mut line = vec![b'x'; 4096 - 1];
+                line.push(b'\n');
+                child.write_all(&line).unwrap();
+                child.write_all(&line).unwrap();
+                assert_eq!(pending(source.as_fd()), 2 * line.len(), "grown={grown}");
+                assert_eq!(
+                    pipe_capacity(source.as_fd()),
+                    if grown {
+                        64 * 1024
+                    } else {
+                        LEAST_REPORTED_CAPACITY
+                    },
+                    "grown={grown}"
+                );
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let started = SystemTime::now();
+                let mut copy = Copier::recording_on((source, child), &log, false, FAST);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while written(&log.lock().unwrap()).len() < 2 * line.len() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "grown={grown}: the pipe was not copied"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let copied = SystemTime::now();
+                copy.child().write_all(b"late\n").unwrap();
+                copy.child.take();
+                let copied_events = copy.wait();
+                let (late, emitted_after) = observed(&copied_events).pop().unwrap();
+                assert_eq!(late, b"late", "grown={grown}");
+                if grown {
+                    assert_eq!(
+                        told(&copied_events),
+                        ["skipped", "skipped", "emptied", "late", "emptied"]
+                    );
+                    assert!(started <= emitted_after && emitted_after <= copied);
+                } else {
+                    // The pipe was last seen empty at the spawn.
+                    assert_eq!(told(&copied_events), ["skipped", "skipped", "late"]);
+                    assert_eq!(emitted_after, at(1));
+                }
+            }
         }
 
         #[test]

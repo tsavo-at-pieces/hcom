@@ -80,16 +80,22 @@ before reading it. A pipe refuses a short write before it is full (one of
 up to `PIPE_BUF` bytes is taken whole or not at all, and Linux counts room
 in pages), so a read shows that only when it left room for any write the
 pipe may have refused: `PIPE_BUF` bytes on macOS, half the pipe on Linux.
-A read that ends at the end of a line without leaving that room shows it
-once the pipe has then stayed empty for 2 seconds. That keeps a turn end
-from overwriting the next turn's prompt as long as Claude writes a turn's
-result before it runs the next prompt hook, and writes what waits, with the
-frames queued behind it, in one call as soon as the pipe has room, well
-within those 2 seconds, as Claude 2.1.309 does on Bun 1.4.4 (it holds
-results back only once its input has closed).
+That needs the pipe's capacity. macOS reports no pipe's capacity as less
+than 16 KiB, though a pipe starts at 512 bytes and grows only as writes
+need room, and not at all once the kernel's pipe memory reaches its 16 MB
+cap, so only a read of a pipe reported larger, at 64 KiB, can show it this
+way. On Linux, no read of a pipe of one page, or of one larger than hcom's
+64 KiB buffer, can. A read that ends at the end of a line without showing
+it this way shows it once the pipe has then stayed empty for 2 seconds.
+That keeps a turn end from overwriting the next turn's prompt as long as
+Claude writes a turn's result before it runs the next prompt hook, and
+writes what waits, with the frames queued behind it, in one call as soon as
+the pipe has room, well within those 2 seconds, as Claude 2.1.309 does on
+Bun 1.4.4 (it holds results back only once its input has closed).
 
 When hcom saw no empty pipe between a turn's prompt and its end, because it
-read the whole turn at once or the client took nothing for the whole turn,
+read the whole turn at once, the client took nothing for the whole turn, or
+a pipe that no read could show empty at once never stayed so for 2 seconds,
 that prompt may be the turn's own or the next one's, so the turn end waits
 and the status stays as the hooks left it. Once hcom has read through the
 turn end (and the idle frame after a result) and then finds the pipe empty

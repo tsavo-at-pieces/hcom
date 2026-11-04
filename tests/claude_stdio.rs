@@ -913,7 +913,10 @@ emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
 hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
 : > "$PWD/transcript.jsonl"
 hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
-emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+# Over 16 KiB: macOS grows the pipe for it to 64 KiB, what Linux pipes hold from
+# the start, and reports that, so that a read can show the pipe empty at once.
+tools=$(head -c 20000 /dev/zero | tr '\0' t)
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\",\"tools\":\"$tools\"}"
 IFS= read -r line
 hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
 emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"running\",\"session_id\":\"$sid\"}"
