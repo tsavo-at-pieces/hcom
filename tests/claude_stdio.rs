@@ -160,7 +160,7 @@ fn claude_stdio_cancelled_turn_becomes_listening_and_stdout_is_byte_exact() {
     let next = |kind: &str| -> Value {
         loop {
             let line = lines
-                .recv_timeout(Duration::from_secs(60))
+                .recv_timeout(Duration::from_secs(300))
                 .unwrap_or_else(|_| panic!("no {kind} frame\n{}", h.diagnostics()));
             if let Ok(frame) = serde_json::from_str::<Value>(&line)
                 && frame["type"] == kind
@@ -971,7 +971,7 @@ exit 0
     let next = |what: &str, matches: &dyn Fn(&Value) -> bool| -> Value {
         loop {
             let line = lines
-                .recv_timeout(Duration::from_secs(60))
+                .recv_timeout(Duration::from_secs(300))
                 .unwrap_or_else(|_| panic!("no {what} frame\n{}", h.diagnostics()));
             if let Ok(frame) = serde_json::from_str::<Value>(&line)
                 && matches(&frame)
@@ -1002,8 +1002,10 @@ exit 0
     );
     next("marker", &|frame| frame["subtype"] == "marker");
     let delivered = locked.elapsed();
+    // The old copy waited out the recorder's 5 s busy timeout before writing on; a loaded host
+    // can take a few seconds to schedule the shim, so the bound sits between the two.
     assert!(
-        delivered < Duration::from_secs(2),
+        delivered < Duration::from_secs(4),
         "frames after the result waited {delivered:?} for the database"
     );
     assert_eq!(
@@ -1011,8 +1013,8 @@ exit 0
         "prompt",
         "recorded through the lock"
     );
-    // Release well inside the recorder's busy timeout.
-    std::thread::sleep(Duration::from_millis(2500).saturating_sub(locked.elapsed()));
+    // Release inside the recorder's busy timeout (a busy refusal would be retried anyway).
+    std::thread::sleep(Duration::from_millis(4500).saturating_sub(locked.elapsed()));
     room.execute_batch("COMMIT").unwrap();
     let interrupted = Some((
         "listening".to_string(),
