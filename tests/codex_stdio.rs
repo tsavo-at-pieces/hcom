@@ -56,7 +56,7 @@ hook('codex-interrupt', payload)
 states['interrupt'] = row()
 hook('codex-stop', payload)
 states['stop'] = row()
-record = {'args': args, 'env': {k: os.environ.get(k) for k in ['HCOM_LAUNCHED','HCOM_TOOL','HCOM_STDIO_MODE','HCOM_PTY_MODE','HCOM_LAUNCHED_BY']}, 'row': row(), 'states': states, 'start_output': start_output}
+record = {'args': args, 'env': {k: os.environ.get(k) for k in ['HCOM_LAUNCHED','HCOM_TOOL','HCOM_STDIO_MODE','HCOM_PTY_MODE','HCOM_LAUNCHED_BY','HCOM_DIR','HCOM_INSTANCE_NAME','HCOM_PROCESS_ID','HCOM_LAUNCH_BATCH_ID','CODEX_EXEC_SERVER_URL','CODEX_HOME','CODEX_QUIET_MODE','OPENAI_BASE_URL','CLAUDE_CODE_MAX_OUTPUT_TOKENS']}, 'row': row(), 'states': states, 'start_output': start_output}
 with open(os.environ['FIXTURE_RECORD'], 'w') as f: json.dump(record, f)
 def cancelled(signum, frame):
     sys.stderr.write('cancelled\n'); sys.stderr.flush(); sys.exit(37)
@@ -101,6 +101,67 @@ fn assert_clean(h: &Hcom) {
     assert_eq!(count, 0, "native exit left a registered instance");
     let actor: String = db.query_row("SELECT instance FROM events WHERE json_extract(data, '$.action') = 'batch_launched' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     assert_eq!(actor, "pezu");
+}
+
+#[test]
+fn codex_stdio_scrubs_instance_state_after_env_overlays() {
+    let h = Hcom::new();
+    let record = fixture(&h);
+    // These extras are applied after the inherited environment is cleaned.
+    // A parent-only check would miss instance state reintroduced by an overlay.
+    h.set_launch_env("CODEX_EXEC_SERVER_URL", "overlay-parent-exec-server");
+    h.set_launch_env("CODEX_QUIET_MODE", "1");
+    h.set_launch_env("OPENAI_BASE_URL", "https://provider.example.invalid/v1");
+    h.set_launch_env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "4096");
+    let output = h
+        .cmd()
+        .env("CODEX_EXEC_SERVER_URL", "inherited-parent-exec-server")
+        .args([
+            "codex",
+            "--stdio",
+            "--run-here",
+            "--go",
+            "--name",
+            "pezu",
+            "--",
+            "app-server",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_str(&fs::read_to_string(record).unwrap()).unwrap();
+    let env = &value["env"];
+    assert!(
+        env["CODEX_EXEC_SERVER_URL"].is_null(),
+        "stdio child inherited a parent's execution server"
+    );
+    assert_eq!(env["CODEX_HOME"], h.codex_home.to_str().unwrap());
+    assert_eq!(env["CODEX_QUIET_MODE"], "1");
+    assert_eq!(
+        env["OPENAI_BASE_URL"],
+        "https://provider.example.invalid/v1"
+    );
+    assert_eq!(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "4096");
+    assert_eq!(env["HCOM_DIR"], h.hcom_dir.to_str().unwrap());
+    assert_eq!(env["HCOM_INSTANCE_NAME"], value["row"]["name"]);
+    assert_eq!(env["HCOM_LAUNCHED_BY"], "pezu");
+    assert_eq!(env["HCOM_LAUNCHED"], "1");
+    assert_eq!(env["HCOM_TOOL"], "codex");
+    assert_eq!(env["HCOM_STDIO_MODE"], "1");
+    assert_eq!(env["HCOM_PTY_MODE"], "0");
+    let context: Value =
+        serde_json::from_str(value["row"]["launch_context"].as_str().unwrap()).unwrap();
+    assert_eq!(env["HCOM_PROCESS_ID"], context["process_id"]);
+    for key in ["HCOM_PROCESS_ID", "HCOM_LAUNCH_BATCH_ID"] {
+        assert!(!env[key].as_str().unwrap().is_empty(), "{key}");
+    }
+    assert_clean(&h);
 }
 
 #[test]

@@ -2,18 +2,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::process::Stdio;
 #[cfg(not(test))]
 use std::sync::OnceLock;
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::sync::mpsc;
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::sync::{Arc, Mutex};
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
@@ -609,9 +609,14 @@ const HCOM_TOOL_NAMES: &[&str] = &[
     "agy",
 ];
 const HCOM_HOOK_TRUST_METADATA_FILE: &str = "hcom-hook-trust.toml";
-#[cfg(not(test))]
+// The first response includes wrapper startup: native image validation,
+// routed runtime preparation and ownership registration can precede spawn.
+// Keep that bounded separately from a query on an initialized app-server.
+#[cfg(any(not(test), unix))]
+const CODEX_APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(any(not(test), unix))]
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 const CODEX_APP_SERVER_STDERR_LIMIT: usize = 8192;
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
 
@@ -1437,7 +1442,7 @@ fn fetch_codex_hook_list_with_overrides(
 
     #[cfg(not(test))]
     {
-        let mut child = codex_app_server_command()
+        let child = codex_app_server_command()
             .args(overrides)
             .args(["app-server", "--listen", "stdio://"])
             .env("CODEX_HOME", codex_home)
@@ -1447,67 +1452,91 @@ fn fetch_codex_hook_list_with_overrides(
             .spawn()
             .map_err(|e| format!("failed to start codex app-server: {e}"))?;
 
-        let stderr_buf = child
-            .stderr
-            .take()
-            .map(spawn_bounded_stderr_reader)
-            .unwrap_or_else(|| Arc::new(Mutex::new(String::new())));
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "failed to capture codex app-server stdout".to_string())?;
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = tx.send(line);
-            }
-        });
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "failed to capture codex app-server stdin".to_string())?;
-        let initialize = serde_json::json!({
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "clientInfo": {
-                    "name": "hcom",
-                    "title": "hcom",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": { "experimentalApi": true }
-            }
-        });
-        writeln!(stdin, "{initialize}").map_err(|e| e.to_string())?;
-        read_jsonrpc_response(&rx, 1).map_err(|e| with_app_server_stderr(e, &stderr_buf))?;
-
-        writeln!(
-            stdin,
-            "{}",
-            serde_json::json!({"method":"initialized","params":{}})
-        )
-        .map_err(|e| e.to_string())?;
-        let request = serde_json::json!({
-            "method": "hooks/list",
-            "id": 2,
-            "params": { "cwds": [cwd] }
-        });
-        writeln!(stdin, "{request}").map_err(|e| e.to_string())?;
-        stdin.flush().map_err(|e| e.to_string())?;
-
-        let response =
-            read_jsonrpc_response(&rx, 2).map_err(|e| with_app_server_stderr(e, &stderr_buf));
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
-        parse_codex_hook_list_entries(&response?)
+        read_codex_hook_list_from_child(child, cwd)
     }
 }
 
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
+struct CodexHookInspectionChild(std::process::Child);
+
+#[cfg(any(not(test), unix))]
+impl Drop for CodexHookInspectionChild {
+    fn drop(&mut self) {
+        // std::process::Child does not reap on drop. In particular, an
+        // initialize error returns before the hooks/list cleanup path.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(any(not(test), unix))]
+fn read_codex_hook_list_from_child(
+    child: std::process::Child,
+    cwd: &Path,
+) -> Result<Vec<CodexHookListEntry>, String> {
+    let mut child = CodexHookInspectionChild(child);
+    let stderr_buf = child
+        .0
+        .stderr
+        .take()
+        .map(spawn_bounded_stderr_reader)
+        .unwrap_or_else(|| Arc::new(Mutex::new(String::new())));
+
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture codex app-server stdout".to_string())?;
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    let mut stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to capture codex app-server stdin".to_string())?;
+    let initialize = serde_json::json!({
+        "method": "initialize",
+        "id": 1,
+        "params": {
+            "clientInfo": {
+                "name": "hcom",
+                "title": "hcom",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": { "experimentalApi": true }
+        }
+    });
+    writeln!(stdin, "{initialize}").map_err(|e| e.to_string())?;
+    read_jsonrpc_response(&rx, 1, CODEX_APP_SERVER_STARTUP_TIMEOUT)
+        .map_err(|e| with_app_server_stderr(e, &stderr_buf))?;
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"method":"initialized","params":{}})
+    )
+    .map_err(|e| e.to_string())?;
+    let request = serde_json::json!({
+        "method": "hooks/list",
+        "id": 2,
+        "params": { "cwds": [cwd] }
+    });
+    writeln!(stdin, "{request}").map_err(|e| e.to_string())?;
+    stdin.flush().map_err(|e| e.to_string())?;
+
+    let response = read_jsonrpc_response(&rx, 2, CODEX_APP_SERVER_TIMEOUT)
+        .map_err(|e| with_app_server_stderr(e, &stderr_buf));
+    drop(stdin);
+    parse_codex_hook_list_entries(&response?)
+}
+
+#[cfg(any(not(test), unix))]
 fn spawn_bounded_stderr_reader<R>(mut stderr: R) -> Arc<Mutex<String>>
 where
     R: Read + Send + 'static,
@@ -1542,7 +1571,7 @@ where
     buf
 }
 
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 fn with_app_server_stderr(mut error: String, stderr_buf: &Arc<Mutex<String>>) -> String {
     let stderr = stderr_buf
         .lock()
@@ -1556,9 +1585,13 @@ fn with_app_server_stderr(mut error: String, stderr_buf: &Arc<Mutex<String>>) ->
     error
 }
 
-#[cfg(not(test))]
-fn read_jsonrpc_response(rx: &mpsc::Receiver<String>, id: i64) -> Result<Value, String> {
-    let deadline = std::time::Instant::now() + CODEX_APP_SERVER_TIMEOUT;
+#[cfg(any(not(test), unix))]
+fn read_jsonrpc_response(
+    rx: &mpsc::Receiver<String>,
+    id: i64,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -1712,6 +1745,71 @@ mod tests {
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
     use std::collections::HashMap;
+
+    #[cfg(unix)]
+    fn run_hook_inspection_fixture(
+        script: &str,
+    ) -> (Result<Vec<CodexHookListEntry>, String>, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .env_clear()
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let result = read_codex_hook_list_from_child(child, dir.path());
+        // waitpid must report no remaining child: this distinguishes reaping
+        // from merely signalling a process and leaving a zombie behind.
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        let reaped =
+            waited == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        if waited == 0 {
+            // A failing regression must not leave its disposable process alive.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+        (result, reaped)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_reaps_child_on_initialize_error() {
+        let (result, reaped) = run_hook_inspection_fixture(
+            r#"read -r request; printf '%s\n' '{"id":1,"error":{"code":-32603,"message":"fixture initialization failure"}}'; exec /bin/sleep 30"#,
+        );
+        assert!(result.unwrap_err().contains("returned error for id 1"));
+        assert!(
+            reaped,
+            "initialize failure left the inspection child unreaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_reaps_child_on_initialize_disconnect() {
+        let (result, reaped) = run_hook_inspection_fixture("exec 1>&-; exec /bin/sleep 30");
+        assert!(result.unwrap_err().contains("closed before response id 1"));
+        assert!(
+            reaped,
+            "initialize disconnect left the inspection child unreaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_reaps_child_after_hook_list() {
+        let (result, reaped) = run_hook_inspection_fixture(
+            r#"read -r request; printf '%s\n' '{"id":1,"result":{}}'; read -r notification; read -r request; printf '%s\n' '{"id":2,"result":{"data":[{"hooks":[]}]}}'; exec /bin/sleep 30"#,
+        );
+        assert_eq!(result.unwrap(), Vec::new());
+        assert!(reaped, "successful inspection left the child unreaped");
+    }
 
     fn per_run_ctx(args: &[&str], home: &Path) -> LaunchCtx {
         LaunchCtx {
