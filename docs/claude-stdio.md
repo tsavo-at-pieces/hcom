@@ -24,6 +24,9 @@ not the environment of the hcom process itself. It does not create a terminal, p
 launch banner, or redirect output to a background log. Native `SessionStart`
 binds the real session ID. Signals reach the child's process group; hcom returns
 its exit status and cleans up its registration if `SessionEnd` was not emitted.
+While the child runs, hcom refreshes the session's heartbeat every few seconds,
+so an idle pipe client is not reported stale. It never revives a stopped or
+replaced row.
 
 The client owns turn completion and idle input. `Stop` drains messages already
 queued, then returns immediately when none remain. Messages arriving while the

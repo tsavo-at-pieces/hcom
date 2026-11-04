@@ -1197,6 +1197,18 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Refresh the heartbeat of one live row incarnation while a foreground
+    /// pipe client's child runs. Unlike [`Self::update_heartbeat`], this
+    /// claims no TCP listener and never touches a stopped or replaced row.
+    /// Returns whether the row was refreshed.
+    pub fn update_stdio_heartbeat(&self, name: &str, created_at: f64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE instances SET last_stop = ? WHERE name = ? AND created_at = ? AND status != ?",
+            params![now_epoch_i64(), name, created_at, ST_INACTIVE],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Update instance position with tcp_mode flag
     pub fn update_tcp_mode(&self, name: &str, tcp_mode: bool) -> Result<()> {
         self.conn.execute(
@@ -1725,6 +1737,46 @@ mod tests {
         // Should be ordered by created_at DESC
         assert_eq!(instances[0]["name"], "luna");
         assert_eq!(instances[1]["name"], "nova");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn stdio_heartbeat_refreshes_only_the_live_row_incarnation() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, last_stop, tcp_mode)
+                 VALUES ('nova', 'listening', '', 1700000000.25, 1, 0)",
+                [],
+            )
+            .unwrap();
+        let heartbeat = |db: &HcomDb| -> (i64, i64) {
+            db.conn
+                .query_row(
+                    "SELECT last_stop, tcp_mode FROM instances WHERE name = 'nova'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+
+        assert!(db.update_stdio_heartbeat("nova", 1700000000.25).unwrap());
+        let (last_stop, tcp_mode) = heartbeat(&db);
+        assert!(last_stop > 1);
+        assert_eq!(tcp_mode, 0, "a pipe client has no TCP listener");
+
+        db.conn
+            .execute("UPDATE instances SET last_stop = 1 WHERE name = 'nova'", [])
+            .unwrap();
+        assert!(!db.update_stdio_heartbeat("nova", 1700000000.5).unwrap());
+        db.mark_killed("nova", "luna").unwrap();
+        assert!(!db.update_stdio_heartbeat("nova", 1700000000.25).unwrap());
+        assert_eq!(heartbeat(&db), (1, 0));
+
+        db.delete_instance("nova").unwrap();
+        assert!(!db.update_stdio_heartbeat("nova", 1700000000.25).unwrap());
+        assert!(db.get_instance_full("nova").unwrap().is_none());
 
         cleanup_test_db(db_path);
     }

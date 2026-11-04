@@ -2591,6 +2591,7 @@ fn launch_stdio(
         None
     };
     let mut child_pid = 0;
+    let mut heartbeat = None;
     let exit_code = crate::sys::process::run_stdio_child(&mut command, stdout_tap, |pid| {
         child_pid = pid;
         db.store_launch_context(
@@ -2632,8 +2633,12 @@ fn launch_stdio(
                 "background": false, "stdio": true, "tag": tag, "instances": [instance_name],
             }),
         )?;
+        if tool == "claude" {
+            heartbeat = StdioHeartbeat::start(db, process_id, STDIO_HEARTBEAT_INTERVAL);
+        }
         Ok(())
     })?;
+    drop(heartbeat);
     let bound_name = db
         .get_process_binding(process_id)?
         .unwrap_or_else(|| instance_name.to_string());
@@ -2745,6 +2750,73 @@ fn valid_codex_stdio_args(args: &[String]) -> bool {
         i += 1;
     }
     app_server
+}
+
+/// Half the heartbeat age at which a listening row without a TCP endpoint
+/// looks stale ([`crate::instance_lifecycle::HEARTBEAT_THRESHOLD_NO_TCP`]).
+const STDIO_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Refreshes the heartbeat of the row a stdio launch's process is bound to,
+/// until dropped. This transport has no delivery loop or notify endpoint, so
+/// nothing else shows that an idle pipe client is still alive.
+struct StdioHeartbeat {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StdioHeartbeat {
+    fn start(db: &HcomDb, process_id: &str, interval: std::time::Duration) -> Option<Self> {
+        let started = HcomDb::open_at(db.path()).and_then(|mut db| {
+            let process_id = process_id.to_string();
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::Builder::new()
+                .name("stdio-heartbeat".into())
+                .spawn(move || {
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        stopped.recv_timeout(interval)
+                    {
+                        db.reconnect_if_stale();
+                        if let Err(error) = refresh_stdio_heartbeat(&db, &process_id) {
+                            crate::log::log_warn(
+                                "launcher",
+                                "stdio.heartbeat_failed",
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                })?;
+            Ok(Self {
+                stop: Some(stop),
+                thread: Some(thread),
+            })
+        });
+        started
+            .inspect_err(|error| {
+                crate::log::log_warn("launcher", "stdio.heartbeat_failed", &error.to_string());
+            })
+            .ok()
+    }
+}
+
+impl Drop for StdioHeartbeat {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The process binding names the row: SessionStart of a native `--resume`
+/// moves the process from its launch placeholder to the restored identity.
+fn refresh_stdio_heartbeat(db: &HcomDb, process_id: &str) -> Result<bool> {
+    let Some(name) = db.get_process_binding(process_id)? else {
+        return Ok(false);
+    };
+    let Some(row) = db.get_instance_full(&name)? else {
+        return Ok(false);
+    };
+    db.update_stdio_heartbeat(&name, row.created_at)
 }
 
 /// A stream-json client receives a `result` frame at the end of every turn,
@@ -4767,6 +4839,38 @@ mod tests {
         assert!(win.contains_key("MY_SECRET") && !win.contains_key("HCOM_X"));
         let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
+    }
+
+    #[test]
+    fn stdio_heartbeat_follows_the_process_binding_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        // A native `--resume` rebound the process from its launch row.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, created_at, last_stop)
+                 VALUES ('kole', 'sess-r', 'claude', 'listening', '', 1700000000.25, 1)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("stdio-proc", "sess-r", "kole")
+            .unwrap();
+        let last_stop = || db.get_instance_full("kole").unwrap().unwrap().last_stop;
+
+        let heartbeat =
+            StdioHeartbeat::start(&db, "stdio-proc", std::time::Duration::from_millis(20)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while last_stop() == 1 {
+            assert!(std::time::Instant::now() < deadline, "no heartbeat");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(heartbeat);
+        db.conn()
+            .execute("UPDATE instances SET last_stop = 1 WHERE name = 'kole'", [])
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(last_stop(), 1, "heartbeat continued after the child exited");
+        assert!(!refresh_stdio_heartbeat(&db, "other-proc").unwrap());
     }
 
     #[test]

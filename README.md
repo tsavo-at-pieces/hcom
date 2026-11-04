@@ -209,7 +209,8 @@ Pipe clients can use `hcom claude --stdio --go -- -p ...` on Unix to retain
 their stdin/stdout/stderr and native exit status. This keeps SDK control frames
 out of a PTY and allows each turn to complete. With `--output-format stream-json`,
 hcom forwards stdout byte-for-byte and marks a client-cancelled turn
-`listening`/`interrupted`. See [Claude pipe clients](docs/claude-stdio.md).
+`listening`/`interrupted`. The session heartbeats while the child runs. See
+[Claude pipe clients](docs/claude-stdio.md).
 
 For subagents, run `hcom claude`, then prompt:
 

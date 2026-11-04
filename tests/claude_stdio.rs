@@ -323,6 +323,50 @@ exit 3
 }
 
 #[test]
+fn claude_stdio_listening_row_stays_live_while_the_child_runs() {
+    let h = Hcom::new();
+    install_fake_claude(
+        &h,
+        r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=7d1e5a2b-3c4f-4a6b-8d9e-0f1a2b3c4d5e
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
+hook poll "{\"session_id\":\"$sid\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false}"
+printf 'idle\n'
+IFS= read -r line
+exit 0
+"##,
+    );
+    h.set_launch_env("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom"));
+    // Text output has no stdout tap; the heartbeat covers every stdio launch.
+    let mut child = h
+        .cmd()
+        .args(["claude", "--stdio", "--go", "--", "-p"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "idle\n");
+    assert_eq!(only_status(&h).unwrap().0, "listening");
+    // Without a heartbeat, `listening` without TCP reads as stale after 10s.
+    std::thread::sleep(Duration::from_secs(12));
+    let rows = h.list_json().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["status"], "listening", "{rows:?}");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    assert_no_registered_instances(&h);
+}
+
+#[test]
 fn claude_stdio_keeps_clean_channels_and_native_exit() {
     let h = Hcom::new();
     let bin = h.root_path().join("pipe-tools");
