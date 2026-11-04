@@ -928,6 +928,30 @@ mod tapped_stdout {
             assert!(before_first <= *emitted_after && *emitted_after <= before_second);
         }
 
+        #[test]
+        fn a_line_is_written_before_its_newline_arrives() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, FAST);
+            copy.child().write_all(b"{\"type\":\"partial\"").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while written(&log.lock().unwrap()) != b"{\"type\":\"partial\"" {
+                assert!(
+                    Instant::now() < deadline,
+                    "the copy held back a partial line"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(observed(&log.lock().unwrap()).is_empty());
+            copy.child().write_all(b"}\n").unwrap();
+            copy.child.take();
+            let copied = copy.wait();
+            assert_eq!(written(&copied), b"{\"type\":\"partial\"}\n");
+            assert_eq!(
+                observed(&copied),
+                [(b"{\"type\":\"partial\"}".to_vec(), at(1))]
+            );
+        }
+
         /// A read that takes all a full pipe held, however short of the
         /// copy's buffer, does not show the pipe empty: the child may have
         /// had more waiting for room, so a line read later keeps the time
