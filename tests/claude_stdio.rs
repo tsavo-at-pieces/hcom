@@ -1322,11 +1322,13 @@ fn real_claude_stdio_interrupt_marks_the_turn_listening_interrupted() {
         if !request.path.contains("/v1/messages") {
             return Reply::Status(404);
         }
+        // The newer turn first: Claude may fold the interrupted prompt into
+        // the next request's last user message.
         let (_, text) = latest_user_turn(&request.body).unwrap_or_default();
-        if text.contains("STDIO_STALL") {
-            Reply::Stall(claude_partial_text("msg_stall", "Counting: 1 2 3"))
-        } else if text.contains("STDIO_AFTER") {
+        if text.contains("STDIO_AFTER") {
             Reply::Sse(claude_text("msg_after", "STDIO_AFTER_DONE"))
+        } else if text.contains("STDIO_STALL") {
+            Reply::Stall(claude_partial_text("msg_stall", "Counting: 1 2 3"))
         } else {
             Reply::Status(500)
         }
@@ -1424,6 +1426,15 @@ fn real_claude_stdio_interrupt_marks_the_turn_listening_interrupted() {
     let result = next("result");
     assert_eq!(result["terminal_reason"], "aborted_streaming", "{result}");
     assert_eq!(result["is_error"], true, "{result}");
+    // The fallback trigger as the client sees it: the idle state, in the session.
+    let idle = loop {
+        let frame = next("system");
+        if frame["subtype"] == "session_state_changed" {
+            break frame;
+        }
+    };
+    assert_eq!(idle["state"], "idle", "{idle}");
+    assert_eq!(idle["session_id"], result["session_id"], "{idle}");
     let interrupted = Some((
         "listening".to_string(),
         "interrupted".to_string(),
