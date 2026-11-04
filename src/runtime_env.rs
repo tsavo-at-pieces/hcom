@@ -39,6 +39,24 @@ pub(crate) fn is_uvx_ephemeral_exe(exe: &std::path::Path) -> bool {
 }
 
 /// Detect hcom invocation prefix based on execution context.
+/// The canonical path of this hcom image, for per-run hooks that must run this
+/// exact implementation (the stdio transports). `current_exe()` can be the
+/// symlink hcom was invoked by; a link retargeted during a live session would
+/// otherwise move that session's hooks to another image.
+pub(crate) fn pinned_hook_executable() -> std::io::Result<String> {
+    Ok(pinned_image(std::env::current_exe()?)
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// The image behind `exe`, which may be the symlink hcom was invoked by.
+fn pinned_image(exe: std::path::PathBuf) -> std::path::PathBuf {
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    #[cfg(windows)]
+    let exe = crate::shared::platform::child_process_path(&exe);
+    exe
+}
+
 pub(crate) fn get_hcom_prefix() -> Vec<String> {
     HCOM_PREFIX.clone()
 }
@@ -570,5 +588,25 @@ mod tests {
         assert!(!super::is_uvx_ephemeral_exe(std::path::Path::new(
             "/usr/local/bin/hcom"
         )));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pinned_image_tests {
+    /// Linux's current_exe() is already resolved by the kernel, so only a path
+    /// handed in directly proves the pin on every Unix; macOS exercises it end
+    /// to end through tests/claude_stdio.rs.
+    #[test]
+    fn pinned_image_resolves_an_invoked_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("image").join("hcom");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"").unwrap();
+        let link = temp.path().join("link-bin").join("hcom");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+        let pinned = super::pinned_image(link.clone());
+        assert_eq!(pinned, std::fs::canonicalize(&image).unwrap());
+        assert_ne!(pinned, link);
     }
 }

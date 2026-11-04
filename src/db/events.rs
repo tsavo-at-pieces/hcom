@@ -31,6 +31,24 @@ impl Message {
     }
 }
 
+/// Who launched an instance and in which batch, as resolved by the launcher
+/// that supervises it (`launch_stdio`); hooks inside a launch read the same
+/// two values from their environment instead.
+#[derive(Clone, Copy)]
+pub(crate) struct LaunchAttribution<'a> {
+    pub launcher: &'a str,
+    pub batch_id: &'a str,
+}
+
+/// The variable part of a launch-lifecycle life event.
+struct LifecycleBody<'a> {
+    action: &'a str,
+    status: &'a str,
+    context: &'a str,
+    reason: Option<&'a str>,
+    detail: Option<&'a str>,
+}
+
 impl HcomDb {
     /// Check if a message event should be delivered to the given receiver.
     ///
@@ -210,27 +228,50 @@ impl HcomDb {
         reason: Option<&str>,
         detail: Option<&str>,
     ) -> Result<(String, Option<String>)> {
+        // A hook runs inside the launch it reports on, so its own environment
+        // is that launch's attribution.
         let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
         let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
+        self.write_launch_lifecycle_event(
+            name,
+            &launcher,
+            batch_id.as_deref(),
+            LifecycleBody {
+                action,
+                status,
+                context,
+                reason,
+                detail,
+            },
+        )?;
+        Ok((launcher, batch_id))
+    }
 
+    fn write_launch_lifecycle_event(
+        &self,
+        name: &str,
+        launcher: &str,
+        batch_id: Option<&str>,
+        body: LifecycleBody<'_>,
+    ) -> Result<()> {
         let mut event_data = serde_json::json!({
-            "action": action,
-            "by": &launcher,
-            "status": status,
-            "context": context,
+            "action": body.action,
+            "by": launcher,
+            "status": body.status,
+            "context": body.context,
         });
-        if let Some(reason) = reason.filter(|s| !s.is_empty()) {
+        if let Some(reason) = body.reason.filter(|s| !s.is_empty()) {
             event_data["reason"] = serde_json::Value::String(reason.to_string());
         }
-        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+        if let Some(detail) = body.detail.filter(|s| !s.is_empty()) {
             event_data["detail"] = serde_json::Value::String(detail.to_string());
         }
-        if let Some(ref bid) = batch_id {
-            event_data["batch_id"] = serde_json::Value::String(bid.clone());
+        if let Some(bid) = batch_id {
+            event_data["batch_id"] = serde_json::Value::String(bid.to_string());
         }
 
         self.log_event_with_ts("life", name, &event_data, None)?;
-        Ok((launcher, batch_id))
+        Ok(())
     }
 
     /// Emit "ready" life event and check for batch completion notification.
@@ -268,6 +309,37 @@ impl HcomDb {
         {
             let notify_detail = if detail.is_empty() { reason } else { detail };
             self.notify_batch_failure(&launcher, bid, name, notify_detail)?;
+        }
+        Ok(())
+    }
+
+    /// `emit_launch_failed_event` for a launch this process supervises rather
+    /// than runs inside: the attribution is the supervised launch's, never the
+    /// supervisor's own `HCOM_LAUNCHED_BY` / `HCOM_LAUNCH_BATCH_ID`.
+    pub(crate) fn emit_launch_failed_event_as(
+        &self,
+        name: &str,
+        who: LaunchAttribution<'_>,
+        status: &str,
+        context: &str,
+        reason: &str,
+        detail: &str,
+    ) -> Result<()> {
+        self.write_launch_lifecycle_event(
+            name,
+            who.launcher,
+            Some(who.batch_id),
+            LifecycleBody {
+                action: "launch_failed",
+                status,
+                context,
+                reason: Some(reason),
+                detail: Some(detail),
+            },
+        )?;
+        if who.launcher != "unknown" {
+            let notify_detail = if detail.is_empty() { reason } else { detail };
+            self.notify_batch_failure(who.launcher, who.batch_id, name, notify_detail)?;
         }
         Ok(())
     }
