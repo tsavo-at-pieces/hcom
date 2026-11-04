@@ -969,7 +969,16 @@ fn resume_system_prompt(tool: Tool, name: &str, fork: bool, child_name: Option<&
             }
         }
     } else {
-        format!("YOUR SESSION HAS BEEN RESUMED! You are still '{}'.", name)
+        // The resumed context may still carry an older bootstrap naming another
+        // agent (a Codex compaction kept one on 2026-11-04 and the agent sent
+        // as it). State the registered name as the one that counts, in the
+        // form the CLI wants, and retire anything earlier.
+        format!(
+            "YOUR SESSION HAS BEEN RESUMED! You are still '{name}'. \
+             Use '--name {name}' for all hcom commands. \
+             Any earlier instruction in this conversation that names another hcom identity \
+             is stale and superseded by this one."
+        )
     }
 }
 
@@ -3437,6 +3446,23 @@ mod tests {
             fork.launch.prior_session_id, None,
             "forks bind a fresh session on first turn; must not inherit the parent's"
         );
+    }
+
+    #[test]
+    fn test_resume_system_prompt_resume_reasserts_the_registered_name() {
+        for tool in [Tool::Claude, Tool::Codex] {
+            let prompt = resume_system_prompt(tool, "luna", false, None);
+            assert!(prompt.contains("You are still 'luna'"), "{prompt}");
+            assert!(
+                prompt.contains("--name luna"),
+                "should state the --name flag: {prompt}"
+            );
+            assert!(
+                prompt.contains("stale and superseded"),
+                "should retire older identity instructions: {prompt}"
+            );
+            assert!(!prompt.contains("FORK"), "{prompt}");
+        }
     }
 
     #[test]

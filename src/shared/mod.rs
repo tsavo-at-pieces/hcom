@@ -41,7 +41,7 @@ pub use constants::{
 };
 pub use context::HcomContext;
 pub use errors::{CLIError, HcomError, HookError};
-pub use identity::{CommandContext, SenderIdentity, SenderKind};
+pub use identity::{CommandContext, IdentityConflict, SenderIdentity, SenderKind};
 pub use platform::{
     detect_current_tool_from_env, dev_root_binary, is_inside_ai_tool, is_termux, is_wsl,
     platform_name, shorten_path, shorten_path_max,

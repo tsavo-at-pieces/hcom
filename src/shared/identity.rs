@@ -61,6 +61,20 @@ pub struct CommandContext {
     /// Warning to print when `--name` disagrees with the identity this shell
     /// resolves to. `None` when they agree or the shell has no identity.
     pub identity_warning: Option<String>,
+    /// The disagreement behind `identity_warning`: `--name` names one instance
+    /// while this shell's registered binding names another, and the named one
+    /// is not a subagent of the bound one. An outbound `send` refuses on it;
+    /// other commands only warn.
+    pub identity_conflict: Option<IdentityConflict>,
+}
+
+/// An explicit `--name` that contradicts the shell's registered binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityConflict {
+    /// The instance `--name` asked for.
+    pub explicit: String,
+    /// The instance this shell's process binding registers.
+    pub bound: String,
 }
 
 #[cfg(test)]

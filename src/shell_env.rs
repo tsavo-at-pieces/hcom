@@ -9,6 +9,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -68,7 +70,7 @@ fn resolve_shell_env_uncached() -> Option<HashMap<String, String>> {
     }
 
     let marker = format!("hcom-shell-env-{}", uuid::Uuid::new_v4());
-    let cmd = format!("printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"");
+    let cmd = format!("printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\"");
     let output = timed_shell_output(&shell, &cmd, &marker)?;
     parse_shell_env_output(&output.stdout, &marker, MARKER_VAR)
 }
@@ -98,6 +100,226 @@ struct ShellOutput {
     stdout: Vec<u8>,
 }
 
+/// Upper bound on what the resolver keeps from the shell. A login environment
+/// is a few kilobytes; a shell that keeps streaming (an rc file that tails a
+/// log, a prompt hook in a loop) is killed instead of being read without limit.
+const MAX_SHELL_OUTPUT: usize = 8 * 1024 * 1024;
+
+/// Size of one read from the shell's stdout.
+const DRAIN_CHUNK: usize = 16 * 1024;
+
+/// How many chunks the drain may queue ahead of the consumer. The byte budget
+/// is enforced before a chunk is queued, so this only bounds the burst a
+/// producer can run ahead by (1 MiB), not the total.
+const DRAIN_QUEUE_CHUNKS: usize = 64;
+
+/// What the drain thread hands over, piece by piece.
+enum Drained {
+    Chunk(Vec<u8>),
+    Eof,
+    /// The byte budget would be exceeded; the chunk that crossed it was dropped
+    /// and nothing more is read.
+    OverCapacity,
+    Failed,
+}
+
+/// Read the shell's stdout on its own thread and hand each chunk over through
+/// a bounded channel, so the shell never sits in a blocked write on a full pipe
+/// while the parent waits for it to exit (#7).
+///
+/// The byte budget is enforced here, before a chunk is queued: the bytes held
+/// anywhere (queue plus consumer) never exceed `budget`. `stop` ends the read
+/// early. On unix the read waits in `poll` with a short timeout and checks the
+/// flag between waits, so the thread can be joined on every return of the
+/// resolver, including when a descendant of the shell still holds the pipe
+/// open and EOF never comes.
+fn drain_stdout(
+    mut out: std::process::ChildStdout,
+    tx: std::sync::mpsc::SyncSender<Drained>,
+    budget: usize,
+    stop: Arc<AtomicBool>,
+    wait: Waiter,
+) {
+    let mut chunk = [0u8; DRAIN_CHUNK];
+    let mut sent = 0usize;
+    loop {
+        match wait(&out, &stop) {
+            Wait::Ready => {}
+            Wait::Stopped => return,
+            Wait::Failed => {
+                let _ = tx.send(Drained::Failed);
+                return;
+            }
+        }
+        match out.read(&mut chunk) {
+            Ok(0) => {
+                let _ = tx.send(Drained::Eof);
+                return;
+            }
+            Ok(n) => {
+                if sent + n > budget {
+                    let _ = tx.send(Drained::OverCapacity);
+                    return;
+                }
+                sent += n;
+                if tx.send(Drained::Chunk(chunk[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                let _ = tx.send(Drained::Failed);
+                return;
+            }
+        }
+    }
+}
+
+/// What a wait on the shell's stdout ended with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// Data, EOF or a hang-up: a read answers without blocking.
+    Ready,
+    /// The resolver asked the drain to stop.
+    Stopped,
+    /// The wait itself failed, so nothing is known about readiness.
+    Failed,
+}
+
+/// How the drain waits for stdout; a test can substitute a failing wait.
+type Waiter = fn(&std::process::ChildStdout, &AtomicBool) -> Wait;
+
+/// Wait until `out` has data, EOF or a hang-up to report, checking `stop`
+/// every 50 ms. A poll error other than EINTR says nothing about readiness,
+/// and a read taken on it could block on a quiet pipe with no way to cancel
+/// it, so it is reported as a failure instead of being read through.
+#[cfg(unix)]
+fn wait_readable(out: &std::process::ChildStdout, stop: &AtomicBool) -> Wait {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Wait::Stopped;
+        }
+        let mut fds = [PollFd::new(out.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(50u16)) {
+            Ok(0) => continue,
+            Ok(_) => return Wait::Ready,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return Wait::Failed,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_readable(_out: &std::process::ChildStdout, stop: &AtomicBool) -> Wait {
+    if stop.load(Ordering::Relaxed) {
+        Wait::Stopped
+    } else {
+        Wait::Ready
+    }
+}
+
+/// The drain thread and the parent's handles on it.
+struct Drain {
+    rx: std::sync::mpsc::Receiver<Drained>,
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl Drain {
+    fn start(out: std::process::ChildStdout, budget: usize) -> std::io::Result<Self> {
+        Self::start_with(out, budget, wait_readable)
+    }
+
+    fn start_with(
+        out: std::process::ChildStdout,
+        budget: usize,
+        wait: Waiter,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(DRAIN_QUEUE_CHUNKS);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("hcom-shell-env-drain".to_string())
+            .spawn(move || drain_stdout(out, tx, budget, flag, wait))?;
+        Ok(Self { rx, stop, handle })
+    }
+
+    /// End the drain thread and wait for it. The receiver goes first, so a
+    /// send blocked on a full queue fails; the flag ends the next wait; a read
+    /// that already has data returns at once. Bounded by one poll interval.
+    fn finish(self) {
+        let Drain { rx, stop, handle } = self;
+        drop(rx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+}
+
+/// The close the command prints after `env -0`: the marker with a suffix the
+/// shell's startup files cannot know. The marker itself is in the shell's
+/// environment before those files run, so a startup diagnostic can echo it;
+/// it cannot produce the close.
+fn close_marker(marker: &str) -> String {
+    format!("{marker}-end")
+}
+
+/// The marker-framed environment in `stdout`, as `(start, end)` of the body:
+/// the close is the first `close_marker` right after a NUL (the terminator of
+/// the last `env -0` entry); the opening is the last marker before it that the
+/// command printed itself: not a startup echo of the exported marker (those
+/// come earlier), not preceded by `=`, and not inside the marker variable's
+/// own `marker_var=marker` entry. Text after the close (an EXIT trap, a
+/// logout message) is outside the frame. The parser and the completeness
+/// check share this.
+fn frame(stdout: &[u8], marker: &str, marker_var: &str) -> Option<(usize, usize)> {
+    let m = marker.as_bytes();
+    let close = close_marker(marker);
+    let c = close.as_bytes();
+    let mut from = 0;
+    let mut close_at = None;
+    while let Some(rel) = find_bytes(&stdout[from..], c) {
+        let at = from + rel;
+        if at > 0 && stdout[at - 1] == 0 {
+            close_at = Some(at);
+            break;
+        }
+        from = at + 1;
+    }
+    let close_at = close_at?;
+    let head = &stdout[..close_at];
+    let own_entry = format!("{marker_var}={marker}");
+    let own = own_entry.as_bytes();
+    let mut entries = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = find_bytes(&head[from..], own) {
+        let at = from + rel;
+        entries.push(at..at + own.len());
+        from = at + 1;
+    }
+    let mut from = 0;
+    let mut open_at = None;
+    while let Some(rel) = find_bytes(&head[from..], m) {
+        let at = from + rel;
+        let after_equals = at > 0 && head[at - 1] == b'=';
+        let inside_own_entry = entries.iter().any(|span| span.contains(&at));
+        if !after_equals && !inside_own_entry {
+            open_at = Some(at);
+        }
+        from = at + 1;
+    }
+    let open_at = open_at?;
+    Some((open_at + m.len(), close_at))
+}
+
+/// Whether `stdout` holds a complete marker-framed environment (see [`frame`]).
+/// A capture cut anywhere before the close, including inside the marker
+/// variable's own value, is not complete.
+fn output_is_complete(stdout: &[u8], marker: &str) -> bool {
+    frame(stdout, marker, MARKER_VAR).is_some()
+}
+
 fn timed_shell_output(shell: &Path, cmd: &str, marker: &str) -> Option<ShellOutput> {
     timed_shell_output_with_timeout(shell, cmd, marker, SHELL_TIMEOUT)
 }
@@ -108,44 +330,150 @@ fn timed_shell_output_with_timeout(
     marker: &str,
     timeout: Duration,
 ) -> Option<ShellOutput> {
-    let mut child = shell_command(shell, cmd, marker).spawn().ok()?;
+    timed_shell_output_bounded(shell, cmd, marker, timeout, MAX_SHELL_OUTPUT, None)
+}
+
+/// Run the shell and collect its stdout while waiting for it to exit.
+///
+/// The read and the wait run together: a drain thread reads the pipe and this
+/// thread polls for the exit, so an environment larger than the pipe buffer
+/// (16 KB on macOS) or a slow writer can no longer park the shell in a blocked
+/// write until the timeout kills it. One deadline covers both halves; when it
+/// runs out, or the output exceeds `capacity`, the shell's process group is
+/// killed and the resolution fails.
+///
+/// Success needs the output to be complete: EOF, or, once the shell has exited
+/// and everything the drain queued has been taken, the closing marker in its
+/// place. The second form covers a background job started by an rc file that
+/// inherited the pipe: after a short grace the output is returned, the job is
+/// left alone, and the drain thread is stopped rather than left waiting on the
+/// pipe. `home` replaces the seeded HOME (tests use a scratch directory).
+fn timed_shell_output_bounded(
+    shell: &Path,
+    cmd: &str,
+    marker: &str,
+    timeout: Duration,
+    capacity: usize,
+    home: Option<&Path>,
+) -> Option<ShellOutput> {
+    const POLL: Duration = Duration::from_millis(25);
+    const EXIT_GRACE: Duration = Duration::from_millis(200);
+
+    enum Verdict {
+        Complete,
+        Fail,
+    }
+
+    fn kill_and_reap(child: &mut std::process::Child) {
+        crate::sys::process::kill_child_group(child);
+        let _ = child.wait();
+    }
+
+    let mut child = shell_command(shell, cmd, marker, home).spawn().ok()?;
+    let Some(out) = child.stdout.take() else {
+        kill_and_reap(&mut child);
+        return None;
+    };
+    let Ok(drain) = Drain::start(out, capacity) else {
+        kill_and_reap(&mut child);
+        return None;
+    };
+
     let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if !status.success() {
-                    return None;
-                }
-                return Some(ShellOutput { stdout });
+    let mut stdout = Vec::new();
+    let mut eof = false;
+    let mut failed = false;
+    let mut exited: Option<(std::process::ExitStatus, std::time::Instant)> = None;
+    // Apply one message from the drain; false once the capture cannot succeed.
+    let take = |message: Drained, stdout: &mut Vec<u8>, eof: &mut bool| match message {
+        Drained::Chunk(bytes) if stdout.len() + bytes.len() <= capacity => {
+            stdout.extend_from_slice(&bytes);
+            true
+        }
+        Drained::Chunk(_) | Drained::OverCapacity | Drained::Failed => false,
+        Drained::Eof => {
+            *eof = true;
+            true
+        }
+    };
+    let verdict = loop {
+        if !eof && !failed {
+            match drain.rx.recv_timeout(POLL) {
+                Ok(message) => failed = !take(message, &mut stdout, &mut eof),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => failed = true,
             }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    crate::sys::process::kill_child_group(&mut child);
-                    let _ = child.wait();
-                    return None;
+        } else if !failed {
+            std::thread::sleep(POLL);
+        }
+        if failed {
+            break Verdict::Fail;
+        }
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some((status, std::time::Instant::now())),
+                Ok(None) => {}
+                Err(_) => break Verdict::Fail,
+            }
+        }
+        if let Some((status, at)) = exited {
+            // The shell is gone: take everything the drain has queued before
+            // judging the capture, so a late consumer cannot return a prefix
+            // while chunks, EOF or the budget verdict still wait in the queue.
+            while !eof && !failed {
+                match drain.rx.try_recv() {
+                    Ok(message) => failed = !take(message, &mut stdout, &mut eof),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => failed = true,
                 }
-                std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => {
-                crate::sys::process::kill_child_group(&mut child);
-                let _ = child.wait();
-                return None;
+            if failed || !status.success() {
+                break Verdict::Fail;
             }
+            if eof || (at.elapsed() >= EXIT_GRACE && output_is_complete(&stdout, marker)) {
+                // A frame accepted here is complete and within the budget as
+                // collected; a budget crossing or read error the drain may still
+                // report concerns bytes after the frame, which are never used.
+                break Verdict::Complete;
+            }
+        }
+        if start.elapsed() >= timeout {
+            break Verdict::Fail;
+        }
+    };
+
+    match verdict {
+        Verdict::Complete => {
+            drain.finish();
+            Some(ShellOutput { stdout })
+        }
+        Verdict::Fail => {
+            // A shell that already exited is not killed: its group may be a
+            // background job the user started, which is left alone as on the
+            // success path.
+            if exited.is_none() {
+                kill_and_reap(&mut child);
+            }
+            drain.finish();
+            None
         }
     }
 }
 
-fn shell_command(shell: &Path, cmd: &str, marker: &str) -> Command {
+/// The login shell invocation. `home` replaces the seeded HOME when given, so
+/// a test can run a shell against an empty directory instead of the caller's
+/// login files.
+fn shell_command(shell: &Path, cmd: &str, marker: &str, home: Option<&Path>) -> Command {
+    let mut seed = clean_shell_seed_env(shell);
+    if let Some(home) = home {
+        seed.insert("HOME".to_string(), home.to_string_lossy().to_string());
+    }
     let mut command = Command::new(shell);
     command
         .arg("-lic")
         .arg(cmd)
         .env_clear()
-        .envs(clean_shell_seed_env(shell))
+        .envs(seed)
         .env(MARKER_VAR, marker)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -233,11 +561,8 @@ fn parse_shell_env_output(
     marker: &str,
     marker_var: &str,
 ) -> Option<HashMap<String, String>> {
-    let marker_bytes = marker.as_bytes();
-    let first = find_bytes(stdout, marker_bytes)?;
-    let after_first = first + marker_bytes.len();
-    let second_rel = rfind_bytes(&stdout[after_first..], marker_bytes)?;
-    let body = &stdout[after_first..after_first + second_rel];
+    let (start, end) = frame(stdout, marker, marker_var)?;
+    let body = &stdout[start..end];
 
     let mut env = HashMap::new();
     for entry in body.split(|b| *b == b'\0') {
@@ -266,15 +591,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +599,7 @@ mod tests {
     #[test]
     fn parse_shell_env_output_extracts_between_markers_and_strips_hcom() {
         let marker = "MARKER";
-        let stdout = b"noiseMARKER\0a=1\0b=two\nlines\0HCOM_PROCESS_ID=pid\0HCOM_SHELL_ENV_MARKER=MARKER\0MARKERtail";
+        let stdout = b"noiseMARKER\0a=1\0b=two\nlines\0HCOM_PROCESS_ID=pid\0HCOM_SHELL_ENV_MARKER=MARKER\0MARKER-endtail";
 
         let env = parse_shell_env_output(stdout, marker, MARKER_VAR).unwrap();
 
@@ -296,7 +612,7 @@ mod tests {
     #[test]
     fn parse_shell_env_output_ignores_marker_value_inside_env_body() {
         let marker = "MARKER";
-        let stdout = b"MARKERHCOM_SHELL_ENV_MARKER=MARKER\0a=1\0MARKER";
+        let stdout = b"MARKERHCOM_SHELL_ENV_MARKER=MARKER\0a=1\0MARKER-end";
 
         let env = parse_shell_env_output(stdout, marker, MARKER_VAR).unwrap();
 
@@ -400,7 +716,7 @@ mod tests {
         use nix::unistd::{Pid, getsid};
 
         let shell = test_shell_path();
-        let mut command = shell_command(&shell, "sleep 30", "setsid-test");
+        let mut command = shell_command(&shell, "sleep 30", "setsid-test", None);
         command.stdout(Stdio::null());
         let mut child = command.spawn().unwrap();
         let child_pid = Pid::from_raw(child.id() as i32);
@@ -431,7 +747,7 @@ mod tests {
         let cmd = format!(
             "chunk=x; i=0; while [ \"$i\" -lt 12 ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; \
              i=0; while [ \"$i\" -lt 64 ]; do echo \"$chunk\" >&2; i=$((i + 1)); done; \
-             printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
+             printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\""
         );
 
         let output =
@@ -443,6 +759,383 @@ mod tests {
         assert_eq!(
             env.get("SHELL").map(String::as_str),
             Some(expected_shell.as_ref())
+        );
+    }
+
+    /// A stand-in for the login shell for the drain tests: accepts `-lic <cmd>`
+    /// and runs the command with `/bin/sh -c`, reading no profile. One per test
+    /// process, executed once on creation: on a loaded macOS host a freshly
+    /// written executable can sit in first-launch validation for over a minute
+    /// (70 s measured on 2026-11-04), and that wait belongs to no test.
+    #[cfg(unix)]
+    fn fake_shell() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::OnceLock;
+        static SHELL: OnceLock<(PathBuf, tempfile::TempDir)> = OnceLock::new();
+        SHELL
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("fakesh");
+                fs::write(
+                    &path,
+                    "#!/bin/sh\n[ \"$1\" = -lic ] || exit 97\nexec /bin/sh -c \"$2\"\n",
+                )
+                .unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                let status = Command::new(&path)
+                    .args(["-lic", "exit 0"])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "fake shell warm-up: {status}");
+                (path, dir)
+            })
+            .0
+            .clone()
+    }
+
+    /// Generous: the resolver's own 10 s is the production bound; here only
+    /// the capture matters, and the host may be slow.
+    #[cfg(unix)]
+    const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// `timed_shell_output_bounded` through the fake shell with an empty HOME.
+    #[cfg(unix)]
+    fn fake_shell_output(cmd: &str, marker: &str, capacity: usize) -> Option<ShellOutput> {
+        let shell = fake_shell();
+        let home = tempfile::tempdir().unwrap();
+        timed_shell_output_bounded(
+            &shell,
+            cmd,
+            marker,
+            TEST_TIMEOUT,
+            capacity,
+            Some(home.path()),
+        )
+    }
+
+    /// A plain `/bin/sh -c` child with stdout piped, for driving the drain
+    /// thread directly.
+    #[cfg(unix)]
+    fn piped_child(cmd: &str) -> std::process::Child {
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// `chunk` holds 2^doublings bytes of `x` when this prefix has run.
+    fn doubling(doublings: u32) -> String {
+        format!(
+            "chunk=x; i=0; while [ \"$i\" -lt {doublings} ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; "
+        )
+    }
+
+    /// Issue #7's shape: an environment larger than the pipe buffer. Reading
+    /// only after exit parked `env -0` in its final write until the timeout
+    /// killed it; the concurrent drain reads it through. Eight 32 KiB values
+    /// (Linux caps a single environment string at 128 KiB) total 256 KiB:
+    /// 16x the macOS pipe buffer, 4x the Linux default.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_reads_an_environment_larger_than_the_pipe_buffer() {
+        let marker = "hcom-shell-env-large-test";
+        let mut cmd = doubling(15);
+        for i in 1..=8 {
+            cmd.push_str(&format!(
+                "SHELL_ENV_TEST_BIG{i}=\"$chunk\"; export SHELL_ENV_TEST_BIG{i}; "
+            ));
+        }
+        cmd.push_str(&format!(
+            "printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\""
+        ));
+
+        let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        for i in 1..=8 {
+            assert_eq!(
+                env.get(&format!("SHELL_ENV_TEST_BIG{i}")).map(String::len),
+                Some(1 << 15),
+                "variable {i}"
+            );
+        }
+        assert!(env.contains_key("PATH"));
+        assert!(output.stdout.len() > 256 * 1024);
+    }
+
+    /// Over the capacity the shell is killed and nothing is returned, and the
+    /// rejection comes from the budget, not from the timeout: the shell would
+    /// otherwise sleep far longer than the few seconds allowed here.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_rejects_output_over_capacity_and_kills_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("shell.pid");
+        let cmd = format!(
+            "echo $$ > {pid}; {doubling} printf %s \"$chunk\"; sleep 30",
+            pid = pid_file.display(),
+            doubling = doubling(20)
+        );
+
+        let started = std::time::Instant::now();
+        let output = fake_shell_output(&cmd, "hcom-shell-env-capacity-test", 64 * 1024);
+        let elapsed = started.elapsed();
+
+        assert!(output.is_none());
+        assert!(
+            elapsed < TEST_TIMEOUT / 5,
+            "rejected by the timeout, not the budget: {elapsed:?}"
+        );
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(wait_for_process_exit(pid));
+    }
+
+    /// A quiet pipe is not the end of the output: the drain waits for the
+    /// closing marker from a writer that pauses after the environment.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_waits_for_a_writer_that_pauses_mid_stream() {
+        let marker = "hcom-shell-env-pause-test";
+        let cmd = format!(
+            "printf %s \"${MARKER_VAR}\"; env -0; sleep 1; printf %s \"${MARKER_VAR}-end\""
+        );
+
+        let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+    }
+
+    /// A background job from an rc file that inherited stdout keeps the pipe
+    /// open after the shell exits. The complete output is returned after the
+    /// grace instead of waiting for that job, the job is left alone, and the
+    /// drain thread is gone when the resolver returns.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_returns_after_exit_when_a_background_job_keeps_stdout_open() {
+        let marker = "hcom-shell-env-background-test";
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("job-done");
+        let cmd = format!(
+            "(sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\"; exit 0",
+            done = done.display()
+        );
+
+        let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+        assert!(
+            !done.exists(),
+            "the resolver returned only after the background job had finished"
+        );
+    }
+
+    /// Everything the drain queued while the parent was busy reaches the
+    /// consumer, in order and followed by EOF: a late consumer never sees a
+    /// prefix as the whole.
+    #[cfg(unix)]
+    #[test]
+    fn drain_hands_queued_output_and_eof_to_a_late_consumer() {
+        // 200 KiB fits the 1 MiB queue, so the producer finishes while the
+        // consumer sleeps.
+        let mut child = piped_child(&format!("{} printf %s \"$chunk\"; exit 0", doubling(17)));
+        let drain = Drain::start(child.stdout.take().unwrap(), MAX_SHELL_OUTPUT).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut total = 0usize;
+        let mut messages = Vec::new();
+        loop {
+            match drain.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Drained::Chunk(bytes) => {
+                    assert!(bytes.iter().all(|b| *b == b'x'));
+                    total += bytes.len();
+                }
+                Drained::Eof => {
+                    messages.push("eof");
+                    break;
+                }
+                Drained::OverCapacity => panic!("budget hit under the cap"),
+                Drained::Failed => panic!("read failed"),
+            }
+        }
+        assert_eq!(total, 1 << 17);
+        assert_eq!(messages, ["eof"]);
+        drain.finish();
+        let _ = child.wait();
+    }
+
+    /// The budget is enforced before a chunk is queued: with the consumer
+    /// asleep, a producer streaming 1 MiB against a 100 KiB budget ends with
+    /// OverCapacity and no more than the budget ever queued.
+    #[cfg(unix)]
+    #[test]
+    fn drain_stops_at_the_byte_budget_before_enqueueing() {
+        let mut child = piped_child(&format!("{} printf %s \"$chunk\"", doubling(20)));
+        let budget = 100 * 1024;
+        let drain = Drain::start(child.stdout.take().unwrap(), budget).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut total = 0usize;
+        let last = loop {
+            match drain.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Drained::Chunk(bytes) => total += bytes.len(),
+                other => break other,
+            }
+        };
+        assert!(matches!(last, Drained::OverCapacity));
+        assert!(
+            total <= budget,
+            "queued {total} bytes over a {budget} byte budget"
+        );
+        drain.finish();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// With a descendant holding stdout open there is no EOF; finish() still
+    /// ends the drain thread within its poll interval.
+    #[cfg(unix)]
+    #[test]
+    fn drain_thread_ends_when_told_while_a_descendant_holds_stdout() {
+        let mut child = piped_child("(sleep 3) & printf ready; exit 0");
+        let drain = Drain::start(child.stdout.take().unwrap(), MAX_SHELL_OUTPUT).unwrap();
+        let _ = child.wait();
+        match drain.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Drained::Chunk(bytes) => assert_eq!(bytes, b"ready"),
+            _ => panic!("expected the chunk before the pipe went quiet"),
+        }
+        assert!(
+            drain.rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "no EOF while the job holds the pipe"
+        );
+
+        let started = std::time::Instant::now();
+        drain.finish();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "finish waited for the descendant: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A poll error is not readiness: the drain reports failure at once instead
+    /// of entering a read that nothing could cancel while a descendant keeps the
+    /// pipe quiet and open.
+    #[cfg(unix)]
+    #[test]
+    fn drain_reports_a_poll_error_as_failure_instead_of_reading() {
+        fn poll_fails(_: &std::process::ChildStdout, _: &AtomicBool) -> Wait {
+            Wait::Failed
+        }
+        let mut child = piped_child("(sleep 3) & exit 0");
+        let drain =
+            Drain::start_with(child.stdout.take().unwrap(), MAX_SHELL_OUTPUT, poll_fails).unwrap();
+        let _ = child.wait();
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            drain.rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Drained::Failed
+        ));
+        drain.finish();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the reader was not joined promptly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A login shell's EXIT trap or logout text after the closing marker, with a
+    /// background job still holding stdout: no EOF ever comes, and the complete
+    /// frame must still be accepted promptly.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_accepts_a_complete_frame_followed_by_shell_noise() {
+        let marker = "hcom-shell-env-noise-test";
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("job-done");
+        let cmd = format!(
+            "trap 'printf tail' EXIT; (sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\"; exit 0",
+            done = done.display()
+        );
+
+        let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+        assert!(
+            output.stdout.ends_with(b"tail"),
+            "the trap's output was captured"
+        );
+        assert!(
+            !done.exists(),
+            "the resolver returned only after the background job had finished"
+        );
+    }
+
+    #[test]
+    fn output_is_complete_requires_the_close_after_a_nul() {
+        let marker = "hcom-shell-env-m";
+        let complete = format!("{marker}A=1\0{MARKER_VAR}={marker}\0{marker}-end");
+        assert!(output_is_complete(complete.as_bytes(), marker));
+        // Trailing shell noise after the close is a complete capture.
+        let noisy = format!("{complete}tail\nlogout");
+        assert!(output_is_complete(noisy.as_bytes(), marker));
+        // Cut inside the marker variable's value, or before the close.
+        let truncated = format!("{marker}A=1\0{MARKER_VAR}={marker}");
+        assert!(!output_is_complete(truncated.as_bytes(), marker));
+        let bare = format!("{marker}A=1\0{MARKER_VAR}={marker}\0{marker}");
+        assert!(!output_is_complete(bare.as_bytes(), marker));
+        assert!(!output_is_complete(marker.as_bytes(), marker));
+        assert!(!output_is_complete(b"", marker));
+    }
+
+    /// The marker is in the login shell's environment before its startup
+    /// files run, so a startup diagnostic can print it. A prefix carrying such
+    /// an echo, the opening and part of the body is not complete until the
+    /// distinct close arrives, and the parser then frames the body from the
+    /// command's own opening, so every entry is kept.
+    #[test]
+    fn frame_ignores_a_startup_echo_of_the_marker_and_waits_for_the_distinct_close() {
+        let marker = "hcom-shell-env-m";
+        let prefix = format!("{marker}\0{marker}A=1\0{MARKER_VAR}={marker}\0");
+        assert!(!output_is_complete(prefix.as_bytes(), marker));
+        let whole = format!("{prefix}B=2\0{marker}-end");
+        assert!(output_is_complete(whole.as_bytes(), marker));
+        let env = parse_shell_env_output(whole.as_bytes(), marker, MARKER_VAR).unwrap();
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("B").map(String::as_str), Some("2"));
+        assert!(!env.contains_key(MARKER_VAR));
+    }
+
+    /// The same shape through the resolver, with the close delivered late by a
+    /// job that holds stdout: the prefix must not be accepted at the exit
+    /// grace, and the entry written just before the close must be in the map.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_waits_for_the_distinct_close_after_a_startup_echo_of_the_marker() {
+        let marker = "hcom-shell-env-echo-test";
+        let cmd = format!(
+            "(sleep 1; printf 'SHELL_ENV_TEST_LATE=2\\0'; printf %s \"${MARKER_VAR}-end\") & \
+             printf '%s\\0' \"${MARKER_VAR}\"; printf %s \"${MARKER_VAR}\"; env -0; exit 0"
+        );
+
+        let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+        assert_eq!(
+            env.get("SHELL_ENV_TEST_LATE").map(String::as_str),
+            Some("2")
         );
     }
 

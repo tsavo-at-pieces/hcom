@@ -968,9 +968,20 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // --name disagrees with this shell's binding. Warn, don't refuse: --name is
-    // what the agent knows itself to be. With send --from, --name isn't the
-    // sender. (listen/events --from is a filter, so it still warns.)
+    // --name disagrees with this shell's binding. An outbound send is refused:
+    // the name can be the stale side (an older bootstrap kept by a compaction
+    // naming another live agent), and a message under it is sent as somebody
+    // else. With send --from, --name isn't the sender, so nothing is at stake.
+    if cmd == "send"
+        && !has_from_flag
+        && let Some(conflict) = ctx.identity_conflict.as_ref()
+    {
+        eprintln!("Error: {}", crate::cli_context::refusal(conflict));
+        return 1;
+    }
+    // Every other command warns: --name is what the agent knows itself to be,
+    // and a read or a filter under it harms nobody. (listen/events --from is a
+    // filter, so it still warns.)
     if let Some(ref warning) = ctx.identity_warning
         && !(cmd == "send" && has_from_flag)
     {

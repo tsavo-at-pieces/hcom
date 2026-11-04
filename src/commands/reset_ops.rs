@@ -292,6 +292,7 @@ mod tests {
             identity: None,
             go: true,
             identity_warning: None,
+            identity_conflict: None,
         };
         let reset_args = crate::commands::reset::ResetArgs { target: None };
         let exit_code = crate::commands::reset::cmd_reset(db, &reset_args, Some(&ctx));
@@ -434,6 +435,7 @@ mod tests {
             identity: None,
             go: true,
             identity_warning: None,
+            identity_conflict: None,
         };
         let reset_args = crate::commands::reset::ResetArgs { target: None };
         let exit_code = crate::commands::reset::cmd_reset(db, &reset_args, Some(&ctx));
@@ -499,6 +501,7 @@ mod tests {
             identity: None,
             go: true,
             identity_warning: None,
+            identity_conflict: None,
         };
         let reset_args = crate::commands::reset::ResetArgs { target: None };
         let exit_code = crate::commands::reset::cmd_reset(db, &reset_args, Some(&ctx));
