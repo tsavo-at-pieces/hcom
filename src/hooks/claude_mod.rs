@@ -1,6 +1,6 @@
 //! Native Claude wakes (default delivery). Classic hooks own the queue and acknowledgements.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -14,6 +14,8 @@ use crate::shared::time::now_epoch_f64;
 const WAIT: Duration = Duration::from_secs(10);
 // Allow the bounded wait, SQLite contention, and process startup to complete.
 const HEALTH_TIMEOUT: f64 = 40.0;
+// Match the mod's bounded BUSY retry window. Evidence expires if retries stop.
+const BUSY_WINDOW: f64 = 60.0;
 /// Time for Claude to start and load the mod before health is reported.
 pub const CONNECT_GRACE: Duration = Duration::from_secs(15);
 /// Launch env and `claude_delivery` config values; the launch freezes one.
@@ -81,6 +83,53 @@ fn state(db: &HcomDb, session: &str, process: &str) -> Result<Option<ModState>> 
         .transpose()
 }
 
+// SQLite cannot record health evidence while its writer is locked. This file
+// is diagnostic only: never let its I/O affect polling or delivery.
+fn busy_path(db_path: &Path, session: &str, process: &str) -> PathBuf {
+    let digest = runtime::content_digest(&[
+        ("db", db_path.as_os_str().as_encoded_bytes()),
+        ("session", session.as_bytes()),
+        ("process", process.as_bytes()),
+    ]);
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".tmp/claude-mod-busy")
+        .join(format!("{digest}.json"))
+}
+
+fn mark_busy(db_path: &Path, session: &str, process: &str) {
+    let path = busy_path(db_path, session, process);
+    if let Some(parent) = path.parent() {
+        let _ = crate::paths::ensure_private_directory(parent);
+    }
+    let _ = crate::paths::atomic_write_io(
+        &path,
+        &serde_json::json!({"kind": "busy", "at": now_epoch_f64()}).to_string(),
+    );
+}
+
+fn clear_busy(db_path: &Path, session: &str, process: &str) {
+    let _ = std::fs::remove_file(busy_path(db_path, session, process));
+}
+
+fn recently_busy(db_path: &Path, session: &str, process: &str, checked_at: f64) -> bool {
+    let read = || -> Option<bool> {
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(busy_path(db_path, session, process)).ok()?,
+        )
+        .ok()?;
+        let at = value.get("at")?.as_f64()?;
+        let age = now_epoch_f64() - at;
+        Some(
+            value.get("kind")?.as_str()? == "busy"
+                && at > checked_at
+                && (0.0..=BUSY_WINDOW).contains(&age),
+        )
+    };
+    read().unwrap_or(false)
+}
+
 fn log(event: &str, session: &str, process: &str, name: &str, detail: &str) {
     crate::log::log_with_fields(
         if event.contains("failed") || event.contains("unavailable") {
@@ -123,6 +172,21 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
         // A new session (/clear, /resume) has not finished its first wait yet.
         Some(s) if s.checked_at == 0.0 && s.started_at + HEALTH_TIMEOUT >= now_epoch_f64() => {
             ("", String::new())
+        }
+        _ if current
+            .as_ref()
+            .is_none_or(|s| s.checked_at + HEALTH_TIMEOUT < now_epoch_f64())
+            && recently_busy(
+                db.path(),
+                session,
+                process,
+                current.as_ref().map_or(0.0, |s| s.checked_at),
+            ) =>
+        {
+            (
+                "tui:mod-busy",
+                "Claude mod is retrying SQLite contention; messages remain queued".into(),
+            )
         }
         Some(s) if s.checked_at == 0.0 || s.checked_at + HEALTH_TIMEOUT < now_epoch_f64() => (
             "tui:mod-unavailable",
@@ -215,8 +279,42 @@ pub fn publish() -> Result<PathBuf> {
 }
 
 pub fn dispatch(args: &[String]) -> (i32, String) {
-    match poll(args) {
+    let result = poll(args);
+    // Outcome reports are not poll cycles, and must not clear BUSY evidence.
+    if !args.iter().any(|arg| arg == "--event")
+        && let Some(session) = args.windows(2).find(|pair| pair[0] == "--session-id")
+        && let Some(process) = HcomContext::from_os().process_id.as_deref()
+    {
+        let db_path = crate::paths::db_path();
+        if result.as_ref().is_err_and(is_busy) {
+            mark_busy(&db_path, &session[1], process);
+        } else {
+            clear_busy(&db_path, &session[1], process);
+        }
+    }
+    poll_result(result)
+}
+
+fn is_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    })
+}
+
+fn poll_result(result: Result<serde_json::Value>) -> (i32, String) {
+    match result {
         Ok(value) => (0, value.to_string()),
+        Err(error) if is_busy(&error) => {
+            crate::log::log_info("hooks", "claude.mod_poll_busy", &error.to_string());
+            (
+                75,
+                serde_json::json!({"busy": true, "error": error.to_string()}).to_string(),
+            )
+        }
         Err(error) => {
             crate::log::log_warn("hooks", "claude.mod_poll_failed", &error.to_string());
             (
@@ -248,6 +346,11 @@ fn poll(args: &[String]) -> Result<serde_json::Value> {
             .find(|pair| pair[0] == "--detail")
             .map(|pair| pair[1].as_str())
             .unwrap_or("");
+        let event = if event == "poll-failed" && args.iter().any(|arg| arg == "--busy") {
+            "poll-busy"
+        } else {
+            event
+        };
         record_report(&db, session, process, event, detail)?;
         if let Some(name) = validated_owner(&db, session, process)? {
             crate::notify::wake(&db, &name, &[crate::notify::WakeKind::Plugin]);
@@ -286,6 +389,9 @@ fn record_report(
     event: &str,
     detail: &str,
 ) -> Result<()> {
+    if event == "poll-busy" {
+        mark_busy(db.path(), session, process);
+    }
     db.with_write_scope(|| {
         let Some(mut current) = load(db, session, process)? else {
             log(&format!("claude.mod_{event}"), session, process, "", detail);
@@ -435,6 +541,193 @@ fn validated_owner(db: &HcomDb, session: &str, process: &str) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_contention_is_a_transient_poll_result() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("database is locked".into()),
+            ))
+            .context("poll write failed");
+            let (exit, output) = poll_result(Err(error));
+            assert_eq!(exit, 75);
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["busy"], true);
+        }
+        assert_eq!(poll_result(Err(anyhow::anyhow!("notify failed"))).0, 1);
+    }
+
+    #[test]
+    fn recent_busy_health_has_no_inject_hint_and_does_not_refresh_success() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        finish(&db, "session-1", "process-1", false).unwrap();
+        let mut current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        current.checked_at -= HEALTH_TIMEOUT + 1.0;
+        let checked_at = current.checked_at;
+        db.kv_set(
+            &key("session-1", "process-1"),
+            Some(&serde_json::to_string(&current).unwrap()),
+        )
+        .unwrap();
+        record_report(
+            &db,
+            "session-1",
+            "process-1",
+            "poll-busy",
+            "database is locked",
+        )
+        .unwrap();
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.status_context, "tui:mod-busy");
+        assert!(!row.status_detail.contains(INJECT_HINT));
+        assert_eq!(
+            state(&db, "session-1", "process-1")
+                .unwrap()
+                .unwrap()
+                .checked_at,
+            checked_at
+        );
+        assert_eq!(db.get_cursor("nova"), 0);
+    }
+
+    #[test]
+    fn a_short_busy_retry_does_not_flag_a_healthy_or_connecting_mod() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        load(&db, "session-1", "process-1").unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        report_health(&db, "process-1", "nova").unwrap();
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
+        finish(&db, "session-1", "process-1", false).unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        report_health(&db, "process-1", "nova").unwrap();
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
+    }
+
+    #[test]
+    fn busy_evidence_survives_a_locked_writer_but_expires_when_retries_stop() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        finish(&db, "session-1", "process-1", false).unwrap();
+        let mut current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        current.checked_at -= BUSY_WINDOW + 1.0;
+        db.kv_set(
+            &key("session-1", "process-1"),
+            Some(&serde_json::to_string(&current).unwrap()),
+        )
+        .unwrap();
+        let writer = HcomDb::open_raw(db.path()).unwrap();
+        writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        assert!(recently_busy(
+            db.path(),
+            "session-1",
+            "process-1",
+            current.checked_at
+        ));
+        assert!(!recently_busy(db.path(), "session-2", "process-1", 0.0));
+        assert!(!recently_busy(db.path(), "session-1", "process-2", 0.0));
+        assert!(!recently_busy(
+            &db.path().with_file_name("other.db"),
+            "session-1",
+            "process-1",
+            0.0
+        ));
+        writer.conn().execute_batch("ROLLBACK").unwrap();
+        report_health(&db, "process-1", "nova").unwrap();
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "tui:mod-busy"
+        );
+        std::fs::write(
+            busy_path(db.path(), "session-1", "process-1"),
+            serde_json::json!({"kind":"busy", "at": now_epoch_f64() - BUSY_WINDOW - 1.0})
+                .to_string(),
+        )
+        .unwrap();
+        report_health(&db, "process-1", "nova").unwrap();
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.status_context, "tui:mod-unavailable");
+        assert!(row.status_detail.contains(INJECT_HINT));
+        assert!(row.status_detail.contains("stopped polling"));
+    }
+
+    #[test]
+    fn real_errors_take_precedence_over_busy_and_a_healthy_cycle_clears_it() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        finish(&db, "session-1", "process-1", false).unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        record_report(
+            &db,
+            "session-1",
+            "process-1",
+            "poll-failed",
+            "notify bind failed",
+        )
+        .unwrap();
+        record_report(
+            &db,
+            "session-1",
+            "process-1",
+            "poll-busy",
+            "database is locked",
+        )
+        .unwrap();
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.status_context, "tui:mod-failed");
+        assert!(row.status_detail.contains("notify bind failed"));
+        assert!(row.status_detail.contains(INJECT_HINT));
+        finish(&db, "session-1", "process-1", false).unwrap();
+        report_health(&db, "process-1", "nova").unwrap();
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
+        clear_busy(db.path(), "session-1", "process-1");
+        assert!(!busy_path(db.path(), "session-1", "process-1").exists());
+    }
+
+    #[test]
+    fn invalid_or_unwritable_busy_markers_do_not_change_poll_health() {
+        let (dir, db) = database();
+        let path = busy_path(db.path(), "session-1", "process-1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "invalid JSON").unwrap();
+        assert!(!recently_busy(db.path(), "session-1", "process-1", 0.0));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        clear_busy(db.path(), "session-1", "process-1");
+        assert!(!recently_busy(db.path(), "session-1", "process-1", 0.0));
+        let blocked_db = dir.path().join("not-a-directory/hcom.db");
+        std::fs::write(blocked_db.parent().unwrap(), "file").unwrap();
+        mark_busy(&blocked_db, "session-1", "process-1");
+    }
 
     fn database() -> (tempfile::TempDir, HcomDb) {
         let dir = tempfile::tempdir().unwrap();
