@@ -207,7 +207,7 @@ Messages arrive automatically — end your turn to receive them."#;
 const DELIVERY_STDIO: &str = r#"## DELIVERY
 
 This session is controlled by a pipe client. Queued hcom messages arrive through
-native prompt, tool and Stop hooks during a turn. Messages that arrive while
+native hooks during a turn. Messages that arrive while
 the client is idle wait for its next turn; hcom does not start a new client turn.
 Complete the current task before returning control to the client."#;
 
@@ -614,7 +614,7 @@ fn render_bootstrap_with_exclusions(
     // anything else (plain `hcom start`) has to poll with `hcom listen`.
     if !excluded.contains("messages") {
         if hcom_ctx.is_launched
-            && tool == Tool::Claude
+            && matches!(tool, Tool::Claude | Tool::Codex)
             && hcom_ctx
                 .raw_env
                 .get("HCOM_STDIO_MODE")

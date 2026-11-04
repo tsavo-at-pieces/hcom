@@ -128,7 +128,9 @@ pub fn do_resume(
     flags: &GlobalFlags,
 ) -> Result<i32> {
     if extract_resume_flags(extra_args).1.stdio {
-        bail!("--stdio is a launch transport; use hcom claude --stdio -- -p --resume <session-id>");
+        bail!(
+            "--stdio is a launch transport; for Claude use hcom claude --stdio -- -p --resume <session-id>; for Codex use hcom codex --stdio -- app-server and resume the native thread through the pipe client"
+        );
     }
     let db = HcomDb::open()?;
     let name = crate::identity::resolve_display_name_or_stopped(&db, name)

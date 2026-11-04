@@ -159,7 +159,7 @@ pub struct LaunchParams {
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
     pub background: bool,
-    /// Single foreground Claude print process, retaining the caller's pipes.
+    /// Single foreground Claude print or Codex app-server process on caller pipes.
     pub stdio: bool,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
@@ -1757,15 +1757,17 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         if !cfg!(unix) {
             bail!("--stdio is currently supported on Unix only");
         }
-        if params.tool != "claude"
-            || !claude_print
+        let supported = (params.tool == "claude" && claude_print)
+            || (params.tool == "codex" && valid_codex_stdio_args(&params.args));
+        if !supported
+            || (params.tool == "codex" && params.initial_prompt.is_some())
             || params.count != 1
             || params.background
             || params.terminal.is_some()
             || params.run_here == Some(false)
         {
             bail!(
-                "--stdio requires one local claude -p/--print process without a terminal or background mode"
+                "--stdio requires one local claude -p/--print or codex app-server (stdio://) process without a terminal or background mode"
             );
         }
         params.run_here = Some(true);
@@ -2197,7 +2199,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         })() {
             if params.stdio {
                 cleanup_instance(db, &instance_name, &process_id);
-                return Err(e.context("Cannot register Claude stdio launch"));
+                return Err(e.context("Cannot register stdio launch"));
             }
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             continue;
@@ -2205,6 +2207,28 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         // Dispatch to tool-specific launcher
         if params.stdio {
+            if normalized.tool() == Tool::Codex {
+                // The app-server's thread ID is not known until SessionStart.
+                // Let that hook announce the canonical identity (also on resume)
+                // instead of putting a fresh placeholder name into every turn.
+                if let Some(ref prompt) = params.system_prompt {
+                    params.args.splice(
+                        0..0,
+                        [
+                            "-c".into(),
+                            format!(
+                                "developer_instructions={}",
+                                toml::Value::String(prompt.clone())
+                            ),
+                        ],
+                    );
+                }
+                params.args = codex_preprocessing::preprocess_codex_args(
+                    &params.args,
+                    "",
+                    codex_home.as_ref().map(|(path, _)| path.as_path()),
+                );
+            }
             instances::update_instance_position(
                 db,
                 &instance_name,
@@ -2538,19 +2562,17 @@ fn launch_stdio(
         tag,
     } = identity;
     let working_dir = params.cwd.as_deref().unwrap_or(".");
-    // Run the executable the install gate validated (PATH, then the per-user
-    // install directories), as the runner scripts do: resolving the bare name
-    // through the child's PATH alone misses a fallback-only install that
-    // `hcom claude -p` launches. The candidate is made absolute against this
-    // process's directory first: the child changes to `working_dir` before
-    // exec, where a relative PATH entry would name another file or none.
-    let program = find_tool_path("claude")
+    let tool = params.tool.as_str();
+    // Resolve either supported tool using the install gate's lookup, including
+    // fallback install directories. Make relative PATH entries absolute before
+    // the child changes to working_dir, where they could name another file.
+    let program = find_tool_path(tool)
         .map(|found| {
             std::path::absolute(&found)
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or(found)
         })
-        .unwrap_or_else(|| "claude".to_string());
+        .unwrap_or_else(|| tool.to_string());
     let mut command = std::process::Command::new(&program);
     command
         .args(&params.args)
@@ -2564,6 +2586,14 @@ fn launch_stdio(
     let mut child_pid = 0;
     let exit_code = crate::sys::process::run_stdio_child(&mut command, |pid| {
         child_pid = pid;
+        db.store_launch_context(
+            instance_name,
+            &json!({
+                "process_id": process_id, "terminal_preset": "stdio",
+                "terminal_preset_effective": "stdio",
+            })
+            .to_string(),
+        )?;
         let identity = crate::db::observe_pid_identity(pid)?;
         db.update_instance_pid_with_identity_and_fields(
             instance_name,
@@ -2574,11 +2604,11 @@ fn launch_stdio(
         crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
             process_id,
             terminal_preset: "stdio",
-            tag: params.tag.as_deref().unwrap_or(""),
+            tag,
             ..crate::pidtrack::PidRecord::new(
                 &paths::hcom_dir(),
                 pid,
-                "claude",
+                tool,
                 instance_name,
                 working_dir,
             )
@@ -2591,15 +2621,19 @@ fn launch_stdio(
             launcher_name,
             &json!({
                 "action": "batch_launched", "by": launcher_name, "batch_id": batch_id,
-                "tool": "claude", "count_requested": 1, "launched": 1, "failed": 0,
+                "tool": tool, "count_requested": 1, "launched": 1, "failed": 0,
                 "background": false, "stdio": true, "tag": tag, "instances": [instance_name],
             }),
         )?;
         Ok(())
     })?;
-    if !crate::hooks::common::launch_reached_ready(db, instance_name, batch_id) {
+    let bound_name = db
+        .get_process_binding(process_id)?
+        .unwrap_or_else(|| instance_name.to_string());
+    if !crate::hooks::common::launch_reached_ready(db, &bound_name, batch_id) {
+        let display_tool = if tool == "claude" { "Claude" } else { tool };
         let _ = db.emit_launch_failed_event_as(
-            instance_name,
+            &bound_name,
             crate::db::LaunchAttribution {
                 launcher: launcher_name,
                 batch_id,
@@ -2607,18 +2641,25 @@ fn launch_stdio(
             crate::shared::ST_INACTIVE,
             "launch_failed",
             "exited_before_ready",
-            &format!("Claude stdio exited with status {exit_code} before SessionStart"),
+            &format!("{display_tool} stdio exited with status {exit_code} before SessionStart"),
         );
     }
     // SessionEnd normally stops the row. EOF, cancellation, startup failure or
     // a native crash may omit it. Only clean up the row still owning this child.
     if let Err(error) = db.with_write_scope(|| {
-        if db.get_process_binding(process_id)?.as_deref() == Some(instance_name)
-            && db
-                .get_instance_full(instance_name)?
-                .is_some_and(|row| row.created_at == created_at)
+        if let Some(current_name) = db.get_process_binding(process_id)?
+            && let Some(row) = db.get_instance_full(&current_name)?
+            && (current_name != instance_name || row.created_at == created_at)
+            && row
+                .launch_context
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .is_some_and(|ctx| ctx["process_id"].as_str() == Some(process_id))
         {
-            crate::hooks::common::finalize_session(db, instance_name, &exit_code.to_string(), None);
+            // SessionStart may replace a launch placeholder with the prior
+            // session's canonical name. The launch token follows that binding;
+            // a newer launch taking the same name has a different token.
+            crate::hooks::common::finalize_session(db, &current_name, &exit_code.to_string(), None);
         }
         Ok(())
     }) {
@@ -2627,15 +2668,76 @@ fn launch_stdio(
     crate::pidtrack::remove_pid(&paths::hcom_dir(), child_pid);
     Ok(LaunchResult {
         exit_code: Some(exit_code),
-        tool: "claude".into(),
+        tool: tool.into(),
         batch_id: batch_id.into(),
         launched: 1,
         failed: 0,
         background: false,
         log_files: vec![],
         errors: vec![],
-        handles: vec![json!({"tool": "claude", "instance_name": instance_name, "pid": child_pid})],
+        handles: vec![json!({"tool": tool, "instance_name": bound_name, "pid": child_pid})],
     })
+}
+
+/// Accept only the long-running app-server pipe command. In particular, do not
+/// mistake a config value or a schema-generation subcommand for app-server.
+fn valid_codex_stdio_args(args: &[String]) -> bool {
+    const APP_SERVER_VALUE_FLAGS: &[&str] = &[
+        "--startup-client-info",
+        "--cloud-skills-snapshot",
+        "--code-mode-host",
+        "--ws-auth",
+        "--ws-token-file",
+        "--ws-token-sha256",
+        "--ws-shared-secret-file",
+        "--ws-issuer",
+        "--ws-audience",
+        "--ws-max-clock-skew-seconds",
+    ];
+    let mut app_server = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "-c" | "--config" | "--enable" | "--disable" => {
+                i += 1;
+                if args.get(i).is_none_or(|value| value.is_empty()) {
+                    return false;
+                }
+            }
+            "--dangerously-bypass-hook-trust" => {}
+            "app-server" if !app_server => app_server = true,
+            "--listen" if app_server => {
+                i += 1;
+                if args.get(i).map(String::as_str) != Some("stdio://") {
+                    return false;
+                }
+            }
+            "--listen=stdio://"
+            | "--stdio"
+            | "--strict-config"
+            | "--startup-sign-out"
+            | "--analytics-default-enabled"
+                if app_server => {}
+            _ if app_server && APP_SERVER_VALUE_FLAGS.contains(&arg) => {
+                i += 1;
+                if args.get(i).is_none_or(|value| value.is_empty()) {
+                    return false;
+                }
+            }
+            _ if app_server
+                && arg.split_once('=').is_some_and(|(flag, value)| {
+                    APP_SERVER_VALUE_FLAGS.contains(&flag) && !value.is_empty()
+                }) => {}
+            _ if arg.starts_with("--config=")
+                || arg.starts_with("--enable=")
+                || arg.starts_with("--disable=")
+                || (arg.starts_with("-c") && !arg.starts_with("--") && arg.len() > 2) => {}
+            _ => return false,
+        }
+        i += 1;
+    }
+    app_server
 }
 
 /// Validate tool args (pure parsing, no mutation).
@@ -2695,6 +2797,87 @@ mod tests {
                 .filter(|key| key.starts_with("CARGO_")),
         );
         EnvVarGuard::remove(keys)
+    }
+
+    #[test]
+    fn test_codex_stdio_accepts_native_server_options() {
+        for (flag, value) in [
+            ("--startup-client-info", r#"{"name":"paradev"}"#),
+            ("--cloud-skills-snapshot", "/tmp/cloud skills.json"),
+            ("--code-mode-host", "http://localhost:9876"),
+            ("--ws-auth", "capability-token"),
+            ("--ws-token-file", "/tmp/token"),
+            ("--ws-token-sha256", "deadbeef"),
+            ("--ws-shared-secret-file", "/tmp/secret"),
+            ("--ws-issuer", "issuer"),
+            ("--ws-audience", "audience"),
+            ("--ws-max-clock-skew-seconds", "30"),
+        ] {
+            for args in [
+                vec!["app-server".to_owned(), flag.to_owned(), value.to_owned()],
+                vec!["app-server".to_owned(), format!("{flag}={value}")],
+            ] {
+                assert!(valid_codex_stdio_args(&args), "{args:?}");
+            }
+            // These flags belong to app-server, not the top-level parser.
+            assert!(!valid_codex_stdio_args(&[
+                flag.to_owned(),
+                value.to_owned(),
+                "app-server".to_owned(),
+            ]));
+            assert!(!valid_codex_stdio_args(&[
+                "app-server".to_owned(),
+                flag.to_owned()
+            ]));
+            assert!(!valid_codex_stdio_args(&[
+                "app-server".to_owned(),
+                format!("{flag}=")
+            ]));
+        }
+        for flag in [
+            "--strict-config",
+            "--stdio",
+            "--startup-sign-out",
+            "--analytics-default-enabled",
+        ] {
+            assert!(
+                valid_codex_stdio_args(&["app-server".to_owned(), flag.to_owned()]),
+                "{flag}"
+            );
+            assert!(!valid_codex_stdio_args(&[
+                flag.to_owned(),
+                "app-server".to_owned()
+            ]));
+        }
+    }
+
+    #[test]
+    fn test_codex_stdio_rejects_one_shot_helpers_and_unknown_options() {
+        for tail in [
+            vec!["--print-startup-config"],
+            vec!["--print-startup-config=false"],
+            vec!["--unknown-option", "value"],
+            vec!["--unknown-option=value"],
+            vec!["generate-ts"],
+            vec!["generate-json-schema"],
+            vec!["help"],
+            vec!["daemon"],
+            vec!["proxy"],
+            vec!["--cloud-skills-snapshot", "/tmp/skills.json", "generate-ts"],
+            vec!["--code-mode-host=/tmp/host", "generate-json-schema"],
+            vec![
+                "--cloud-skills-snapshot",
+                "/tmp/skills.json",
+                "--listen",
+                "ws://127.0.0.1:9000",
+            ],
+        ] {
+            let args = std::iter::once("app-server")
+                .chain(tail)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(!valid_codex_stdio_args(&args), "{args:?}");
+        }
     }
 
     #[test]

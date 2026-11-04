@@ -2,18 +2,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::process::Stdio;
 #[cfg(not(test))]
 use std::sync::OnceLock;
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::sync::mpsc;
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::sync::{Arc, Mutex};
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
@@ -192,7 +192,14 @@ fn merged_per_run_hooks(ctx: &LaunchCtx) -> AnyResult<(Vec<String>, toml::Value)
         }
         i += consumed;
     }
-    let expected = build_expected_hook_json();
+    let expected = if ctx.var("HCOM_STDIO_MODE") == Some("1") {
+        // A pipe launch may outlive a PATH or symlink update. Its hooks must
+        // continue running the image that owns this native process.
+        let executable = crate::runtime_env::pinned_hook_executable()?;
+        build_expected_hook_json_for(Some(&executable))
+    } else {
+        build_expected_hook_json()
+    };
     let table = hooks
         .as_table_mut()
         .context("Codex -c hooks must be a TOML table")?;
@@ -239,6 +246,18 @@ fn json_to_toml_literal(value: &Value) -> String {
 
 fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
     let (mut args, mut hooks) = merged_per_run_hooks(ctx)?;
+    // merged_per_run_hooks appends our own group last for each event. Match
+    // those exact commands, including a stdio launch's canonical image path,
+    // rather than recomputing a bare PATH-based invocation during preflight.
+    let expected: HashSet<String> = CODEX_HOOK_COMMANDS
+        .iter()
+        .map(|(event, _, _)| {
+            hooks[*event].as_array().unwrap().last().unwrap()["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
     // Codex merges hooks.state per key across the user and session-flag layers
     // (codex-rs/hooks/src/config_rules.rs), so only hcom's entries and the
     // caller's own -c state belong here. Copying config.toml's state would pin
@@ -278,10 +297,6 @@ fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
             fetch_codex_hook_list_with_overrides(&ctx.cwd, &per_run_home(ctx), &preflight)
                 .map_err(anyhow::Error::msg)
                 .context("Codex hooks/list preflight failed")?;
-        let expected: HashSet<String> = CODEX_HOOK_COMMANDS
-            .iter()
-            .map(|(_, suffix, _)| build_codex_hook_command(suffix))
-            .collect();
         let owned: Vec<CodexHookTrustEntry> = entries
             .into_iter()
             .filter(|entry| {
@@ -593,9 +608,14 @@ const HCOM_TOOL_NAMES: &[&str] = &[
     "agy",
 ];
 const HCOM_HOOK_TRUST_METADATA_FILE: &str = "hcom-hook-trust.toml";
-#[cfg(not(test))]
+// The first response includes wrapper startup: native image validation,
+// routed runtime preparation and ownership registration can precede spawn.
+// Keep that bounded separately from a query on an initialized app-server.
+#[cfg(any(not(test), unix))]
+const CODEX_APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(any(not(test), unix))]
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 const CODEX_APP_SERVER_STDERR_LIMIT: usize = 8192;
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
 
@@ -851,7 +871,33 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::relay::worker::try_spawn_worker();
     common::notify_hook_instance_with_db(db, &instance_name);
 
-    // Bootstrap is injected at launch time via developer_instructions flag.
+    if ctx
+        .raw_env
+        .get("HCOM_STDIO_MODE")
+        .is_some_and(|mode| mode == "1")
+    {
+        // There is no PTY delivery loop to announce readiness in this mode.
+        if let Some(batch_id) = ctx.launch_batch_id.as_deref()
+            && !common::launch_reached_ready(db, &instance_name, batch_id)
+            && let Err(error) = db.emit_ready_event(&instance_name, ST_LISTENING, "start")
+        {
+            log::log_warn("hooks", "codex.stdio_ready_event_fail", &error.to_string());
+        }
+        // A pipe client chooses its thread only after the app-server starts.
+        // Announce after binding so thread/resume uses its canonical hcom name,
+        // not the fresh launch placeholder. Internal threads returned above.
+        return HookResult::Allow {
+            additional_context: Some(crate::bootstrap::get_bootstrap(
+                db,
+                ctx,
+                &instance_name,
+                "codex",
+            )),
+            system_message: None,
+            delivery_ack: None,
+        };
+    }
+    // Interactive bootstrap is injected at launch via developer_instructions.
     hook_noop()
 }
 
@@ -869,6 +915,15 @@ fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload
 
     if prompt.trim() != HCOM_TRIGGER {
         set_prompt_active(db, &instance.name);
+        // Pipe clients have no PTY wakeup loop. Deliver at the next ordinary
+        // turn even when the model never calls a tool during that turn.
+        if ctx
+            .raw_env
+            .get("HCOM_STDIO_MODE")
+            .is_some_and(|mode| mode == "1")
+        {
+            return prepare_codex_delivery(db, &instance.name).unwrap_or_else(hook_noop);
+        }
         return hook_noop();
     }
 
@@ -1191,6 +1246,10 @@ fn build_codex_hook_command(command: &str) -> String {
 }
 
 fn build_expected_hook_json() -> Value {
+    build_expected_hook_json_for(None)
+}
+
+fn build_expected_hook_json_for(executable: Option<&str>) -> Value {
     let mut hooks = serde_json::Map::new();
     for (event, command, matcher) in CODEX_HOOK_COMMANDS {
         let mut group = serde_json::Map::new();
@@ -1201,7 +1260,10 @@ fn build_expected_hook_json() -> Value {
             "hooks".into(),
             Value::Array(vec![serde_json::json!({
                 "type": "command",
-                "command": build_codex_hook_command(command),
+                "command": executable.map_or_else(
+                    || build_codex_hook_command(command),
+                    |path| format!("{} {command}", crate::tools::args_common::shell_quote(path)),
+                ),
             })]),
         );
         hooks.insert(
@@ -1379,7 +1441,7 @@ fn fetch_codex_hook_list_with_overrides(
 
     #[cfg(not(test))]
     {
-        let mut child = codex_app_server_command()
+        let child = codex_app_server_command()
             .args(overrides)
             .args(["app-server", "--listen", "stdio://"])
             .env("CODEX_HOME", codex_home)
@@ -1389,67 +1451,102 @@ fn fetch_codex_hook_list_with_overrides(
             .spawn()
             .map_err(|e| format!("failed to start codex app-server: {e}"))?;
 
-        let stderr_buf = child
-            .stderr
-            .take()
-            .map(spawn_bounded_stderr_reader)
-            .unwrap_or_else(|| Arc::new(Mutex::new(String::new())));
+        read_codex_hook_list_from_child(child, cwd)
+    }
+}
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "failed to capture codex app-server stdout".to_string())?;
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = tx.send(line);
-            }
-        });
+#[cfg(any(not(test), unix))]
+struct CodexHookInspectionChild(std::process::Child);
 
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "failed to capture codex app-server stdin".to_string())?;
-        let initialize = serde_json::json!({
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "clientInfo": {
-                    "name": "hcom",
-                    "title": "hcom",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": { "experimentalApi": true }
-            }
-        });
-        writeln!(stdin, "{initialize}").map_err(|e| e.to_string())?;
-        read_jsonrpc_response(&rx, 1).map_err(|e| with_app_server_stderr(e, &stderr_buf))?;
-
-        writeln!(
-            stdin,
-            "{}",
-            serde_json::json!({"method":"initialized","params":{}})
-        )
-        .map_err(|e| e.to_string())?;
-        let request = serde_json::json!({
-            "method": "hooks/list",
-            "id": 2,
-            "params": { "cwds": [cwd] }
-        });
-        writeln!(stdin, "{request}").map_err(|e| e.to_string())?;
-        stdin.flush().map_err(|e| e.to_string())?;
-
-        let response =
-            read_jsonrpc_response(&rx, 2).map_err(|e| with_app_server_stderr(e, &stderr_buf));
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
-        parse_codex_hook_list_entries(&response?)
+#[cfg(any(not(test), unix))]
+impl Drop for CodexHookInspectionChild {
+    fn drop(&mut self) {
+        // std::process::Child does not reap on drop. In particular, an
+        // initialize error returns before the hooks/list cleanup path.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
 #[cfg(not(test))]
+fn read_codex_hook_list_from_child(
+    child: std::process::Child,
+    cwd: &Path,
+) -> Result<Vec<CodexHookListEntry>, String> {
+    read_codex_hook_list_with_response_reader(child, cwd, read_jsonrpc_response)
+}
+
+// Keep the phase-specific deadline selection in the real exchange, while
+// allowing tests to observe it without waiting for a production timeout.
+#[cfg(any(not(test), unix))]
+fn read_codex_hook_list_with_response_reader(
+    child: std::process::Child,
+    cwd: &Path,
+    mut read_response: impl FnMut(&mpsc::Receiver<String>, i64, Duration) -> Result<Value, String>,
+) -> Result<Vec<CodexHookListEntry>, String> {
+    let mut child = CodexHookInspectionChild(child);
+    let stderr_buf = child
+        .0
+        .stderr
+        .take()
+        .map(spawn_bounded_stderr_reader)
+        .unwrap_or_else(|| Arc::new(Mutex::new(String::new())));
+
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture codex app-server stdout".to_string())?;
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    let mut stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to capture codex app-server stdin".to_string())?;
+    let initialize = serde_json::json!({
+        "method": "initialize",
+        "id": 1,
+        "params": {
+            "clientInfo": {
+                "name": "hcom",
+                "title": "hcom",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": { "experimentalApi": true }
+        }
+    });
+    writeln!(stdin, "{initialize}").map_err(|e| e.to_string())?;
+    read_response(&rx, 1, CODEX_APP_SERVER_STARTUP_TIMEOUT)
+        .map_err(|e| with_app_server_stderr(e, &stderr_buf))?;
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"method":"initialized","params":{}})
+    )
+    .map_err(|e| e.to_string())?;
+    let request = serde_json::json!({
+        "method": "hooks/list",
+        "id": 2,
+        "params": { "cwds": [cwd] }
+    });
+    writeln!(stdin, "{request}").map_err(|e| e.to_string())?;
+    stdin.flush().map_err(|e| e.to_string())?;
+
+    let response = read_response(&rx, 2, CODEX_APP_SERVER_TIMEOUT)
+        .map_err(|e| with_app_server_stderr(e, &stderr_buf));
+    drop(stdin);
+    parse_codex_hook_list_entries(&response?)
+}
+
+#[cfg(any(not(test), unix))]
 fn spawn_bounded_stderr_reader<R>(mut stderr: R) -> Arc<Mutex<String>>
 where
     R: Read + Send + 'static,
@@ -1484,7 +1581,7 @@ where
     buf
 }
 
-#[cfg(not(test))]
+#[cfg(any(not(test), unix))]
 fn with_app_server_stderr(mut error: String, stderr_buf: &Arc<Mutex<String>>) -> String {
     let stderr = stderr_buf
         .lock()
@@ -1498,9 +1595,13 @@ fn with_app_server_stderr(mut error: String, stderr_buf: &Arc<Mutex<String>>) ->
     error
 }
 
-#[cfg(not(test))]
-fn read_jsonrpc_response(rx: &mpsc::Receiver<String>, id: i64) -> Result<Value, String> {
-    let deadline = std::time::Instant::now() + CODEX_APP_SERVER_TIMEOUT;
+#[cfg(any(not(test), unix))]
+fn read_jsonrpc_response(
+    rx: &mpsc::Receiver<String>,
+    id: i64,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -1654,6 +1755,99 @@ mod tests {
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
     use std::collections::HashMap;
+
+    #[cfg(unix)]
+    fn run_hook_inspection_fixture(
+        script: &str,
+    ) -> (Result<Vec<CodexHookListEntry>, String>, bool) {
+        run_hook_inspection_fixture_with_response_reader(script, read_jsonrpc_response)
+    }
+
+    #[cfg(unix)]
+    fn run_hook_inspection_fixture_with_response_reader(
+        script: &str,
+        read_response: impl FnMut(&mpsc::Receiver<String>, i64, Duration) -> Result<Value, String>,
+    ) -> (Result<Vec<CodexHookListEntry>, String>, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .env_clear()
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let result = read_codex_hook_list_with_response_reader(child, dir.path(), read_response);
+        // waitpid must report no remaining child: this distinguishes reaping
+        // from merely signalling a process and leaving a zombie behind.
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        let reaped =
+            waited == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        if waited == 0 {
+            // A failing regression must not leave its disposable process alive.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+        (result, reaped)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_reaps_child_on_initialize_error() {
+        let (result, reaped) = run_hook_inspection_fixture(
+            r#"read -r request; printf '%s\n' '{"id":1,"error":{"code":-32603,"message":"fixture initialization failure"}}'; exec /bin/sleep 30"#,
+        );
+        assert!(result.unwrap_err().contains("returned error for id 1"));
+        assert!(
+            reaped,
+            "initialize failure left the inspection child unreaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_reaps_child_on_initialize_disconnect() {
+        let (result, reaped) = run_hook_inspection_fixture("exec 1>&-; exec /bin/sleep 30");
+        assert!(result.unwrap_err().contains("closed before response id 1"));
+        assert!(
+            reaped,
+            "initialize disconnect left the inspection child unreaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_reaps_child_after_hook_list() {
+        let (result, reaped) = run_hook_inspection_fixture(
+            r#"read -r request; printf '%s\n' '{"id":1,"result":{}}'; read -r notification; read -r request; printf '%s\n' '{"id":2,"result":{"data":[{"hooks":[]}]}}'; exec /bin/sleep 30"#,
+        );
+        assert_eq!(result.unwrap(), Vec::new());
+        assert!(reaped, "successful inspection left the child unreaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_inspection_uses_startup_budget_then_query_budget() {
+        let mut waits = Vec::new();
+        let (result, reaped) = run_hook_inspection_fixture_with_response_reader(
+            r#"read -r request; printf '%s\n' '{"id":1,"result":{}}'; read -r notification; read -r request; printf '%s\n' '{"id":2,"result":{"data":[{"hooks":[]}]}}'; exec /bin/sleep 30"#,
+            |rx, id, timeout| {
+                waits.push((id, timeout));
+                read_jsonrpc_response(rx, id, timeout)
+            },
+        );
+        assert_eq!(result.unwrap(), Vec::new());
+        assert!(reaped, "successful inspection left the child unreaped");
+        assert_eq!(
+            waits,
+            vec![(1, Duration::from_secs(60)), (2, Duration::from_secs(10))],
+            "initialize includes wrapper startup; hooks/list keeps the shorter query budget"
+        );
+    }
 
     fn per_run_ctx(args: &[&str], home: &Path) -> LaunchCtx {
         LaunchCtx {
@@ -1929,6 +2123,21 @@ mod tests {
     }
 
     #[test]
+    fn pinned_stdio_hook_image_is_one_shell_word() {
+        let path = "/a path/owner's hcom";
+        let hooks = build_expected_hook_json_for(Some(path));
+        for (event, command, _) in CODEX_HOOK_COMMANDS {
+            let rendered = hooks["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                crate::tools::args_common::shell_split(rendered, false).unwrap(),
+                [path, command],
+            );
+        }
+    }
+
+    #[test]
     fn hcom_command_match_requires_hcom_prefix() {
         assert!(is_hcom_codex_command("hcom codex-stop"));
         assert!(is_hcom_codex_command("/old/bin/hcom codex-stop"));
@@ -1977,6 +2186,130 @@ mod tests {
         assert_eq!(row.session_id.as_deref(), Some("main-sid"), "{label}");
         assert_eq!(row.directory, "/work", "{label}");
         assert_eq!(db.get_session_binding("mem-sid").unwrap(), None, "{label}");
+    }
+
+    fn queue_prompt_message(db: &HcomDb) {
+        db.log_event(
+            "message",
+            "pezu",
+            &serde_json::json!({
+                "from": "pezu", "text": "queued before a tool-less turn", "scope": "broadcast",
+            }),
+        )
+        .unwrap();
+    }
+
+    fn ordinary_prompt() -> HookPayload {
+        HookPayload::from_codex_native(
+            "UserPromptSubmit",
+            serde_json::json!({
+                "session_id": "main-sid", "transcript_path": "/rollout-main.jsonl",
+                "cwd": "/work", "prompt": "Reply without calling a tool",
+            }),
+        )
+    }
+
+    #[test]
+    fn stdio_prompt_delivers_pending_messages_without_a_tool_call() {
+        let (_dir, db, mut ctx) = db_with_listening_codex();
+        ctx.raw_env.insert("HCOM_STDIO_MODE".into(), "1".into());
+        queue_prompt_message(&db);
+        let HookResult::Allow {
+            additional_context,
+            system_message,
+            delivery_ack,
+        } = handle_userpromptsubmit(&db, &ctx, &ordinary_prompt())
+        else {
+            panic!("prompt refused")
+        };
+        assert!(
+            additional_context
+                .as_deref()
+                .unwrap()
+                .contains("queued before a tool-less turn")
+        );
+        assert_eq!(additional_context, system_message);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "prompt");
+        assert_eq!(
+            row.last_event_id, 0,
+            "delivery must wait for successful output"
+        );
+        common::commit_delivery_ack(&db, &delivery_ack.unwrap());
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &ordinary_prompt())
+        else {
+            panic!("prompt refused")
+        };
+        assert!(
+            additional_context.is_none(),
+            "already delivered message repeated"
+        );
+        assert!(delivery_ack.is_none());
+    }
+
+    #[test]
+    fn stdio_prompt_change_preserves_interactive_trigger_delivery() {
+        let (_dir, db, ctx) = db_with_listening_codex();
+        queue_prompt_message(&db);
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &ordinary_prompt())
+        else {
+            panic!("prompt refused")
+        };
+        assert!(additional_context.is_none());
+        assert!(delivery_ack.is_none());
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().last_event_id,
+            0
+        );
+        let mut trigger = ordinary_prompt();
+        trigger.raw["prompt"] = serde_json::json!(HCOM_TRIGGER);
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &trigger)
+        else {
+            panic!("trigger refused")
+        };
+        assert!(
+            additional_context
+                .unwrap()
+                .contains("queued before a tool-less turn")
+        );
+        assert!(delivery_ack.is_some());
+    }
+
+    #[test]
+    fn stdio_prompt_from_internal_thread_does_not_consume_main_messages() {
+        let (_dir, db, mut ctx) = db_with_listening_codex();
+        ctx.raw_env.insert("HCOM_STDIO_MODE".into(), "1".into());
+        queue_prompt_message(&db);
+        let mut prompt = ordinary_prompt();
+        prompt.raw["agent_id"] = serde_json::json!("internal-agent");
+        let HookResult::Allow {
+            additional_context,
+            delivery_ack,
+            ..
+        } = handle_userpromptsubmit(&db, &ctx, &prompt)
+        else {
+            panic!("prompt refused")
+        };
+        assert!(additional_context.is_none());
+        assert!(delivery_ack.is_none());
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().last_event_id,
+            0
+        );
+        assert_main_thread_untouched(&db, "stdio internal prompt");
     }
 
     #[test]

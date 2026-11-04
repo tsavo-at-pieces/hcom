@@ -1032,6 +1032,12 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
             "--stdio", "Keep -p on caller's pipes (Unix, one process)"
         ));
     }
+    if spec.tool == crate::tool::Tool::Codex {
+        lines.push(format!(
+            "    {:<29}{}",
+            "--stdio", "Keep app-server on caller's pipes (Unix, one process)"
+        ));
+    }
 
     // Environment
     lines.push(String::new());
