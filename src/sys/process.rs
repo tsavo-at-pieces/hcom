@@ -14,11 +14,11 @@ use std::process::Command;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub trait StdoutTap: Send + Sync {
     /// A complete line without its `\n`. The child wrote all of it after
-    /// `emitted_after`: the spawn, or the start of a read that found its
-    /// stdout pipe empty as [`Self::emptied`] says, so that a child writing
-    /// whatever it has as soon as the pipe has room had nothing waiting
-    /// then. `read_at` is when the copy began the read that took the line's
-    /// first byte.
+    /// `emitted_after`: the spawn, or the start of a read that showed a
+    /// child writing whatever it has as soon as the pipe has room to have
+    /// had nothing waiting, in a way [`Self::emptied`] describes, though
+    /// that read may have ended inside a line. `read_at` is when the copy
+    /// began the read that took the line's first byte.
     fn observe(
         &self,
         line: &[u8],
