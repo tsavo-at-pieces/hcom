@@ -2631,6 +2631,7 @@ fn launch_stdio(
         .get_process_binding(process_id)?
         .unwrap_or_else(|| instance_name.to_string());
     if !crate::hooks::common::launch_reached_ready(db, &bound_name, batch_id) {
+        let display_tool = if tool == "claude" { "Claude" } else { tool };
         let _ = db.emit_launch_failed_event_as(
             &bound_name,
             crate::db::LaunchAttribution {
@@ -2640,7 +2641,7 @@ fn launch_stdio(
             crate::shared::ST_INACTIVE,
             "launch_failed",
             "exited_before_ready",
-            &format!("{tool} stdio exited with status {exit_code} before SessionStart"),
+            &format!("{display_tool} stdio exited with status {exit_code} before SessionStart"),
         );
     }
     // SessionEnd normally stops the row. EOF, cancellation, startup failure or

@@ -195,9 +195,8 @@ fn merged_per_run_hooks(ctx: &LaunchCtx) -> AnyResult<(Vec<String>, toml::Value)
     let expected = if ctx.var("HCOM_STDIO_MODE") == Some("1") {
         // A pipe launch may outlive a PATH or symlink update. Its hooks must
         // continue running the image that owns this native process.
-        let executable = std::fs::canonicalize(std::env::current_exe()?)?;
-        let executable = crate::shared::platform::child_process_path(&executable);
-        build_expected_hook_json_for(Some(&executable.to_string_lossy()))
+        let executable = crate::runtime_env::pinned_hook_executable()?;
+        build_expected_hook_json_for(Some(&executable))
     } else {
         build_expected_hook_json()
     };
