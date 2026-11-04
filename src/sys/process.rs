@@ -8,6 +8,9 @@ use std::process::Command;
 /// Observes a pipe client's stdout while [`run_stdio_child`] copies it. The
 /// tap is shown each complete line only after hcom's stdout took it, and can
 /// change neither the bytes nor when they are written.
+///
+/// Off Unix, `run_stdio_child` refuses to start, so nothing calls a tap there.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub trait StdoutTap: Send + Sync {
     /// A complete line without its `\n`. The child wrote all of it after
     /// `emitted_after`, a time at which its stdout pipe was seen empty. This
