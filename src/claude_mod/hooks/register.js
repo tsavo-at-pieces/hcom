@@ -9,6 +9,10 @@ let command;
 // timeout keeps counting while the process is suspended, so it aborts on wake.
 let failures = 0;
 const FAILURES_BEFORE_REPORT = 3;
+const BUSY_WINDOW_MS = 60000;
+let busySince;
+let busySession;
+let busyReported = false;
 // Ticks to skip after a failed poll, so a broken hcom is not respawned 4x/s.
 let backoff = 0;
 // process.run starts in the session's working directory by default. Claude
@@ -16,10 +20,11 @@ let backoff = 0;
 // fails with ENOENT until the command ends. hcom needs no particular directory.
 const CWD = '/';
 
-async function report($, session, event, detail) {
+async function report($, session, event, detail, busy = false) {
   try {
     const result = await $.process.run(
-      [...command, 'claude-mod-poll', '--session-id', session, '--event', event, '--detail', detail],
+      [...command, 'claude-mod-poll', '--session-id', session, '--event', event, '--detail', detail,
+        ...(busy ? ['--busy'] : [])],
       { cwd: CWD, timeoutMs: 10000 },
     );
     if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);
@@ -45,6 +50,27 @@ async function poll($) {
       [...command, 'claude-mod-poll', '--session-id', session, ...(submitting ? ['--observe'] : [])],
       { cwd: CWD, timeoutMs: 30000 },
     );
+    if (result.exitCode === 75) {
+      backoff = 20;
+      const now = await $.clock.now();
+      if (busySince === undefined || busySession !== session) {
+        busySince = now;
+        busySession = session;
+        busyReported = false;
+      }
+      if (now - busySince >= BUSY_WINDOW_MS) {
+        const detail = result.stderr || result.stdout || 'SQLite contention';
+        await report($, session, 'poll-failed', detail, true);
+        if (!busyReported) {
+          $.ui.log('hcom mod poll delayed by SQLite contention; messages remain queued: ' + detail);
+          busyReported = true;
+        }
+      }
+      return;
+    }
+    busySince = undefined;
+    busySession = undefined;
+    busyReported = false;
     if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || 'hcom poll failed');
     const state = JSON.parse(result.stdout);
     failures = 0;
@@ -76,6 +102,9 @@ async function poll($) {
       await report($, session, 'submission-failed', String(error));
     }
   } catch (error) {
+    busySince = undefined;
+    busySession = undefined;
+    busyReported = false;
     failures++;
     backoff = 20;
     // Record every failure past the threshold: hcom clears the error after one
@@ -100,6 +129,9 @@ export function register(on) {
   submittingSession = undefined;
   generation = 0;
   failures = 0;
+  busySince = undefined;
+  busySession = undefined;
+  busyReported = false;
   backoff = 0;
   on('session.start', async ($, e, next) => {
     if (!e.isInteractive || !await $.env.get('HCOM_PROCESS_ID') || await $.env.get('HCOM_PTY_MODE') !== '1'
