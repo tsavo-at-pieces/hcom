@@ -508,9 +508,14 @@ impl ScreenTracker {
     /// viewer, which is navigable but not an approval blocker.
     pub fn is_codex_approval_visible(&self) -> bool {
         let lines = self.get_screen_lines();
+        // Ultra uses » instead of ›. Both delimit the live composer, so
+        // quoted approval dialogs in earlier tool output stay out of the scan.
         let start = lines
             .iter()
-            .rposition(|line| line.trim_start().starts_with('›'))
+            .rposition(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with('›') || trimmed.starts_with('»')
+            })
             .unwrap_or(0);
         let visible = lines[start..].join("\n").to_lowercase();
 
@@ -1696,6 +1701,43 @@ mod tests {
     fn codex_detects_visible_approval_dialog() {
         let mut t = make_tracker(24, 80, "");
         t.process(b"Run command\r\nAllow command?\r\nPress enter to confirm or esc to cancel\r\n");
+        assert!(t.is_codex_approval_visible());
+    }
+
+    #[test]
+    fn codex_quoted_approval_above_the_latest_composer_is_not_approval() {
+        for composer in ["›", "»"] {
+            for history in ["", "› Check the other session\r\n"] {
+                let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
+                t.process(
+                    format!(
+                        "{history}Tool output: Do you want to proceed? ❯ 1. Yes\r\n\
+                         The other session is waiting; this session is done.\r\n\
+                         {composer} \x1b[2mAsk Codex to do anything\x1b[0m\r\n\
+                           ? for shortcuts\r\n"
+                    )
+                    .as_bytes(),
+                );
+                assert_eq!(t.get_codex_input_text().as_deref(), Some(""));
+                assert!(
+                    !t.is_codex_approval_visible(),
+                    "quoted history above {composer} must not block the current composer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_live_approval_after_an_ultra_history_prompt_is_still_approval() {
+        let mut t = make_tool_tracker(24, 100, crate::tool::Tool::Codex);
+        t.process(
+            "» Run the requested command\r\n\
+             Allow command?\r\n\
+             › 1. Yes, proceed (y)\r\n\
+               2. No (esc)\r\n\
+             Press enter to confirm or esc to cancel\r\n"
+                .as_bytes(),
+        );
         assert!(t.is_codex_approval_visible());
     }
 

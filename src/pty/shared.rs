@@ -2061,6 +2061,65 @@ No session found matching 'never-saved'"
     }
 
     #[test]
+    fn codex_quoted_approval_history_releases_delivery_at_the_ultra_composer() {
+        let patterns: Vec<String> = Tool::Codex
+            .ready_patterns()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let mut screen = ScreenTracker::new_with_instance(24, 100, &patterns, None);
+        let state = Arc::new(RwLock::new(ScreenState::default()));
+        let launch = Arc::new(AtomicBool::new(false));
+        let target = PtyTarget::Known(Tool::Codex);
+        let edges = std::cell::RefCell::new(Vec::new());
+        let publish = |a: bool| edges.borrow_mut().push(a);
+        let delivery = DeliveryState {
+            screen: Arc::clone(&state),
+            grok_acp: None,
+            launch_phase_active: Arc::clone(&launch),
+            inject_port: 0,
+            user_activity_cooldown_ms: 500,
+        };
+        let config = ToolConfig::codex();
+
+        screen
+            .process(b"\x1b[2J\x1b[HAllow command?\r\nPress enter to confirm or esc to cancel\r\n");
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        assert_eq!(
+            crate::delivery::evaluate_gate(&config, &delivery, true).reason,
+            "approval"
+        );
+
+        screen.process(
+            "\x1b[2J\x1b[H› Check the other session\r\n\
+             Tool output: Do you want to proceed? ❯ 1. Yes\r\n\
+             The other session needs approval; this session is done.\r\n\
+             » \x1b[2mAsk Codex to do anything\x1b[0m\r\n\
+               ? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        assert!(
+            state.read().unwrap().approval,
+            "a partial redraw still latches"
+        );
+        state.write().unwrap().approval_scrape_negative_since =
+            Some(Instant::now() - Duration::from_millis(APPROVAL_SCRAPE_CLEAR_MS));
+        update_delivery_state(&state, &screen, &target, &launch, &publish);
+        {
+            let mut s = state.write().unwrap();
+            s.last_user_input = Instant::now() - Duration::from_secs(30);
+        }
+        let gate = crate::delivery::evaluate_gate(&config, &delivery, true);
+        assert!(
+            gate.safe,
+            "delivery should resume, not block on {}",
+            gate.reason
+        );
+        assert_eq!(*edges.borrow(), vec![true, false]);
+    }
+
+    #[test]
     fn codex_input_preserves_approval_until_screen_clears() {
         let target = PtyTarget::Known(Tool::Codex);
         let state = Arc::new(RwLock::new(ScreenState {
