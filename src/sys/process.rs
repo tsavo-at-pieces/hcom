@@ -619,8 +619,16 @@ mod tapped_stdout {
                 self.child.as_mut().unwrap()
             }
 
+            /// Wait for the copy to end. A copy that never ends fails the
+            /// test instead of hanging it.
             fn wait(mut self) -> Vec<Copied> {
-                self.copier.take().unwrap().join().unwrap();
+                let copier = self.copier.take().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !copier.is_finished() {
+                    assert!(Instant::now() < deadline, "the copy never ended");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                copier.join().unwrap();
                 self.log.lock().unwrap().clone()
             }
         }
