@@ -420,12 +420,27 @@ fn claude_stdio_text_output_starts_no_heartbeat() {
     assert_no_registered_instances(&h);
 }
 
+/// A client pipe filled to capacity, so hcom's first write to it waits for
+/// the client. Returns the client's end, hcom's end and the filler's size.
+fn full_client_pipe() -> (std::io::PipeReader, std::io::PipeWriter, usize) {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use std::os::fd::AsFd;
+
+    let (client, sink) = std::io::pipe().unwrap();
+    let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+    fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+    let mut filled = 0;
+    while let Ok(written) = nix::unistd::write(sink.as_fd(), &[b'.'; 4096]) {
+        filled += written;
+    }
+    fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+    (client, sink, filled)
+}
+
 /// The copy keeps every byte the child wrote before it exited, however long
 /// the client takes to read them: hcom delivers them before it exits.
 #[test]
 fn claude_stdio_delivers_output_to_a_client_paused_past_the_drain_bounds() {
-    use std::os::fd::AsFd;
-
     let h = Hcom::new();
     let exited = h.root_path().join("exited");
     h.set_launch_env("FAKE_EXITED", exited.to_str().unwrap());
@@ -450,18 +465,7 @@ exit 0
     // The client's pipe starts full, so hcom's first write waits for the
     // client. The child's output still fits in the copy's buffer and its own
     // pipe, so the child exits while hcom holds its last bytes.
-    let (mut client, sink) = std::io::pipe().unwrap();
-    let filler = {
-        use nix::fcntl::{FcntlArg, OFlag, fcntl};
-        let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
-        fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
-        let mut filled = 0;
-        while let Ok(written) = nix::unistd::write(sink.as_fd(), &[b'.'; 4096]) {
-            filled += written;
-        }
-        fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
-        filled
-    };
+    let (mut client, sink, filler) = full_client_pipe();
     let mut child = {
         let mut command = h.cmd();
         command
@@ -496,6 +500,68 @@ exit 0
         received[filler..] == *expected.as_bytes(),
         "stdout differs from the native output"
     );
+}
+
+/// Once the child has exited, HUP, INT or TERM stops hcom waiting for a
+/// client that is not reading, as it would stop a child blocked writing to
+/// that client. hcom still returns the child's status and cleans up.
+#[test]
+fn claude_stdio_signal_after_the_child_exits_ends_a_stalled_copy() {
+    for (signal, name) in [
+        (libc::SIGHUP, "HUP"),
+        (libc::SIGINT, "INT"),
+        (libc::SIGTERM, "TERM"),
+    ] {
+        let h = Hcom::new();
+        let exited = h.root_path().join("exited");
+        h.set_launch_env("FAKE_EXITED", exited.to_str().unwrap());
+        install_fake_claude(
+            &h,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+pad=$(head -c 30000 /dev/zero | tr '\0' z)
+printf '{"type":"assistant","pad":"%s"}\n' "$pad"
+printf '{"type":"result","subtype":"success","is_error":false}\n'
+: > "$FAKE_EXITED"
+exit 5
+"#,
+        );
+        let (client, sink, _) = full_client_pipe();
+        let mut child = h
+            .cmd()
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::null())
+            .stdout(sink)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        h.eventually("the child to exit", Duration::from_secs(30), || {
+            Ok(exited.exists().then_some(()))
+        });
+        // hcom has reaped the child by now and still holds its output.
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{name}: hcom exited before the client read"
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let status = h.eventually(
+            &format!("hcom to stop on {name}"),
+            Duration::from_secs(10),
+            || child.try_wait().map_err(|error| error.to_string()),
+        );
+        assert_eq!(status.code(), Some(5), "{name}");
+        drop(client);
+        assert_no_registered_instances(&h);
+    }
 }
 
 /// HUP, INT and TERM reach a stream-json child's process group exactly as

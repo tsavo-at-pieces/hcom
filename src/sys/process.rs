@@ -25,7 +25,9 @@ pub trait StdoutTap: Send + Sync {
 /// With a `stdout_tap`, the child writes into a pipe that a thread copies to
 /// hcom's own stdout; otherwise it inherits that stdout directly. The copy
 /// delivers everything the child wrote before it was reaped and is joined
-/// before this returns.
+/// before this returns, unless HUP, INT or TERM reaches hcom once the child
+/// has exited: that ends the wait, as it would end a child still blocked
+/// writing to the client.
 #[cfg(unix)]
 pub fn run_stdio_child(
     command: &mut Command,
@@ -61,6 +63,8 @@ pub fn run_stdio_child(
     let mut child = command.spawn()?;
     let pid = child.id();
     let mut forwarder = None;
+    // A cancellation that found the child already exited ends the drain.
+    let mut unforwarded = None;
     let result = (|| {
         if let (Some(source), Some(sink), Some(tap)) = (child.stdout.take(), sink, tap.clone()) {
             forwarder = Some(tapped_stdout::Forwarder::spawn(
@@ -78,6 +82,9 @@ pub fn run_stdio_child(
                 // The child stays unreaped until this single-threaded loop
                 // observes it. Never signal after a successful wait.
                 if let Some(status) = child.try_wait()? {
+                    if signal != SIGCHLD {
+                        unforwarded = Some(signal);
+                    }
                     return Ok(status
                         .code()
                         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
@@ -101,7 +108,7 @@ pub fn run_stdio_child(
         let _ = catch_unwind(AssertUnwindSafe(|| tap.child_exited()));
     }
     if let Some(forwarder) = forwarder {
-        forwarder.finish();
+        forwarder.finish(&mut signals, unforwarded);
     }
     drop(tap);
     result
@@ -122,10 +129,12 @@ mod tapped_stdout {
     use super::StdoutTap;
     use nix::errno::Errno;
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use signal_hook::consts::SIGCHLD;
+    use signal_hook::iterator::{Handle, Signals};
     use std::io::ErrorKind;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, Instant, SystemTime};
 
     /// Longest line a tap is shown. Longer lines are still forwarded whole.
@@ -152,6 +161,32 @@ mod tapped_stdout {
         thread: std::thread::JoinHandle<()>,
         /// Closed once the child is reaped, which starts the drain.
         exited: std::io::PipeWriter,
+        ended: Arc<Mutex<Ended>>,
+    }
+
+    /// Whether the copy has ended. A supervisor waiting for signals leaves
+    /// its handle here, so that the end wakes it.
+    #[derive(Default)]
+    struct Ended {
+        done: bool,
+        waiter: Option<Handle>,
+    }
+
+    fn lock(ended: &Mutex<Ended>) -> MutexGuard<'_, Ended> {
+        ended.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Held by the copy thread: records the end however the thread exits.
+    struct EndGuard(Arc<Mutex<Ended>>);
+
+    impl Drop for EndGuard {
+        fn drop(&mut self) {
+            let mut ended = lock(&self.0);
+            ended.done = true;
+            if let Some(waiter) = ended.waiter.take() {
+                waiter.close();
+            }
+        }
     }
 
     impl Forwarder {
@@ -163,9 +198,12 @@ mod tapped_stdout {
         ) -> std::io::Result<Self> {
             let (exit_notice, exited) = std::io::pipe()?;
             let lines = LineTap::new(tap, LINE_LIMIT);
+            let ended = Arc::new(Mutex::new(Ended::default()));
+            let guard = EndGuard(ended.clone());
             let thread = std::thread::Builder::new()
                 .name("stdio-stdout".into())
                 .spawn(move || {
+                    let _guard = guard;
                     forward(
                         source.as_fd(),
                         exit_notice.as_fd(),
@@ -175,13 +213,43 @@ mod tapped_stdout {
                         DRAIN,
                     );
                 })?;
-            Ok(Self { thread, exited })
+            Ok(Self {
+                thread,
+                exited,
+                ended,
+            })
         }
 
         /// Report the child's exit and wait until its output is delivered.
-        pub(super) fn finish(self) {
+        /// HUP, INT or TERM (`stop`, or one arriving meanwhile) ends the wait
+        /// instead. The copy, perhaps blocked writing to a client that is not
+        /// reading, is then left to end with hcom.
+        pub(super) fn finish(self, signals: &mut Signals, mut stop: Option<libc::c_int>) {
+            {
+                let mut ended = lock(&self.ended);
+                if !ended.done {
+                    ended.waiter = Some(signals.handle());
+                }
+            }
             drop(self.exited);
-            let _ = self.thread.join();
+            loop {
+                if lock(&self.ended).done {
+                    let _ = self.thread.join();
+                    return;
+                }
+                // Closing the handle at the end of the copy wakes this wait.
+                let signal = stop
+                    .take()
+                    .or_else(|| signals.wait().find(|&signal| signal != SIGCHLD));
+                if let Some(signal) = signal {
+                    crate::log::log_warn(
+                        "launcher",
+                        "stdio.stdout_copy_stopped",
+                        &format!("signal {signal} ended the copy of the exited child's stdout"),
+                    );
+                    return;
+                }
+            }
         }
     }
 
@@ -266,7 +334,10 @@ mod tapped_stdout {
             let timeout = drain.as_ref().map_or(PollTimeout::NONE, Drain::timeout);
             match poll(&mut fds[..watched], timeout) {
                 // Only a drain has a timeout: the pipe stayed empty.
-                Ok(0) if drain.as_ref().is_some_and(Drain::expired) => return,
+                Ok(0) if drain.as_ref().is_some_and(Drain::expired) => {
+                    drain_ended("it stayed empty, held open by a descendant");
+                    return;
+                }
                 Ok(0) => continue,
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
@@ -320,9 +391,19 @@ mod tapped_stdout {
             if let Some(drain) = &mut drain
                 && drain.read(read, drained)
             {
+                drain_ended("it was empty once the cap had passed");
                 return;
             }
         }
+    }
+
+    /// The drain ended before EOF on the child's stdout pipe.
+    fn drain_ended(why: &str) {
+        crate::log::log_info(
+            "launcher",
+            "stdio.stdout_drain_ended",
+            &format!("stopped copying the exited child's stdout: {why}"),
+        );
     }
 
     /// Bytes waiting in a pipe, or 0 when that is unknown.
