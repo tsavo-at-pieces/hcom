@@ -658,6 +658,15 @@ impl HcomDb {
             .unwrap_or(0)
     }
 
+    /// ID of the newest status event logged for `instance`, or 0 if none.
+    pub fn last_status_event_id(&self, instance: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE type = 'status' AND instance = ?",
+            params![instance],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Log a bare status event (test fixture for status-driven subscriptions).
     #[cfg(test)]
     pub fn log_status_event(

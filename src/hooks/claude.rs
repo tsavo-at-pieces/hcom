@@ -1855,6 +1855,133 @@ fn handle_poll(
     (0, stdout, result.ack)
 }
 
+/// A pipe client's turn end, read from Claude's stream-json stdout before the
+/// client could see it. A cancelled turn runs no Stop hook, so its `result`
+/// frame is the only sign that the session went idle.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StdioTurnEnd {
+    name: String,
+    created_at: f64,
+    session_id: String,
+    /// Newest status event of `name` when the frame was observed.
+    watermark: i64,
+    context: String,
+    detail: String,
+}
+
+/// `(status context, detail)` for a top-level stream-json `result` frame, or
+/// `None` when the session does not go idle: a queued turn follows, or the
+/// host shut the process down mid-turn.
+fn stdio_turn_end(frame: &Value) -> Option<(String, String)> {
+    if frame.get("type").and_then(Value::as_str) != Some("result")
+        || frame
+            .get("queued_turn_count")
+            .and_then(Value::as_i64)
+            .is_some_and(|count| count > 0)
+        || frame
+            .get("interrupted_by_shutdown")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        return None;
+    }
+    let reason = frame.get("terminal_reason").and_then(Value::as_str);
+    let context = match reason {
+        Some("aborted_streaming" | "aborted_tools") => "interrupted".to_string(),
+        _ if frame.get("is_error").and_then(Value::as_bool) == Some(true) => format!(
+            "failure:{}",
+            reason
+                .or_else(|| frame.get("subtype").and_then(Value::as_str))
+                .unwrap_or("error")
+        ),
+        _ => String::new(),
+    };
+    Some((context, reason.unwrap_or_default().to_string()))
+}
+
+/// Snapshot the turn end a `result` frame reports, before the frame is
+/// forwarded. The row is the process binding's: SessionStart moves a resumed
+/// session's process from its launch placeholder to the restored identity.
+pub(crate) fn observe_stdio_turn_end(
+    db: &HcomDb,
+    process_id: &str,
+    frame: &Value,
+) -> Result<Option<StdioTurnEnd>> {
+    let Some((context, detail)) = stdio_turn_end(frame) else {
+        return Ok(None);
+    };
+    // Without a session the frame cannot be tied to the bound conversation.
+    let Some(session_id) = frame
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(name) = db.get_process_binding(process_id)? else {
+        return Ok(None);
+    };
+    // Stop has normally recorded the turn end already.
+    let Some(row) = db
+        .get_instance_full(&name)?
+        .filter(|row| matches!(row.status.as_str(), ST_ACTIVE | ST_BLOCKED))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(StdioTurnEnd {
+        watermark: db.last_status_event_id(&name)?,
+        name,
+        created_at: row.created_at,
+        session_id: session_id.to_string(),
+        context,
+        detail,
+    }))
+}
+
+/// Mark a pipe client listening after a turn that ended without Stop. Anything
+/// since the snapshot wins: a late Stop, the next prompt, an exit, or a new
+/// owner of the process. Queued messages wait for the next native prompt.
+pub(crate) fn record_stdio_turn_end(
+    db: &HcomDb,
+    process_id: &str,
+    end: &StdioTurnEnd,
+) -> Result<bool> {
+    let recorded = db.with_write_scope(|| {
+        let current = db.get_process_binding(process_id)?.as_deref() == Some(end.name.as_str())
+            && db.get_instance_full(&end.name)?.is_some_and(|row| {
+                row.created_at == end.created_at
+                    && row.session_id.as_deref() == Some(end.session_id.as_str())
+                    && matches!(row.status.as_str(), ST_ACTIVE | ST_BLOCKED)
+            })
+            && db.last_status_event_id(&end.name)? == end.watermark;
+        if current {
+            lifecycle::try_set_status(
+                db,
+                &end.name,
+                ST_LISTENING,
+                &end.context,
+                lifecycle::StatusUpdate {
+                    detail: &end.detail,
+                    ..Default::default()
+                },
+            )?;
+        }
+        Ok(current)
+    })?;
+    if recorded {
+        common::notify_hook_instance_with_db(db, &end.name);
+        log::log_info(
+            "hooks",
+            "stdio.turn_end",
+            &format!(
+                "instance={} context={} detail={}",
+                end.name, end.context, end.detail
+            ),
+        );
+    }
+    Ok(recorded)
+}
+
 /// Parent UserPromptSubmit: fallback bootstrap, PTY mode message delivery.
 fn handle_userpromptsubmit(
     db: &HcomDb,
@@ -5421,6 +5548,297 @@ mod tests {
         let (_, output, ack) = userpromptsubmit_prompt(&db, &ctx, "next question");
         assert!(output.contains("between turns"));
         assert!(ack.is_some());
+    }
+
+    #[test]
+    fn stdio_turn_end_maps_stream_json_result_frames() {
+        let end = |frame: Value| stdio_turn_end(&frame);
+        let idle = |context: &str, detail: &str| Some((context.to_string(), detail.to_string()));
+        assert_eq!(
+            end(
+                serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+                "terminal_reason": "completed", "queued_turn_count": 0})
+            ),
+            idle("", "completed")
+        );
+        assert_eq!(
+            end(serde_json::json!({"type": "result", "subtype": "success", "is_error": false})),
+            idle("", "")
+        );
+        assert_eq!(
+            end(
+                serde_json::json!({"type": "result", "subtype": "error_during_execution",
+                "is_error": true, "terminal_reason": "aborted_streaming"})
+            ),
+            idle("interrupted", "aborted_streaming")
+        );
+        assert_eq!(
+            end(
+                serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+                "terminal_reason": "aborted_tools"})
+            ),
+            idle("interrupted", "aborted_tools")
+        );
+        assert_eq!(
+            end(
+                serde_json::json!({"type": "result", "subtype": "success", "is_error": true,
+                "terminal_reason": "api_error"})
+            ),
+            idle("failure:api_error", "api_error")
+        );
+        assert_eq!(
+            end(
+                serde_json::json!({"type": "result", "subtype": "error_max_turns", "is_error": true})
+            ),
+            idle("failure:error_max_turns", "")
+        );
+        // Another turn follows, or the worker is being shut down mid-turn.
+        assert_eq!(
+            end(serde_json::json!({"type": "result", "is_error": false,
+                "terminal_reason": "completed", "queued_turn_count": 2})),
+            None
+        );
+        assert_eq!(
+            end(serde_json::json!({"type": "result", "is_error": true,
+                "terminal_reason": "aborted_streaming", "interrupted_by_shutdown": true})),
+            None
+        );
+        for frame in [
+            serde_json::json!({"type": "assistant", "terminal_reason": "aborted_streaming"}),
+            serde_json::json!({"type": "user", "result": "x"}),
+            serde_json::json!({"subtype": "success", "is_error": false}),
+            serde_json::json!({"type": ["result"]}),
+            serde_json::json!({"message": {"type": "result"}}),
+            serde_json::json!([{"type": "result"}]),
+            serde_json::json!("result"),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(end(frame.clone()), None, "{frame}");
+        }
+    }
+
+    /// `nova` owns stdio process `stdio-proc` and session `sess-1`.
+    fn stdio_turn_db(status: &str, context: &str) -> (tempfile::TempDir, EnvGuard, HcomDb) {
+        let (dir, guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id, name_announced)
+                 VALUES ('nova', 'sess-1', 'claude', 'listening', '', 0, 1700000000.25, 0, 1)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("stdio-proc", "sess-1", "nova")
+            .unwrap();
+        lifecycle::set_status(&db, "nova", status, context, Default::default());
+        (dir, guard, db)
+    }
+
+    fn stdio_result(session_id: &str, reason: &str) -> Value {
+        serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "session_id": session_id, "terminal_reason": reason, "queued_turn_count": 0,
+        })
+    }
+
+    fn status_triplet(db: &HcomDb, name: &str) -> (String, String, String) {
+        let row = db.get_instance_full(name).unwrap().unwrap();
+        (row.status, row.status_context, row.status_detail)
+    }
+
+    #[test]
+    #[serial]
+    fn stdio_cancelled_turn_without_stop_becomes_listening_interrupted() {
+        for (status, context, reason) in [
+            (ST_ACTIVE, "prompt", "aborted_streaming"),
+            (ST_ACTIVE, "tool:Bash", "aborted_tools"),
+            (ST_BLOCKED, "approval", "aborted_tools"),
+        ] {
+            let (_dir, _guard, db) = stdio_turn_db(status, context);
+            let end = observe_stdio_turn_end(&db, "stdio-proc", &stdio_result("sess-1", reason))
+                .unwrap()
+                .expect("a busy row records the turn end");
+            assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+            assert_eq!(
+                status_triplet(&db, "nova"),
+                (ST_LISTENING.into(), "interrupted".into(), reason.into()),
+                "{status}/{context}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn stdio_turn_end_needs_a_busy_row_and_the_frame_session() {
+        let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
+        let mut frame = stdio_result("sess-1", "aborted_streaming");
+        frame.as_object_mut().unwrap().remove("session_id");
+        assert_eq!(
+            observe_stdio_turn_end(&db, "stdio-proc", &frame).unwrap(),
+            None
+        );
+        assert_eq!(
+            observe_stdio_turn_end(&db, "other-proc", &stdio_result("sess-1", "completed"))
+                .unwrap(),
+            None
+        );
+        // Another session's frame never matches this row.
+        let end = observe_stdio_turn_end(&db, "stdio-proc", &stdio_result("sess-x", "completed"))
+            .unwrap()
+            .unwrap();
+        assert!(!record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(status_triplet(&db, "nova").1, "prompt");
+
+        // Stop already recorded the turn end; stopped rows are never revived.
+        for (status, context) in [
+            (ST_LISTENING, ""),
+            (ST_INACTIVE, "exit:killed"),
+            (ST_INACTIVE, "failure:x"),
+        ] {
+            db.set_status("nova", status, context).unwrap();
+            assert_eq!(
+                observe_stdio_turn_end(&db, "stdio-proc", &stdio_result("sess-1", "completed"))
+                    .unwrap(),
+                None,
+                "{status}/{context}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn stdio_turn_end_yields_to_anything_after_its_snapshot() {
+        type Change = (&'static str, fn(&HcomDb));
+        let changes: [Change; 9] = [
+            ("late Stop", |db| {
+                lifecycle::set_status(db, "nova", ST_LISTENING, "", Default::default())
+            }),
+            ("next prompt", |db| {
+                lifecycle::set_status(db, "nova", ST_ACTIVE, "prompt", Default::default())
+            }),
+            ("killed", |db| db.mark_killed("nova", "luna").unwrap()),
+            ("failed", |db| {
+                db.set_status("nova", ST_INACTIVE, "failure:x").unwrap()
+            }),
+            ("row recreated", |db| {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET created_at = created_at + 1 WHERE name = 'nova'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+            ("session switched", |db| {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET session_id = 'sess-2' WHERE name = 'nova'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+            ("process rebound", |db| {
+                db.set_process_binding("stdio-proc", "sess-1", "kole")
+                    .unwrap()
+            }),
+            ("process unbound", |db| {
+                db.delete_process_binding("stdio-proc").unwrap()
+            }),
+            ("row stopped", |db| {
+                db.delete_instance("nova").unwrap();
+            }),
+        ];
+        for (change, apply) in changes {
+            let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
+            let end = observe_stdio_turn_end(
+                &db,
+                "stdio-proc",
+                &stdio_result("sess-1", "aborted_streaming"),
+            )
+            .unwrap()
+            .unwrap();
+            apply(&db);
+            let before = db
+                .get_instance_full("nova")
+                .unwrap()
+                .map(|row| (row.status, row.status_context, row.status_time));
+            let watermark = db.last_status_event_id("nova").unwrap();
+            assert!(
+                !record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+                "{change}"
+            );
+            assert_eq!(
+                db.get_instance_full("nova").unwrap().map(|row| (
+                    row.status,
+                    row.status_context,
+                    row.status_time
+                )),
+                before,
+                "{change}"
+            );
+            assert_eq!(
+                db.last_status_event_id("nova").unwrap(),
+                watermark,
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn stdio_turn_end_leaves_queued_messages_for_the_next_prompt() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
+        insert_broadcast_from_luna(&db, "sent during the cancelled turn");
+        let end = observe_stdio_turn_end(
+            &db,
+            "stdio-proc",
+            &stdio_result("sess-1", "aborted_streaming"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(status_triplet(&db, "nova").1, "interrupted");
+        assert_eq!(delivery_cursor(&db), 0);
+        assert_eq!(db.get_unread_messages("nova").len(), 1);
+
+        let ctx = HcomContext::from_env(
+            &std::collections::HashMap::from([("HCOM_STDIO_MODE".into(), "1".into())]),
+            PathBuf::from("/tmp"),
+        );
+        let (_, output, ack) = userpromptsubmit_prompt(&db, &ctx, "next question");
+        assert!(output.contains("sent during the cancelled turn"));
+        assert!(ack.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn stdio_turn_end_follows_the_process_to_its_resumed_identity() {
+        let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
+        // `--resume` SessionStart retired the launch row and bound the
+        // process to the restored identity.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('kole', 'sess-r', 'claude', 'listening', '', 0, 1700000100.5, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("stdio-proc", "sess-r", "kole")
+            .unwrap();
+        lifecycle::set_status(&db, "kole", ST_ACTIVE, "tool:Bash", Default::default());
+        let end =
+            observe_stdio_turn_end(&db, "stdio-proc", &stdio_result("sess-r", "aborted_tools"))
+                .unwrap()
+                .unwrap();
+        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(
+            status_triplet(&db, "kole"),
+            (
+                ST_LISTENING.into(),
+                "interrupted".into(),
+                "aborted_tools".into()
+            )
+        );
+        assert_eq!(status_triplet(&db, "nova").1, "prompt");
     }
 
     /// Claude's screen sitting at an empty, settled prompt.

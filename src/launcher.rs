@@ -2583,8 +2583,15 @@ fn launch_stdio(
         .get_instance_full(instance_name)?
         .ok_or_else(|| anyhow::anyhow!("stdio launch registration disappeared"))?
         .created_at;
+    // Only a Claude stream-json client needs its turn ends read from stdout;
+    // Codex reports cancellation through its own Interrupt hook.
+    let stdout_tap = if tool == "claude" {
+        stdio_turn_tap(db, &params.args, process_id)
+    } else {
+        None
+    };
     let mut child_pid = 0;
-    let exit_code = crate::sys::process::run_stdio_child(&mut command, |pid| {
+    let exit_code = crate::sys::process::run_stdio_child(&mut command, stdout_tap, |pid| {
         child_pid = pid;
         db.store_launch_context(
             instance_name,
@@ -2738,6 +2745,70 @@ fn valid_codex_stdio_args(args: &[String]) -> bool {
         i += 1;
     }
     app_server
+}
+
+/// A stream-json client receives a `result` frame at the end of every turn,
+/// including a turn it cancels, for which Claude runs no Stop hook. Watch for
+/// those frames on the copied stdout; other output formats stay inherited.
+fn stdio_turn_tap(
+    db: &HcomDb,
+    args: &[String],
+    process_id: &str,
+) -> Option<Box<dyn crate::sys::process::StdoutTap>> {
+    let formats = crate::hooks::runtime::take_flag_values(&mut args.to_vec(), &["--output-format"]);
+    if formats.last().map(String::as_str) != Some("stream-json") {
+        return None;
+    }
+    match HcomDb::open_at(db.path()) {
+        Ok(db) => Some(Box::new(StdioTurnTap {
+            db,
+            process_id: process_id.to_string(),
+            pending: None,
+        })),
+        Err(error) => {
+            crate::log::log_warn("launcher", "stdio.turn_tap_failed", &error.to_string());
+            None
+        }
+    }
+}
+
+struct StdioTurnTap {
+    db: HcomDb,
+    process_id: String,
+    /// Observed before its frame is written; recorded after.
+    pending: Option<crate::hooks::claude::StdioTurnEnd>,
+}
+
+impl crate::sys::process::StdoutTap for StdioTurnTap {
+    fn observe(&mut self, line: &[u8]) {
+        // Tool results can be megabytes; parse only lines that can be a result.
+        if !std::str::from_utf8(line).is_ok_and(|text| text.contains("\"result\"")) {
+            return;
+        }
+        let Ok(frame) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return;
+        };
+        if frame.get("type").and_then(serde_json::Value::as_str) != Some("result") {
+            return;
+        }
+        self.db.reconnect_if_stale();
+        // The latest result decides, including one after which a queued turn runs.
+        self.pending =
+            crate::hooks::claude::observe_stdio_turn_end(&self.db, &self.process_id, &frame)
+                .unwrap_or_else(|error| {
+                    crate::log::log_warn("launcher", "stdio.turn_end_failed", &error.to_string());
+                    None
+                });
+    }
+
+    fn after_write(&mut self) {
+        if let Some(end) = self.pending.take()
+            && let Err(error) =
+                crate::hooks::claude::record_stdio_turn_end(&self.db, &self.process_id, &end)
+        {
+            crate::log::log_warn("launcher", "stdio.turn_end_failed", &error.to_string());
+        }
+    }
 }
 
 /// Validate tool args (pure parsing, no mutation).
@@ -4696,5 +4767,29 @@ mod tests {
         assert!(win.contains_key("MY_SECRET") && !win.contains_key("HCOM_X"));
         let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
+    }
+
+    #[test]
+    fn stdio_turn_tap_needs_stream_json_output_before_the_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let tapped = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            stdio_turn_tap(&db, &args, "stdio-proc").is_some()
+        };
+        assert!(tapped(&["-p", "--output-format", "stream-json"]));
+        assert!(tapped(&["-p", "--output-format=stream-json", "--verbose"]));
+        // The last value wins, as in Claude.
+        assert!(tapped(&[
+            "--output-format=json",
+            "--output-format=stream-json"
+        ]));
+        assert!(!tapped(&[
+            "--output-format=stream-json",
+            "--output-format=text"
+        ]));
+        assert!(!tapped(&["-p", "--input-format", "stream-json"]));
+        assert!(!tapped(&["-p", "--", "--output-format", "stream-json"]));
+        assert!(!tapped(&["-p"]));
     }
 }

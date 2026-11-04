@@ -5,29 +5,56 @@
 
 use std::process::Command;
 
+/// Observes a pipe client's stdout while [`run_stdio_child`] copies it. The
+/// tap only reads: every byte reaches hcom's stdout unchanged and in order.
+pub trait StdoutTap: Send {
+    /// A complete line without its `\n`, before the read that completed it is
+    /// written, so anything recorded here precedes the client's reaction.
+    fn observe(&mut self, line: &[u8]);
+    /// Everything read so far has been written.
+    fn after_write(&mut self);
+}
+
 /// Run a foreground pipe client without a shell or PTY. The hcom process
 /// remains the native child's parent and forwards cancellation to its group.
 /// SIGCHLD wakes the same loop as cancellation: no polling, and no signalling
 /// thread can race the reaping of a PID that the OS might reuse.
+///
+/// With a `stdout_tap`, the child writes into a pipe that a thread copies to
+/// hcom's own stdout; otherwise it inherits that stdout directly.
 #[cfg(unix)]
 pub fn run_stdio_child(
     command: &mut Command,
+    stdout_tap: Option<Box<dyn StdoutTap>>,
     on_spawn: impl FnOnce(u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<i32> {
     use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
+    use std::os::fd::AsFd;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
 
     let mut signals = Signals::new([SIGCHLD, SIGHUP, SIGINT, SIGTERM])?;
+    let stdout_copy = match stdout_tap {
+        Some(tap) => Some((std::io::stdout().as_fd().try_clone_to_owned()?, tap)),
+        None => None,
+    };
     command
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdout(if stdout_copy.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .stderr(Stdio::inherit());
     detach_session(command);
     let mut child = command.spawn()?;
     let pid = child.id();
+    let mut forwarder = None;
     let result = (|| {
+        if let (Some(source), Some((sink, tap))) = (child.stdout.take(), stdout_copy) {
+            forwarder = Some(tapped_stdout::Forwarder::spawn(source, sink, tap)?);
+        }
         on_spawn(pid)?;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -56,15 +83,450 @@ pub fn run_stdio_child(
         kill_group(pid);
         let _ = child.wait();
     }
+    if let Some(forwarder) = forwarder {
+        forwarder.finish(tapped_stdout::DRAIN_TIMEOUT);
+    }
     result
 }
 
 #[cfg(not(unix))]
 pub fn run_stdio_child(
     _command: &mut Command,
+    _stdout_tap: Option<Box<dyn StdoutTap>>,
     _on_spawn: impl FnOnce(u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<i32> {
     anyhow::bail!("--stdio is currently supported on Unix only")
+}
+
+/// The copy of a pipe client's stdout behind a [`StdoutTap`].
+#[cfg(unix)]
+mod tapped_stdout {
+    use super::StdoutTap;
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    /// Longest line a tap is shown. Longer lines are still forwarded whole.
+    const LINE_LIMIT: usize = 16 * 1024 * 1024;
+
+    /// How long the copy may continue after the child exits. A descendant
+    /// that inherited the pipe can keep it open indefinitely.
+    pub(super) const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Copies the child's stdout to hcom's own on a dedicated thread.
+    pub(super) struct Forwarder {
+        /// Disconnects when the copy thread exits.
+        done: mpsc::Receiver<()>,
+        /// Cleared once hcom stops waiting, so a late line can't reach the tap.
+        tap_open: Arc<AtomicBool>,
+    }
+
+    impl Forwarder {
+        pub(super) fn spawn(
+            source: std::process::ChildStdout,
+            sink: OwnedFd,
+            tap: Box<dyn StdoutTap>,
+        ) -> std::io::Result<Self> {
+            let (done_tx, done) = mpsc::channel();
+            let tap_open = Arc::new(AtomicBool::new(true));
+            let lines = LineTap::new(tap, tap_open.clone(), LINE_LIMIT);
+            std::thread::Builder::new()
+                .name("stdio-stdout".into())
+                .spawn(move || {
+                    let _done = done_tx;
+                    forward(source, |bytes| write_all(sink.as_fd(), bytes), lines);
+                })?;
+            Ok(Self { done, tap_open })
+        }
+
+        /// Wait for the child's last bytes, which normally end in EOF as it exits.
+        pub(super) fn finish(self, timeout: Duration) {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = self.done.recv_timeout(timeout) {
+                self.tap_open.store(false, Ordering::Release);
+                crate::log::log_warn(
+                    "launcher",
+                    "stdio.stdout_drain_timeout",
+                    "a descendant still holds the native stdout pipe",
+                );
+            }
+        }
+    }
+
+    /// Copy `source` to `write` until EOF or a failed write. Each complete
+    /// line is shown to the tap before the chunk that completes it is written.
+    fn forward(
+        mut source: impl Read,
+        mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
+        mut lines: LineTap,
+    ) {
+        let mut buf = vec![0; 64 * 1024];
+        loop {
+            let read = match source.read(&mut buf) {
+                Ok(0) => return,
+                Ok(read) => read,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    crate::log::log_warn(
+                        "launcher",
+                        "stdio.stdout_read_failed",
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            };
+            lines.observe(&buf[..read]);
+            if let Err(error) = write(&buf[..read]) {
+                // Returning drops the read end, so the child gets the same
+                // EPIPE it would have received writing to the client's pipe.
+                if error.kind() != ErrorKind::BrokenPipe {
+                    crate::log::log_warn(
+                        "launcher",
+                        "stdio.stdout_write_failed",
+                        &error.to_string(),
+                    );
+                }
+                return;
+            }
+            lines.after_write();
+        }
+    }
+
+    /// Write all of `bytes` without changing the file status flags: the
+    /// client may have made its end nonblocking.
+    fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> std::io::Result<()> {
+        use nix::errno::Errno;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        while !bytes.is_empty() {
+            match nix::unistd::write(fd, bytes) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(written) => bytes = &bytes[written..],
+                Err(Errno::EINTR) => {}
+                Err(Errno::EAGAIN) => {
+                    let _ = poll(
+                        &mut [PollFd::new(fd, PollFlags::POLLOUT)],
+                        PollTimeout::NONE,
+                    );
+                }
+                Err(errno) => return Err(errno.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Splits the copied bytes into lines for a [`StdoutTap`]. A tap that
+    /// panics is dropped; the copy continues without it.
+    struct LineTap {
+        tap: Option<Box<dyn StdoutTap>>,
+        open: Arc<AtomicBool>,
+        limit: usize,
+        /// Start of the current line, unless it outgrew `limit`.
+        line: Vec<u8>,
+        overflowed: bool,
+    }
+
+    impl LineTap {
+        fn new(tap: Box<dyn StdoutTap>, open: Arc<AtomicBool>, limit: usize) -> Self {
+            Self {
+                tap: Some(tap),
+                open,
+                limit,
+                line: Vec::new(),
+                overflowed: false,
+            }
+        }
+
+        fn observe(&mut self, mut chunk: &[u8]) {
+            if self.tap.is_none() {
+                return;
+            }
+            while let Some(end) = chunk.iter().position(|&byte| byte == b'\n') {
+                let head = &chunk[..end];
+                if !self.overflowed && self.line.len() + head.len() <= self.limit {
+                    if self.line.is_empty() {
+                        self.call(|tap| tap.observe(head));
+                    } else {
+                        let mut line = std::mem::take(&mut self.line);
+                        line.extend_from_slice(head);
+                        self.call(|tap| tap.observe(&line));
+                    }
+                }
+                self.line.clear();
+                self.overflowed = false;
+                chunk = &chunk[end + 1..];
+            }
+            if self.overflowed || self.tap.is_none() {
+                return;
+            }
+            if self.line.len() + chunk.len() <= self.limit {
+                self.line.extend_from_slice(chunk);
+            } else {
+                self.line = Vec::new();
+                self.overflowed = true;
+            }
+        }
+
+        fn after_write(&mut self) {
+            self.call(|tap| tap.after_write());
+        }
+
+        fn call(&mut self, f: impl FnOnce(&mut dyn StdoutTap)) {
+            let Some(tap) = self.tap.as_deref_mut() else {
+                return;
+            };
+            if !self.open.load(Ordering::Acquire)
+                || catch_unwind(AssertUnwindSafe(|| f(tap))).is_err()
+            {
+                self.tap = None;
+                self.line = Vec::new();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Mutex;
+
+        /// One tap call or sink write, in the order the forwarder made them.
+        #[derive(Debug, Clone, PartialEq)]
+        enum Copied {
+            Observed(Vec<u8>),
+            Wrote(Vec<u8>),
+            AfterWrite,
+        }
+
+        struct RecordingTap {
+            log: Arc<Mutex<Vec<Copied>>>,
+            panic_on_observe: bool,
+        }
+
+        impl StdoutTap for RecordingTap {
+            fn observe(&mut self, line: &[u8]) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(Copied::Observed(line.to_vec()));
+                assert!(!self.panic_on_observe, "tap failure");
+            }
+
+            fn after_write(&mut self) {
+                self.log.lock().unwrap().push(Copied::AfterWrite);
+            }
+        }
+
+        fn recording_tap(
+            log: &Arc<Mutex<Vec<Copied>>>,
+            panic_on_observe: bool,
+        ) -> Box<dyn StdoutTap> {
+            Box::new(RecordingTap {
+                log: log.clone(),
+                panic_on_observe,
+            })
+        }
+
+        /// Serves `data` in pseudo-random read sizes from 1 to `max`.
+        struct ChunkedReader {
+            data: Vec<u8>,
+            offset: usize,
+            state: u64,
+            max: u64,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.state ^= self.state << 13;
+                self.state ^= self.state >> 7;
+                self.state ^= self.state << 17;
+                let size = (1 + (self.state % self.max) as usize)
+                    .min(buf.len())
+                    .min(self.data.len() - self.offset);
+                buf[..size].copy_from_slice(&self.data[self.offset..self.offset + size]);
+                self.offset += size;
+                Ok(size)
+            }
+        }
+
+        fn copy_with_tap(
+            data: &[u8],
+            seed: u64,
+            max_read: u64,
+            open: bool,
+            panic_on_observe: bool,
+        ) -> Vec<Copied> {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let source = ChunkedReader {
+                data: data.to_vec(),
+                offset: 0,
+                state: seed,
+                max: max_read,
+            };
+            let sink = log.clone();
+            forward(
+                source,
+                |bytes| {
+                    sink.lock().unwrap().push(Copied::Wrote(bytes.to_vec()));
+                    Ok(())
+                },
+                LineTap::new(
+                    recording_tap(&log, panic_on_observe),
+                    Arc::new(AtomicBool::new(open)),
+                    256,
+                ),
+            );
+            log.lock().unwrap().clone()
+        }
+
+        fn written(copied: &[Copied]) -> Vec<u8> {
+            copied
+                .iter()
+                .filter_map(|event| match event {
+                    Copied::Wrote(bytes) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .flatten()
+                .copied()
+                .collect()
+        }
+
+        #[test]
+        fn copy_is_byte_exact_and_shows_lines_before_writing_them() {
+            let mut data = Vec::new();
+            let mut lines = Vec::new();
+            let mut line = |data: &mut Vec<u8>, bytes: &[u8], shown: bool| {
+                data.extend_from_slice(bytes);
+                if shown {
+                    lines.push((bytes.to_vec(), data.len()));
+                }
+                data.push(b'\n');
+            };
+            line(
+                &mut data,
+                "{\"type\":\"assistant\",\"text\":\"h\u{e9}llo \u{2713} \u{1f389}\"}".as_bytes(),
+                true,
+            );
+            line(&mut data, b"{\"type\":\"user\"}\r", true);
+            line(&mut data, b"", true);
+            // Over the 256-byte test limit: forwarded whole, never shown.
+            line(&mut data, &[b'x'; 300], false);
+            line(
+                &mut data,
+                "{\"type\":\"result\",\"result\":\"\u{2713}\"}".as_bytes(),
+                true,
+            );
+            // A final line without newline, ending inside a UTF-8 sequence.
+            data.extend_from_slice(b"partial \xe2\x9c");
+
+            for seed in 1..=64 {
+                for max_read in [1, 2, 3, 7, 64, 100_000] {
+                    let copied = copy_with_tap(&data, seed, max_read, true, false);
+                    assert_eq!(written(&copied), data, "seed={seed} max_read={max_read}");
+                    let mut sent = 0;
+                    let mut shown = lines.iter();
+                    for (index, event) in copied.iter().enumerate() {
+                        match event {
+                            Copied::Observed(observed) => {
+                                let (line, newline) = shown.next().expect("unexpected line");
+                                assert_eq!(observed, line);
+                                // Shown before its newline is written, and the
+                                // next write contains that newline.
+                                assert!(sent <= *newline);
+                                let Some(Copied::Wrote(next)) = copied[index..]
+                                    .iter()
+                                    .find(|event| matches!(event, Copied::Wrote(_)))
+                                else {
+                                    panic!("line shown but never written");
+                                };
+                                assert!(sent + next.len() > *newline);
+                            }
+                            Copied::Wrote(bytes) => {
+                                sent += bytes.len();
+                                assert_eq!(copied.get(index + 1), Some(&Copied::AfterWrite));
+                            }
+                            Copied::AfterWrite => {}
+                        }
+                    }
+                    assert!(shown.next().is_none(), "seed={seed} max_read={max_read}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_failed_or_closed_tap_never_interrupts_the_copy() {
+            let data = b"one\ntwo\nthree\n";
+            let copied = copy_with_tap(data, 7, 3, true, true);
+            assert_eq!(written(&copied), data);
+            // The first line panics the tap; nothing reaches it afterwards.
+            let failed = copied
+                .iter()
+                .position(|event| matches!(event, Copied::Observed(_)))
+                .unwrap();
+            assert_eq!(copied[failed], Copied::Observed(b"one".to_vec()));
+            assert!(
+                copied[failed + 1..]
+                    .iter()
+                    .all(|event| matches!(event, Copied::Wrote(_)))
+            );
+
+            let copied = copy_with_tap(data, 7, 3, false, false);
+            assert_eq!(written(&copied), data);
+            assert!(copied.iter().all(|event| matches!(event, Copied::Wrote(_))));
+        }
+
+        #[test]
+        fn a_closed_client_stdout_closes_the_child_pipe_too() {
+            use std::io::Write;
+
+            let (source, mut child_stdout) = std::io::pipe().unwrap();
+            let (client, sink) = std::io::pipe().unwrap();
+            drop(client);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let tap = recording_tap(&log, false);
+            let copier = std::thread::spawn(move || {
+                forward(
+                    source,
+                    |bytes| write_all(sink.as_fd(), bytes),
+                    LineTap::new(tap, Arc::new(AtomicBool::new(true)), 256),
+                );
+            });
+            child_stdout.write_all(b"{\"type\":\"result\"}\n").unwrap();
+            copier.join().unwrap();
+            assert_eq!(
+                child_stdout.write_all(b"next\n").unwrap_err().kind(),
+                ErrorKind::BrokenPipe
+            );
+            // Shown, but never confirmed as written to the client.
+            assert_eq!(
+                *log.lock().unwrap(),
+                [Copied::Observed(b"{\"type\":\"result\"}".to_vec())]
+            );
+        }
+
+        #[test]
+        fn a_nonblocking_client_stdout_is_waited_for_not_reconfigured() {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+            let (mut client, sink) = std::io::pipe().unwrap();
+            let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+            fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+            let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+            let reader = std::thread::spawn(move || {
+                // Let the pipe fill first, so the writer meets EAGAIN.
+                std::thread::sleep(Duration::from_millis(100));
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).unwrap();
+                received
+            });
+            write_all(sink.as_fd(), &data).unwrap();
+            let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+            assert!(flags.contains(OFlag::O_NONBLOCK));
+            drop(sink);
+            assert!(reader.join().unwrap() == data);
+        }
+    }
 }
 
 /// Stable identity for one PID incarnation.
