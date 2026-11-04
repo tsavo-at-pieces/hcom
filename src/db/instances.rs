@@ -1197,6 +1197,23 @@ impl HcomDb {
         Ok(())
     }
 
+    /// The row a foreground pipe client's launch still owns: the process
+    /// binding of `process_id` names it, it carries that launch token (a
+    /// takeover moves the token to its own supervisor), and it is not newer
+    /// than the binding, which was written for the incarnation it names.
+    pub fn get_stdio_owned_instance(&self, process_id: &str) -> Result<Option<InstanceRow>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT i.* FROM instances i JOIN process_bindings b ON b.instance_name = i.name
+                 WHERE b.process_id = ?1 AND i.created_at <= b.updated_at
+                   AND CASE WHEN json_valid(i.launch_context)
+                       THEN json_extract(i.launch_context, '$.process_id') = ?1 ELSE 0 END",
+            )?
+            .query_row(params![process_id], InstanceRow::from_row)
+            .optional()?)
+    }
+
     /// Refresh the heartbeat of one live row incarnation while a foreground
     /// pipe client's child runs. Unlike [`Self::update_heartbeat`], this
     /// claims no TCP listener and never touches a stopped or replaced row.

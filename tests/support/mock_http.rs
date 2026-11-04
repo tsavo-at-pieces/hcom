@@ -54,6 +54,9 @@ pub enum Reply {
     /// An HTTP status with an empty body, recorded as unexpected so a
     /// mis-scripted turn or stray route fails the test loudly.
     Status(u16),
+    /// The first events of an SSE stream that never finishes: the connection
+    /// stays open until the client gives up on it (e.g. a cancelled turn).
+    Stall(Vec<u8>),
 }
 
 /// A scripted localhost HTTP provider shared by every real-tool mock.
@@ -97,8 +100,11 @@ impl MockHttp {
                         let unexpected = h_unexpected.clone();
                         let errors = h_errors.clone();
                         let responder = responder.clone();
+                        let shutdown = h_shutdown.clone();
                         workers.push(std::thread::spawn(move || {
-                            if let Err(e) = handle_conn(stream, requests, unexpected, responder) {
+                            if let Err(e) =
+                                handle_conn(stream, requests, unexpected, responder, &shutdown)
+                            {
                                 // A reset/timeout after the reply is already
                                 // written is benign (clients close eagerly);
                                 // record everything else for the audit.
@@ -175,6 +181,7 @@ fn handle_conn(
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     unexpected: Arc<Mutex<Vec<RecordedRequest>>>,
     responder: Arc<dyn Fn(&RecordedRequest) -> Reply + Send + Sync>,
+    shutdown: &AtomicBool,
 ) -> std::io::Result<()> {
     // Accepted streams can inherit nonblocking mode from the listener on some
     // platforms. The parser below expects ordinary blocking reads with a
@@ -258,6 +265,31 @@ fn handle_conn(
             let head =
                 format!("HTTP/1.1 {code} Mock\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             writer.write_all(head.as_bytes())?;
+        }
+        Reply::Stall(sse) => {
+            // No length: the body would end only when the connection closes.
+            writer.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                  Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+            )?;
+            writer.write_all(&sse)?;
+            writer.flush()?;
+            let mut stream = reader.into_inner();
+            stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+            let mut byte = [0u8; 1];
+            while !shutdown.load(Ordering::Relaxed) {
+                match stream.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+            return Ok(());
         }
     }
     writer.flush()?;

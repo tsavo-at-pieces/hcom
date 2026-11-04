@@ -67,13 +67,16 @@ fn status_contexts(h: &Hcom) -> Vec<String> {
 }
 
 /// A stream-json Claude stand-in. Hooks run through the hcom binary in the
-/// order native Claude runs them. Turn 2 is cancelled by an interrupt control
-/// request: like native Claude, it then skips Stop and only emits its result.
+/// order native Claude runs them, and session state frames follow them as
+/// for a client that opted into them. Turn 2 is cancelled by an interrupt
+/// control request: like native Claude, it then skips Stop and only emits its
+/// result.
 const SDK_CLAUDE: &str = r##"#!/bin/sh
 if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
 sid=4b8c2f0e-6d3a-4f1b-9e2c-7a5d8c1b3e60
 emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
 hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+state() { emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"$1\",\"session_id\":\"$sid\"}"; }
 : > "$PWD/transcript.jsonl"
 hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
 emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
@@ -82,6 +85,7 @@ while IFS= read -r line; do
   case "$line" in *'"type":"user"'*) ;; *) continue ;; esac
   turn=$((turn + 1))
   hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"turn $turn\"}"
+  state running
   emit "{\"type\":\"assistant\",\"session_id\":\"$sid\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"turn $turn héllo ✓ 🎉\"}]}}"
   if [ "$turn" = 1 ]; then
     big=$(head -c 200000 /dev/zero | tr '\0' x)
@@ -95,6 +99,7 @@ while IFS= read -r line; do
     hook poll "{\"session_id\":\"$sid\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false}"
     emit "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"$sid\",\"terminal_reason\":\"completed\",\"queued_turn_count\":0,\"result\":\"done $turn\"}"
   fi
+  state idle
 done
 printf 'crlf\r\nlast frame without newline' >> "$FAKE_STDOUT_COPY"
 printf 'crlf\r\nlast frame without newline'
@@ -363,6 +368,281 @@ exit 0
     assert_eq!(rows[0]["status"], "listening", "{rows:?}");
     drop(stdin);
     assert!(child.wait().unwrap().success());
+    assert_no_registered_instances(&h);
+}
+
+/// The copy keeps every byte the child wrote before it exited, however long
+/// the client takes to read them: hcom delivers them before it exits.
+#[test]
+fn claude_stdio_delivers_output_to_a_client_paused_past_the_drain_bounds() {
+    use std::os::fd::AsFd;
+
+    let h = Hcom::new();
+    let exited = h.root_path().join("exited");
+    h.set_launch_env("FAKE_EXITED", exited.to_str().unwrap());
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+pad=$(head -c 30000 /dev/zero | tr '\0' z)
+printf '{"type":"system","subtype":"init"}\n'
+printf '{"type":"assistant","pad":"%s"}\n' "$pad"
+printf '{"type":"assistant","pad":"%s"}\n' "$pad"
+printf '{"type":"result","subtype":"success","is_error":false}\n'
+: > "$FAKE_EXITED"
+exit 0
+"#,
+    );
+    let pad = "z".repeat(30_000);
+    let expected = format!(
+        "{{\"type\":\"system\",\"subtype\":\"init\"}}\n{assistant}{assistant}{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}\n",
+        assistant = format!("{{\"type\":\"assistant\",\"pad\":\"{pad}\"}}\n")
+    );
+    // The client's pipe starts full, so hcom's first write waits for the
+    // client. The child's output still fits in the copy's buffer and its own
+    // pipe, so the child exits while hcom holds its last bytes.
+    let (mut client, sink) = std::io::pipe().unwrap();
+    let filler = {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+        fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+        let mut filled = 0;
+        while let Ok(written) = nix::unistd::write(sink.as_fd(), &[b'.'; 4096]) {
+            filled += written;
+        }
+        fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+        filled
+    };
+    let mut child = {
+        let mut command = h.cmd();
+        command
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::null())
+            .stdout(sink)
+            .stderr(Stdio::null());
+        command.spawn().unwrap()
+    };
+    h.eventually("the child to exit", Duration::from_secs(30), || {
+        Ok(exited.exists().then_some(()))
+    });
+    // Longer than the drain's idle bound and the old fixed deadline.
+    std::thread::sleep(Duration::from_secs(7));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "hcom exited with the child's output undelivered"
+    );
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(received.len(), filler + expected.len());
+    assert!(
+        received[filler..] == *expected.as_bytes(),
+        "stdout differs from the native output"
+    );
+}
+
+/// HUP, INT and TERM reach a stream-json child's process group exactly as
+/// they reach an untapped one, and what it writes on the way out arrives.
+#[test]
+fn claude_stdio_stream_json_forwards_hup_int_and_term() {
+    for (signal, name, code) in [
+        (libc::SIGHUP, "HUP", 41),
+        (libc::SIGINT, "INT", 42),
+        (libc::SIGTERM, "TERM", 43),
+    ] {
+        let h = Hcom::new();
+        install_fake_claude(
+            &h,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+trap 'printf "{\"signal\":\"HUP\"}\n"; exit 41' HUP
+trap 'printf "{\"signal\":\"INT\"}\n"; exit 42' INT
+trap 'printf "{\"signal\":\"TERM\"}\n"; exit 43' TERM
+printf '{"type":"system","subtype":"init"}\n'
+while IFS= read -r line; do :; done
+exit 32
+"#,
+        );
+        let mut child = h
+            .cmd()
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, "{\"type\":\"system\",\"subtype\":\"init\"}\n");
+        let _stdin = child.stdin.take().unwrap();
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let mut rest = String::new();
+        stdout.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, format!("{{\"signal\":\"{name}\"}}\n"), "{name}");
+        assert_eq!(child.wait().unwrap().code(), Some(code), "{name}");
+        assert_no_registered_instances(&h);
+    }
+}
+
+/// The copy never waits for the room database. While another process holds
+/// its write lock, a cancelled turn's result and every later frame still
+/// reach a ready client at once; the status lands once the lock is released.
+#[test]
+fn claude_stdio_cancelled_turn_waits_for_a_locked_room_but_its_output_does_not() {
+    use serde_json::{Value, json};
+    use std::sync::mpsc;
+
+    let h = Hcom::new();
+    let copy = h.root_path().join("native-stdout");
+    h.set_launch_envs(&[
+        ("FAKE_STDOUT_COPY", copy.to_str().unwrap()),
+        ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
+    ]);
+    install_fake_claude(
+        &h,
+        r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=0c3e9d2a-5b7f-4e18-a6d4-9f2b1c8e7a50
+emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+IFS= read -r line
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
+emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"running\",\"session_id\":\"$sid\"}"
+emit "{\"type\":\"assistant\",\"session_id\":\"$sid\"}"
+IFS= read -r line
+emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"stop-1\"}}"
+emit "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"$sid\",\"terminal_reason\":\"aborted_streaming\",\"queued_turn_count\":0}"
+emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"idle\",\"session_id\":\"$sid\"}"
+# More than both pipes hold: a stalled copy would stall the child too.
+pad=$(head -c 30000 /dev/zero | tr '\0' y)
+for i in 1 2 3 4 5 6 7 8; do emit "{\"type\":\"stream_event\",\"n\":$i,\"pad\":\"$pad\"}"; done
+emit "{\"type\":\"system\",\"subtype\":\"marker\"}"
+IFS= read -r line
+exit 0
+"##,
+    );
+    let mut child = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (send_line, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let mut line_start = 0;
+        loop {
+            let read = stdout.read(&mut chunk).unwrap();
+            if read == 0 {
+                return received;
+            }
+            received.extend_from_slice(&chunk[..read]);
+            while let Some(end) = received[line_start..].iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&received[line_start..line_start + end]);
+                let _ = send_line.send(line.into_owned());
+                line_start += end + 1;
+            }
+        }
+    });
+    let next = |what: &str, matches: &dyn Fn(&Value) -> bool| -> Value {
+        loop {
+            let line = lines
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("no {what} frame\n{}", h.diagnostics()));
+            if let Ok(frame) = serde_json::from_str::<Value>(&line)
+                && matches(&frame)
+            {
+                return frame;
+            }
+        }
+    };
+    let send = |stdin: &mut std::process::ChildStdin, value: Value| {
+        writeln!(stdin, "{value}").unwrap();
+        stdin.flush().unwrap();
+    };
+    next("init", &|frame| frame["subtype"] == "init");
+    send(
+        &mut stdin,
+        json!({"type": "user", "message": {"role": "user", "content": "one"}}),
+    );
+    next("assistant", &|frame| frame["type"] == "assistant");
+    assert_eq!(only_status(&h).unwrap().1, "prompt");
+
+    // Another room writer holds the write lock across the cancellation.
+    let room = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    room.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locked = Instant::now();
+    send(
+        &mut stdin,
+        json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}}),
+    );
+    next("marker", &|frame| frame["subtype"] == "marker");
+    let delivered = locked.elapsed();
+    assert!(
+        delivered < Duration::from_secs(2),
+        "frames after the result waited {delivered:?} for the database"
+    );
+    assert_eq!(
+        only_status(&h).unwrap().1,
+        "prompt",
+        "recorded through the lock"
+    );
+    // Release well inside the recorder's busy timeout.
+    std::thread::sleep(Duration::from_millis(2500).saturating_sub(locked.elapsed()));
+    room.execute_batch("COMMIT").unwrap();
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    h.eventually(
+        "the cancelled turn to become listening",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+
+    drop(stdin);
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    let received = reader.join().unwrap();
+    assert!(
+        received == fs::read(&copy).unwrap(),
+        "stdout differs from the native output"
+    );
     assert_no_registered_instances(&h);
 }
 
@@ -957,4 +1237,182 @@ fn real_claude_stdio_two_turns_permission_channel_and_eof() {
         calls.lines().all(|line| line == "relay push"),
         "native hooks used ordinary hcom from PATH: {calls}"
     );
+}
+
+/// A real SDK interrupt, as X1 captured it: the native CLI aborts the streamed
+/// reply, answers the control request, runs no Stop hook and writes a
+/// `result` with `terminal_reason: aborted_streaming`, then the idle session
+/// state. The mock provider holds the reply open; no hosted model is used.
+#[test]
+#[ignore = "requires the real Claude CLI installed by scripts/install-mock-tools.sh"]
+fn real_claude_stdio_interrupt_marks_the_turn_listening_interrupted() {
+    use serde_json::{Value, json};
+    use std::sync::mpsc;
+    use support::claude_mock::{
+        ClaudeCase, MODEL, claude_partial_text, claude_text, latest_user_turn,
+    };
+    use support::mock_http::{MockHttp, Reply};
+    use support::real_tool::ToolCase;
+
+    let h = Hcom::new();
+    h.set_launch_env(
+        "PATH",
+        &format!(
+            "{}:{}",
+            support::pins::mock_tools_bin().display(),
+            std::env::var("PATH").unwrap()
+        ),
+    );
+    let mock = MockHttp::start(|request| {
+        if request.method.eq_ignore_ascii_case("HEAD") {
+            return Reply::Empty(200);
+        }
+        if request.path.contains("count_tokens") {
+            return Reply::Json(json!({"input_tokens": 1}).to_string());
+        }
+        if !request.path.contains("/v1/messages") {
+            return Reply::Status(404);
+        }
+        let (_, text) = latest_user_turn(&request.body).unwrap_or_default();
+        if text.contains("STDIO_STALL") {
+            Reply::Stall(claude_partial_text("msg_stall", "Counting: 1 2 3"))
+        } else if text.contains("STDIO_AFTER") {
+            Reply::Sse(claude_text("msg_after", "STDIO_AFTER_DONE"))
+        } else {
+            Reply::Status(500)
+        }
+    })
+    .unwrap();
+    ClaudeCase.prepare(&h, &ClaudeCase.provider_base_url(mock.port()));
+    // As the Agent SDK host launches it, session state frames included.
+    h.set_launch_envs(&[
+        ("CLAUDE_CODE_ENTRYPOINT", "sdk-ts"),
+        ("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"),
+    ]);
+    let mut child = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            MODEL,
+            "--setting-sources",
+            "user",
+            "--tools",
+            "Bash",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let mut reader = stderr;
+        reader.read_to_string(&mut text).unwrap();
+        text
+    });
+    let (send, receive) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if send.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let send_json = |input: &mut std::process::ChildStdin, value: Value| {
+        writeln!(input, "{value}").unwrap();
+        input.flush().unwrap();
+    };
+    let next = |kind: &str| -> Value {
+        loop {
+            let line = receive
+                .recv_timeout(Duration::from_secs(90))
+                .unwrap_or_else(|_| panic!("no {kind} frame\n{}", h.diagnostics()));
+            let frame: Value =
+                serde_json::from_str(&line).expect("stdout contains only native JSON frames");
+            if frame["type"] == kind {
+                return frame;
+            }
+        }
+    };
+    send_json(
+        &mut stdin,
+        json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}}),
+    );
+    send_json(
+        &mut stdin,
+        json!({"type": "user", "message": {"role": "user", "content": "STDIO_STALL"}, "parent_tool_use_id": null}),
+    );
+    // The turn is under way once the provider holds its reply open.
+    h.eventually(
+        "the stalled turn to reach the provider",
+        Duration::from_secs(90),
+        || {
+            let started = mock.requests().iter().any(|request| {
+                request.path.contains("/v1/messages")
+                    && !request.path.contains("count_tokens")
+                    && request.body.contains("STDIO_STALL")
+            });
+            Ok((started && only_status(&h).is_some_and(|row| row.1 == "prompt")).then_some(()))
+        },
+    );
+    send_json(
+        &mut stdin,
+        json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}}),
+    );
+    let result = next("result");
+    assert_eq!(result["terminal_reason"], "aborted_streaming", "{result}");
+    assert_eq!(result["is_error"], true, "{result}");
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    h.eventually(
+        "the interrupted turn to become listening",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the native process outlives a cancelled turn"
+    );
+
+    send_json(
+        &mut stdin,
+        json!({"type": "user", "message": {"role": "user", "content": "STDIO_AFTER"}, "parent_tool_use_id": null}),
+    );
+    let result = next("result");
+    assert_eq!(result["is_error"], false, "{result}");
+    assert!(
+        result["result"]
+            .as_str()
+            .unwrap()
+            .contains("STDIO_AFTER_DONE"),
+        "{result}"
+    );
+    h.eventually("the next turn to end", Duration::from_secs(10), || {
+        Ok(
+            (only_status(&h).is_some_and(|row| row.0 == "listening" && row.1.is_empty()))
+                .then_some(()),
+        )
+    });
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+    let stderr = errors.join().unwrap();
+    assert!(!stderr.contains("requires --print"), "{stderr}");
+    assert_no_registered_instances(&h);
 }

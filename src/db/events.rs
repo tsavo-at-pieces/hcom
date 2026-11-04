@@ -658,13 +658,32 @@ impl HcomDb {
             .unwrap_or(0)
     }
 
-    /// ID of the newest status event logged for `instance`, or 0 if none.
-    pub fn last_status_event_id(&self, instance: &str) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM events WHERE type = 'status' AND instance = ?",
-            params![instance],
-            |row| row.get(0),
-        )?)
+    /// Whether `instance` logged a status event at or after `since` that
+    /// starts a turn: a prompt (`active`/`prompt`) or the delivery a prompt
+    /// hook makes instead (`active`/`deliver:*`). Timestamps are parsed and
+    /// compared at their microsecond precision; one that does not parse counts.
+    pub fn turn_started_since(&self, instance: &str, since: std::time::SystemTime) -> Result<bool> {
+        let since = since
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |at| at.as_micros() as i64);
+        let mut statement = self.conn.prepare_cached(
+            "SELECT timestamp FROM events
+             WHERE type = 'status' AND instance = ?
+               AND json_extract(data, '$.status') = 'active'
+               AND (json_extract(data, '$.context') = 'prompt'
+                    OR json_extract(data, '$.context') LIKE 'deliver:%')",
+        )?;
+        let mut rows = statement.query(params![instance])?;
+        while let Some(row) = rows.next()? {
+            let started = match chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(0)?) {
+                Ok(at) => at.timestamp_micros() >= since,
+                Err(_) => true,
+            };
+            if started {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Log a bare status event (test fixture for status-driven subscriptions).

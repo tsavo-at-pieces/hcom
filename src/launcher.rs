@@ -2583,13 +2583,7 @@ fn launch_stdio(
         .get_instance_full(instance_name)?
         .ok_or_else(|| anyhow::anyhow!("stdio launch registration disappeared"))?
         .created_at;
-    // Only a Claude stream-json client needs its turn ends read from stdout;
-    // Codex reports cancellation through its own Interrupt hook.
-    let stdout_tap = if tool == "claude" {
-        stdio_turn_tap(db, &params.args, process_id)
-    } else {
-        None
-    };
+    let stdout_tap = stdio_stdout_tap(tool, db, &params.args, process_id);
     let mut child_pid = 0;
     let mut heartbeat = None;
     let exit_code = crate::sys::process::run_stdio_child(&mut command, stdout_tap, |pid| {
@@ -2819,24 +2813,28 @@ fn refresh_stdio_heartbeat(db: &HcomDb, process_id: &str) -> Result<bool> {
     db.update_stdio_heartbeat(&name, row.created_at)
 }
 
-/// A stream-json client receives a `result` frame at the end of every turn,
-/// including a turn it cancels, for which Claude runs no Stop hook. Watch for
-/// those frames on the copied stdout; other output formats stay inherited.
-fn stdio_turn_tap(
+/// How long the post-exit cleanup waits for the tap's recorder to apply what
+/// it has queued.
+const STDIO_RECORDER_FINISH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Only a Claude stream-json client needs its turn ends read from stdout:
+/// a cancelled turn there runs no Stop hook, while Codex reports one through
+/// its own Interrupt hook. Every other launch keeps the inherited stdout.
+fn stdio_stdout_tap(
+    tool: &str,
     db: &HcomDb,
     args: &[String],
     process_id: &str,
 ) -> Option<Box<dyn crate::sys::process::StdoutTap>> {
+    if tool != "claude" {
+        return None;
+    }
     let formats = crate::hooks::runtime::take_flag_values(&mut args.to_vec(), &["--output-format"]);
     if formats.last().map(String::as_str) != Some("stream-json") {
         return None;
     }
-    match HcomDb::open_at(db.path()) {
-        Ok(db) => Some(Box::new(StdioTurnTap {
-            db,
-            process_id: process_id.to_string(),
-            pending: None,
-        })),
+    match StdioTurnTap::start(db, process_id) {
+        Ok(tap) => Some(Box::new(tap)),
         Err(error) => {
             crate::log::log_warn("launcher", "stdio.turn_tap_failed", &error.to_string());
             None
@@ -2844,41 +2842,79 @@ fn stdio_turn_tap(
     }
 }
 
+/// Reads a Claude stream-json client's turn ends off its copied stdout. The
+/// copy thread only classifies lines and queues the few that end a turn; a
+/// recorder thread with its own connection makes every database read and
+/// write, in the order the frames were read.
 struct StdioTurnTap {
-    db: HcomDb,
-    process_id: String,
-    /// Observed before its frame is written; recorded after.
-    pending: Option<crate::hooks::claude::StdioTurnEnd>,
+    turn_ends: Option<std::sync::mpsc::Sender<crate::hooks::claude::StdioTurnEnd>>,
+    /// Disconnects when the recorder thread exits. (A receiver is not `Sync`.)
+    recorder_done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl StdioTurnTap {
+    fn start(db: &HcomDb, process_id: &str) -> Result<Self> {
+        let mut recorder_db = HcomDb::open_at(db.path())?;
+        let (turn_ends, queue) = std::sync::mpsc::channel::<crate::hooks::claude::StdioTurnEnd>();
+        let (done, recorder_done) = std::sync::mpsc::channel::<()>();
+        let process_id = process_id.to_string();
+        std::thread::Builder::new()
+            .name("stdio-recorder".into())
+            .spawn(move || {
+                let _done = done;
+                for end in queue {
+                    recorder_db.reconnect_if_stale();
+                    if let Err(error) =
+                        crate::hooks::claude::record_stdio_turn_end(&recorder_db, &process_id, &end)
+                    {
+                        crate::log::log_warn(
+                            "launcher",
+                            "stdio.turn_end_failed",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            })?;
+        Ok(Self {
+            turn_ends: Some(turn_ends),
+            recorder_done: std::sync::Mutex::new(recorder_done),
+        })
+    }
 }
 
 impl crate::sys::process::StdoutTap for StdioTurnTap {
-    fn observe(&mut self, line: &[u8]) {
-        // Tool results can be megabytes; parse only lines that can be a result.
-        if !std::str::from_utf8(line).is_ok_and(|text| text.contains("\"result\"")) {
-            return;
+    fn observe(&self, line: &[u8], emitted_after: std::time::SystemTime) {
+        if let Some(end) = crate::hooks::claude::stdio_turn_end(line, emitted_after)
+            && let Some(turn_ends) = &self.turn_ends
+        {
+            // A recorder that is gone only ends the recording.
+            let _ = turn_ends.send(end);
         }
-        let Ok(frame) = serde_json::from_slice::<serde_json::Value>(line) else {
-            return;
-        };
-        if frame.get("type").and_then(serde_json::Value::as_str) != Some("result") {
-            return;
-        }
-        self.db.reconnect_if_stale();
-        // The latest result decides, including one after which a queued turn runs.
-        self.pending =
-            crate::hooks::claude::observe_stdio_turn_end(&self.db, &self.process_id, &frame)
-                .unwrap_or_else(|error| {
-                    crate::log::log_warn("launcher", "stdio.turn_end_failed", &error.to_string());
-                    None
-                });
     }
 
-    fn after_write(&mut self) {
-        if let Some(end) = self.pending.take()
-            && let Err(error) =
-                crate::hooks::claude::record_stdio_turn_end(&self.db, &self.process_id, &end)
+    /// Recording needs no live child: frames read during the drain still count.
+    fn child_exited(&self) {}
+}
+
+impl Drop for StdioTurnTap {
+    /// The recorder applies what is queued, then exits. One still waiting on
+    /// the database after [`STDIO_RECORDER_FINISH`] is left to the post-exit
+    /// cleanup, which removes this launch's binding: a late write then
+    /// matches no row.
+    fn drop(&mut self) {
+        self.turn_ends.take();
+        let done = self
+            .recorder_done
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            done.recv_timeout(STDIO_RECORDER_FINISH)
         {
-            crate::log::log_warn("launcher", "stdio.turn_end_failed", &error.to_string());
+            crate::log::log_warn(
+                "launcher",
+                "stdio.recorder_busy",
+                "turn ends still queued at exit are left to cleanup",
+            );
         }
     }
 }
@@ -4873,27 +4909,95 @@ mod tests {
         assert!(!refresh_stdio_heartbeat(&db, "other-proc").unwrap());
     }
 
+    /// `name` as a stdio launch of `process_id` leaves it: bound, with its token.
+    fn stdio_launch_row(db: &HcomDb, name: &str, process_id: &str, session_id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, created_at, last_stop, launch_context)
+                 VALUES (?1, ?2, 'claude', 'listening', '', ?3, 1, json_object('process_id', ?4))",
+                rusqlite::params![
+                    name,
+                    session_id,
+                    crate::shared::time::now_epoch_f64(),
+                    process_id
+                ],
+            )
+            .unwrap();
+        db.set_process_binding(process_id, session_id, name)
+            .unwrap();
+    }
+
     #[test]
-    fn stdio_turn_tap_needs_stream_json_output_before_the_separator() {
+    fn stdio_tap_records_turn_ends_in_order_off_the_copy_thread() {
+        use crate::sys::process::StdoutTap;
+
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        let tapped = |args: &[&str]| {
+        stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
+        crate::instance_lifecycle::set_status(&db, "nova", "active", "prompt", Default::default());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let emitted_after = std::time::SystemTime::now();
+        let tap = StdioTurnTap::start(&db, "stdio-proc").unwrap();
+        // Held for the whole recording: observe never waits for the database.
+        db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        tap.observe(
+            br#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-1","terminal_reason":"aborted_streaming","queued_turn_count":0}"#,
+            emitted_after,
+        );
+        // The idle frame that follows changes nothing: the result applied.
+        tap.observe(
+            br#"{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"sess-1"}"#,
+            emitted_after,
+        );
+        tap.observe(b"not json", emitted_after);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        db.conn().execute_batch("COMMIT").unwrap();
+        drop(tap);
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(
+            (
+                row.status.as_str(),
+                row.status_context.as_str(),
+                row.status_detail.as_str()
+            ),
+            ("listening", "interrupted", "aborted_streaming")
+        );
+    }
+
+    #[test]
+    fn stdio_stdout_tap_only_for_claude_with_stream_json_output_before_the_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let tapped = |tool: &str, args: &[&str]| {
             let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
-            stdio_turn_tap(&db, &args, "stdio-proc").is_some()
+            stdio_stdout_tap(tool, &db, &args, "stdio-proc").is_some()
         };
-        assert!(tapped(&["-p", "--output-format", "stream-json"]));
-        assert!(tapped(&["-p", "--output-format=stream-json", "--verbose"]));
+        assert!(tapped("claude", &["-p", "--output-format", "stream-json"]));
+        assert!(tapped(
+            "claude",
+            &["-p", "--output-format=stream-json", "--verbose"]
+        ));
         // The last value wins, as in Claude.
-        assert!(tapped(&[
-            "--output-format=json",
-            "--output-format=stream-json"
-        ]));
-        assert!(!tapped(&[
-            "--output-format=stream-json",
-            "--output-format=text"
-        ]));
-        assert!(!tapped(&["-p", "--input-format", "stream-json"]));
-        assert!(!tapped(&["-p", "--", "--output-format", "stream-json"]));
-        assert!(!tapped(&["-p"]));
+        assert!(tapped(
+            "claude",
+            &["--output-format=json", "--output-format=stream-json"]
+        ));
+        assert!(!tapped(
+            "claude",
+            &["--output-format=stream-json", "--output-format=text"]
+        ));
+        assert!(!tapped("claude", &["-p", "--input-format", "stream-json"]));
+        assert!(!tapped(
+            "claude",
+            &["-p", "--", "--output-format", "stream-json"]
+        ));
+        assert!(!tapped("claude", &["-p"]));
+        // Codex keeps its inherited stdout and reports turns through hooks.
+        assert!(!tapped(
+            "codex",
+            &["app-server", "--output-format", "stream-json"]
+        ));
+        assert!(!tapped("codex", &["app-server", "--listen", "stdio://"]));
     }
 }

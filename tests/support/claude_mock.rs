@@ -191,6 +191,22 @@ pub fn claude_text(id: &str, text: &str) -> Vec<u8> {
     ])
 }
 
+/// The start of an assistant text turn that never completes: serve it with
+/// `Reply::Stall` to hold a turn open until the client interrupts it.
+pub fn claude_partial_text(id: &str, text: &str) -> Vec<u8> {
+    sse(&[
+        message_start(id),
+        (
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        ),
+    ])
+}
+
 /// A complete assistant tool-use turn (`stop_reason: tool_use`). The tool input
 /// is sent as a single `input_json_delta`.
 pub fn claude_tool_use(id: &str, tool_id: &str, name: &str, input: &Value) -> Vec<u8> {
