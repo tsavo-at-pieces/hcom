@@ -145,7 +145,7 @@ fn mark_busy(db_path: &Path, session: &str, process: &str) {
         let Some(digest) = name.strip_suffix(".json") else {
             continue;
         };
-        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if digest.len() != 32 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
         if !busy_marker_current(&entry.path(), 0.0, now)
@@ -821,8 +821,8 @@ mod tests {
         let directory = target.parent().unwrap();
         std::fs::create_dir_all(directory).unwrap();
         let marker = serde_json::json!({"kind":"busy", "at": now_epoch_f64()}).to_string();
-        for i in 0..512 {
-            std::fs::write(directory.join(format!("{i:064x}.json")), &marker).unwrap();
+        for i in 0..256 {
+            std::fs::write(directory.join(format!("{i:032x}.json")), &marker).unwrap();
         }
         mark_busy(db.path(), "new-session", "new-process");
         assert!(
