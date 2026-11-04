@@ -2541,8 +2541,16 @@ fn launch_stdio(
     // Run the executable the install gate validated (PATH, then the per-user
     // install directories), as the runner scripts do: resolving the bare name
     // through the child's PATH alone misses a fallback-only install that
-    // `hcom claude -p` launches.
-    let program = find_tool_path("claude").unwrap_or_else(|| "claude".to_string());
+    // `hcom claude -p` launches. The candidate is made absolute against this
+    // process's directory first: the child changes to `working_dir` before
+    // exec, where a relative PATH entry would name another file or none.
+    let program = find_tool_path("claude")
+        .map(|found| {
+            std::path::absolute(&found)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or(found)
+        })
+        .unwrap_or_else(|| "claude".to_string());
     let mut command = std::process::Command::new(&program);
     command
         .args(&params.args)

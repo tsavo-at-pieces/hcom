@@ -214,6 +214,53 @@ fn claude_stdio_runs_the_validated_executable_of_a_fallback_dir_install() {
     assert_no_registered_instances(&h);
 }
 
+/// The install gate searches PATH relative to hcom's own directory; the child
+/// changes to its working directory before exec. A relative PATH entry must
+/// still run the validated file, not a same-named file under `--dir`.
+#[test]
+fn claude_stdio_runs_the_validated_file_when_path_is_relative_and_dir_differs() {
+    let h = Hcom::new();
+    let script = |text: &str| {
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '2.1.309 (Claude Code)\\n'; exit 0; fi\nprintf '{text}\\n'\nexit 0\n"
+        )
+    };
+    let validated = h.workspace.join("toolbin").join("claude");
+    let decoy_dir = h.workspace.join("other");
+    let decoy = decoy_dir.join("toolbin").join("claude");
+    for (path, text) in [(&validated, "validated"), (&decoy, "decoy under --dir")] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, script(text)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let hcom_dir = std::path::Path::new(env!("CARGO_BIN_EXE_hcom"))
+        .parent()
+        .unwrap();
+    // `toolbin` is relative: it names the validated file from hcom's directory
+    // (the fixture workspace) and the decoy from the child's.
+    h.set_launch_env(
+        "PATH",
+        &format!("toolbin:{}:/usr/bin:/bin", hcom_dir.display()),
+    );
+    let output = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--dir",
+            decoy_dir.to_str().unwrap(),
+            "--",
+            "-p",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "validated\n");
+    assert_no_registered_instances(&h);
+}
+
 /// The batch and startup-failure events of a stdio launch name the launch's
 /// own launcher, tag and batch. The supervising hcom process may run inside
 /// another launch (an agent's Bash tool); that launch's `HCOM_LAUNCHED_BY` and

@@ -8,7 +8,8 @@ hcom preserves the native arguments and does not add stream format defaults.
 
 hcom prepares its usual per-launch hooks, reserves a fresh process identity,
 and remains the native child's parent. The child runs the executable hcom's
-install check resolved, with the launched environment minus a parent Claude's
+install check resolved, as an absolute path fixed before the child changes to
+its working directory, with the launched environment minus a parent Claude's
 instance state (`CLAUDE_CODE_CHILD_SESSION` and the messaging socket and token
 belong to that parent and would stop the new session's transcript). Its hooks
 name the canonical path of the hcom image that launched it, and its batch and
