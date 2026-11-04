@@ -20,6 +20,11 @@ pub trait StdoutTap: Send + Sync {
     fn observe(&self, line: &[u8], emitted_after: std::time::SystemTime);
     /// The child has been reaped; its remaining output drains next.
     fn child_exited(&self);
+    /// The copy has ended: at EOF, at a write to hcom's stdout that failed
+    /// (EPIPE once the client closed it), at a failed read, or where the
+    /// drain stops. Nothing follows, and the child's pipe closes with it,
+    /// while the child itself may still run, waiting on stdin.
+    fn copy_ended(&self);
 }
 
 /// Run a foreground pipe client without a shell or PTY. The hcom process
@@ -74,7 +79,10 @@ pub fn run_stdio_child(
     let result = (|| {
         if let (Some(source), Some(sink), Some(tap)) = (child.stdout.take(), sink, tap.clone()) {
             forwarder = Some(tapped_stdout::Forwarder::spawn(
-                source, sink, tap, spawned_at,
+                source.into(),
+                sink,
+                tap,
+                spawned_at,
             )?);
         }
         on_spawn(pid)?;
@@ -219,15 +227,25 @@ mod tapped_stdout {
         }
     }
 
+    /// Held by the copy thread: tells the tap the copy ended, however the
+    /// thread exits, even after the tap panicked out of the line split.
+    struct TapEnd(Arc<dyn StdoutTap>);
+
+    impl Drop for TapEnd {
+        fn drop(&mut self) {
+            let _ = catch_unwind(AssertUnwindSafe(|| self.0.copy_ended()));
+        }
+    }
+
     impl Forwarder {
         pub(super) fn spawn(
-            source: std::process::ChildStdout,
+            source: OwnedFd,
             sink: OwnedFd,
             tap: Arc<dyn StdoutTap>,
             spawned_at: SystemTime,
         ) -> std::io::Result<Self> {
             let (exit_notice, exited) = std::io::pipe()?;
-            let lines = LineTap::new(tap, LINE_LIMIT);
+            let lines = LineTap::new(tap.clone(), LINE_LIMIT);
             let ended = Arc::new(Mutex::new(Ended::default()));
             let guard = EndGuard(ended.clone());
             let writes = ended.clone();
@@ -235,7 +253,8 @@ mod tapped_stdout {
                 .name("stdio-stdout".into())
                 .spawn(move || {
                     let _guard = guard;
-                    forward(
+                    let tap_end = TapEnd(tap);
+                    let end = forward(
                         source.as_fd(),
                         exit_notice.as_fd(),
                         |bytes| {
@@ -248,6 +267,10 @@ mod tapped_stdout {
                         spawned_at,
                         DRAIN,
                     );
+                    // The tap first, so that what it stops has stopped by
+                    // the time the end is logged.
+                    drop(tap_end);
+                    end.log();
                 })?;
             Ok(Self {
                 thread,
@@ -398,6 +421,50 @@ mod tapped_stdout {
         }
     }
 
+    /// Why [`forward`] stopped copying.
+    #[derive(Debug)]
+    enum End {
+        /// Every writer closed the pipe.
+        Eof,
+        /// The drain ended before EOF, for this reason.
+        Drained(&'static str),
+        /// hcom's stdout refused a write: EPIPE once the client closed it.
+        WriteFailed(std::io::Error),
+        ReadFailed(Errno),
+        PollFailed(Errno),
+    }
+
+    impl End {
+        fn log(&self) {
+            match self {
+                Self::Eof => {}
+                Self::Drained(why) => crate::log::log_info(
+                    "launcher",
+                    "stdio.stdout_drain_ended",
+                    &format!("stopped copying the exited child's stdout: {why}"),
+                ),
+                Self::WriteFailed(error) if error.kind() == ErrorKind::BrokenPipe => {
+                    crate::log::log_info(
+                        "launcher",
+                        "stdio.stdout_client_closed",
+                        "the client closed stdout: the copy stopped, and the child's pipe closes with it",
+                    )
+                }
+                Self::WriteFailed(error) => crate::log::log_warn(
+                    "launcher",
+                    "stdio.stdout_write_failed",
+                    &error.to_string(),
+                ),
+                Self::ReadFailed(errno) => {
+                    crate::log::log_warn("launcher", "stdio.stdout_read_failed", &errno.to_string())
+                }
+                Self::PollFailed(errno) => {
+                    crate::log::log_warn("launcher", "stdio.stdout_poll_failed", &errno.to_string())
+                }
+            }
+        }
+    }
+
     /// Copy `source` to `write` chunk by chunk as it arrives, then show the
     /// tap each complete line. Ends at EOF or a failed write, or, once
     /// `exited` reports the child reaped, as [`DrainLimits`] allow.
@@ -415,7 +482,7 @@ mod tapped_stdout {
         mut lines: LineTap,
         spawned_at: SystemTime,
         limits: DrainLimits,
-    ) {
+    ) -> End {
         let mut buf = vec![0; 64 * 1024];
         let mut empty_at = spawned_at;
         let mut drain: Option<Drain> = None;
@@ -429,20 +496,12 @@ mod tapped_stdout {
             match poll(&mut fds[..watched], timeout) {
                 // Only a drain has a timeout: the pipe stayed empty.
                 Ok(0) if drain.as_ref().is_some_and(Drain::expired) => {
-                    drain_ended("it stayed empty, held open by a descendant");
-                    return;
+                    return End::Drained("it stayed empty, held open by a descendant");
                 }
                 Ok(0) => continue,
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
-                Err(errno) => {
-                    crate::log::log_warn(
-                        "launcher",
-                        "stdio.stdout_poll_failed",
-                        &errno.to_string(),
-                    );
-                    return;
-                }
+                Err(errno) => return End::PollFailed(errno),
             }
             if drain.is_none() && fds[1].revents().is_some_and(|events| !events.is_empty()) {
                 drain = Some(Drain::start(pending(source), limits));
@@ -454,29 +513,15 @@ mod tapped_stdout {
             let capacity = pipe_capacity(source).min(buf.len());
             let before = SystemTime::now();
             let read = match nix::unistd::read(source, &mut buf) {
-                Ok(0) => return,
+                Ok(0) => return End::Eof,
                 Ok(read) => read,
                 Err(Errno::EINTR | Errno::EAGAIN) => continue,
-                Err(errno) => {
-                    crate::log::log_warn(
-                        "launcher",
-                        "stdio.stdout_read_failed",
-                        &errno.to_string(),
-                    );
-                    return;
-                }
+                Err(errno) => return End::ReadFailed(errno),
             };
             if let Err(error) = write(&buf[..read]) {
                 // Returning drops the read end, so the child gets the same
                 // EPIPE it would have received writing to the client's pipe.
-                if error.kind() != ErrorKind::BrokenPipe {
-                    crate::log::log_warn(
-                        "launcher",
-                        "stdio.stdout_write_failed",
-                        &error.to_string(),
-                    );
-                }
-                return;
+                return End::WriteFailed(error);
             }
             lines.push(&buf[..read], empty_at);
             let drained = read < capacity;
@@ -486,19 +531,9 @@ mod tapped_stdout {
             if let Some(drain) = &mut drain
                 && drain.read(read, drained)
             {
-                drain_ended("it was empty once the cap had passed");
-                return;
+                return End::Drained("it was empty once the cap had passed");
             }
         }
-    }
-
-    /// The drain ended before EOF on the child's stdout pipe.
-    fn drain_ended(why: &str) {
-        crate::log::log_info(
-            "launcher",
-            "stdio.stdout_drain_ended",
-            &format!("stopped copying the exited child's stdout: {why}"),
-        );
     }
 
     /// How many bytes the pipe can hold now, or 0 when that is unknown, so
@@ -633,6 +668,7 @@ mod tapped_stdout {
         enum Copied {
             Observed(Vec<u8>, SystemTime),
             Wrote(Vec<u8>),
+            Ended,
         }
 
         struct RecordingTap {
@@ -650,6 +686,10 @@ mod tapped_stdout {
             }
 
             fn child_exited(&self) {}
+
+            fn copy_ended(&self) {
+                self.log.lock().unwrap().push(Copied::Ended);
+            }
         }
 
         fn recording_tap(log: &Arc<Mutex<Vec<Copied>>>, panic_on_observe: bool) -> LineTap {
@@ -678,7 +718,7 @@ mod tapped_stdout {
             child: Option<std::io::PipeWriter>,
             /// Dropping it reports the child's exit.
             exited: Option<std::io::PipeWriter>,
-            copier: Option<std::thread::JoinHandle<()>>,
+            copier: Option<std::thread::JoinHandle<End>>,
         }
 
         impl Copier {
@@ -715,7 +755,7 @@ mod tapped_stdout {
                         lines,
                         at(1),
                         limits,
-                    );
+                    )
                 });
                 Self {
                     log: log.clone(),
@@ -758,15 +798,20 @@ mod tapped_stdout {
 
             /// Wait for the copy to end. A copy that never ends fails the
             /// test instead of hanging it.
-            fn wait(mut self) -> Vec<Copied> {
+            fn wait(self) -> Vec<Copied> {
+                self.wait_for_end().0
+            }
+
+            /// [`Self::wait`], with why the copy ended.
+            fn wait_for_end(mut self) -> (Vec<Copied>, End) {
                 let copier = self.copier.take().unwrap();
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while !copier.is_finished() {
                     assert!(Instant::now() < deadline, "the copy never ended");
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                copier.join().unwrap();
-                self.log.lock().unwrap().clone()
+                let end = copier.join().unwrap();
+                (self.log.lock().unwrap().clone(), end)
             }
         }
 
@@ -896,6 +941,7 @@ mod tapped_stdout {
                         assert_eq!(line, expected);
                         assert!(sent > *newline, "shown before its newline was written");
                     }
+                    Copied::Ended => panic!("forward itself never reports its end"),
                 }
             }
         }
@@ -1016,11 +1062,64 @@ mod tapped_stdout {
             );
             copy.child().write_all(b"{\"type\":\"result\"}\n").unwrap();
             let mut child = copy.child.take().unwrap();
-            assert!(copy.wait().is_empty(), "a line nobody received was shown");
+            let (copied, end) = copy.wait_for_end();
+            assert!(copied.is_empty(), "a line nobody received was shown");
+            assert!(
+                matches!(&end, End::WriteFailed(error) if error.kind() == ErrorKind::BrokenPipe),
+                "{end:?}"
+            );
             assert_eq!(
                 child.write_all(b"next\n").unwrap_err().kind(),
                 ErrorKind::BrokenPipe
             );
+        }
+
+        /// The copy thread tells the tap when the copy ends, however it
+        /// ends, and does not wait for the child: a client that closed
+        /// stdout ends it at hcom's first failed write, although the child,
+        /// whose last line went into the pipe without error, runs on and
+        /// writes nothing more.
+        #[test]
+        fn the_tap_learns_that_the_copy_ended_while_the_child_runs_on() {
+            for client_closed in [true, false] {
+                let (client, sink) = std::io::pipe().unwrap();
+                let (source, child) = std::io::pipe().unwrap();
+                let mut child = Some(child);
+                let _client = (!client_closed).then_some(client);
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let tap = Arc::new(RecordingTap {
+                    log: log.clone(),
+                    panic_on_observe: false,
+                });
+                let forwarder = Forwarder::spawn(source.into(), sink.into(), tap, at(1)).unwrap();
+                if client_closed {
+                    let child = child.as_mut().unwrap();
+                    child.write_all(b"{\"type\":\"result\"}\n").unwrap();
+                } else {
+                    // EOF: every writer of the pipe closed it.
+                    child = None;
+                }
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !forwarder.thread.is_finished() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "client_closed={client_closed}: the copy never ended"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                forwarder.thread.join().unwrap();
+                assert_eq!(
+                    *log.lock().unwrap(),
+                    [Copied::Ended],
+                    "client_closed={client_closed}"
+                );
+                if let Some(mut child) = child {
+                    assert_eq!(
+                        child.write_all(b"next\n").unwrap_err().kind(),
+                        ErrorKind::BrokenPipe
+                    );
+                }
+            }
         }
 
         #[test]

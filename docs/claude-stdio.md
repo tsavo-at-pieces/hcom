@@ -40,16 +40,21 @@ launch banner, or redirect output to a background log. Native `SessionStart`
 binds the real session ID. Signals reach the child's process group; hcom returns
 its exit status and cleans up its registration if `SessionEnd` was not emitted.
 For a stream-json launch, hcom refreshes the session's heartbeat every 5
-seconds until the child is reaped, so an idle pipe client is not reported
-stale. A single statement sets only the heartbeat, on the row that this
+seconds while the child runs and hcom still copies its stdout, so an idle
+pipe client is not reported stale. The refreshes stop when the child is
+reaped and when the copy ends, whichever comes first: a client that closes
+stdout ends the copy at hcom's next write, while Claude, whose last frames
+went into hcom's pipe without error, may wait on stdin and never write again.
+A refresh already under way then may still land, with a time taken before.
+A single statement sets only the heartbeat, on the row that this
 launch's process binding, launch token and row incarnation still name: a
 stopped row, or one another launch replaced or took over, is never touched.
 Like a PTY's delivery loop, it keeps any row that has not stopped live, busy
 ones included: a turn running one tool for more than 5 minutes stays
 `active` rather than reading as stale, and so does a row whose turn end hcom
-could not record (below), until the next hook or until Claude exits. Other
-output formats get no heartbeat, so their idle rows read as stale after 10
-seconds.
+could not record (below), until the next hook, until the copy ends or until
+Claude exits. Other output formats get no heartbeat, so their idle rows read
+as stale after 10 seconds.
 
 The client owns turn completion and idle input. `Stop` drains messages already
 queued, then returns immediately when none remain. Messages arriving while the

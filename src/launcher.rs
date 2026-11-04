@@ -2779,15 +2779,36 @@ fn stdio_stdout_tap(
 }
 
 /// Reads a Claude stream-json client's turn ends off its copied stdout and
-/// keeps the idle row live. The copy thread only classifies lines and queues
-/// the few that end a turn; a recorder thread with its own connection makes
-/// every database read and write, in the order the frames were read.
+/// keeps the idle row live while hcom still copies that stdout. The copy
+/// thread only classifies lines and queues the few that end a turn; a
+/// recorder thread with its own connection makes every database read and
+/// write, in the order the frames were read.
 struct StdioTurnTap {
     turn_ends: Option<std::sync::mpsc::Sender<crate::hooks::claude::StdioTurnEnd>>,
-    /// Cleared once the child is reaped: no heartbeat after that.
-    child_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    life: std::sync::Arc<StdioLife>,
     /// Disconnects when the recorder thread exits. (A receiver is not `Sync`.)
     recorder_done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// What the supervisor and the copy thread tell the recorder: the heartbeat
+/// runs only while both hold.
+struct StdioLife {
+    /// Cleared once the child is reaped.
+    child_running: std::sync::atomic::AtomicBool,
+    /// Cleared once the copy of the child's stdout ends. A client that
+    /// closes stdout ends it at hcom's next write, while Claude, whose last
+    /// frames went into hcom's pipe without error, may wait on stdin for
+    /// good: nothing then reaches the client, and the row must not look
+    /// live.
+    copying: std::sync::atomic::AtomicBool,
+}
+
+impl StdioLife {
+    fn live(&self) -> bool {
+        self.child_running
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.copying.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl StdioTurnTap {
@@ -2803,27 +2824,31 @@ impl StdioTurnTap {
     ) -> Result<Self> {
         let (turn_ends, queue) = std::sync::mpsc::channel();
         let (done, recorder_done) = std::sync::mpsc::channel::<()>();
-        let child_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let running = child_running.clone();
+        let life = std::sync::Arc::new(StdioLife {
+            child_running: std::sync::atomic::AtomicBool::new(true),
+            copying: std::sync::atomic::AtomicBool::new(true),
+        });
+        let recorder_life = life.clone();
         let process_id = process_id.to_string();
         std::thread::Builder::new()
             .name("stdio-recorder".into())
             .spawn(move || {
                 let _done = done;
-                record_stdio_turns(recorder_db, &process_id, &queue, &running, heartbeat);
+                record_stdio_turns(recorder_db, &process_id, &queue, &recorder_life, heartbeat);
             })?;
         Ok(Self {
             turn_ends: Some(turn_ends),
-            child_running,
+            life,
             recorder_done: std::sync::Mutex::new(recorder_done),
         })
     }
 }
 
 /// The recorder thread: applies queued turn ends in order and, while the
-/// child runs, refreshes the heartbeat every `interval`. A refresh that
-/// passed its check before the reap was reported may land after it, but
-/// records a time taken before that report.
+/// child runs and its stdout is still copied, refreshes the heartbeat every
+/// `interval`. A refresh that passed its check before the reap or the end of
+/// the copy was reported may land after it, but records a time taken before
+/// that report.
 ///
 /// A turn end that another room writer's lock kept out past the busy
 /// timeout is tried again, before anything queued after it, until it is
@@ -2834,7 +2859,7 @@ fn record_stdio_turns(
     mut db: HcomDb,
     process_id: &str,
     queue: &std::sync::mpsc::Receiver<crate::hooks::claude::StdioTurnEnd>,
-    running: &std::sync::atomic::AtomicBool,
+    life: &StdioLife,
     interval: std::time::Duration,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
@@ -2854,7 +2879,11 @@ fn record_stdio_turns(
                 if let Err(error) =
                     crate::hooks::claude::record_stdio_turn_end(&db, process_id, &end)
                 {
-                    if room_busy(&error) && running.load(std::sync::atomic::Ordering::Acquire) {
+                    if room_busy(&error)
+                        && life
+                            .child_running
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
                         crate::log::log_info("launcher", "stdio.turn_end_busy", &error.to_string());
                         refused = Some(end);
                         std::thread::sleep(STDIO_BUSY_RETRY);
@@ -2870,7 +2899,7 @@ fn record_stdio_turns(
             Err(RecvTimeoutError::Timeout) => {
                 next_beat = std::time::Instant::now() + interval;
                 let now = crate::shared::time::now_epoch_i64();
-                if running.load(std::sync::atomic::Ordering::Acquire) {
+                if life.live() {
                     db.reconnect_if_stale();
                     if let Err(error) = db.update_stdio_heartbeat(process_id, now) {
                         crate::log::log_warn(
@@ -2912,7 +2941,14 @@ impl crate::sys::process::StdoutTap for StdioTurnTap {
     }
 
     fn child_exited(&self) {
-        self.child_running
+        self.life
+            .child_running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn copy_ended(&self) {
+        self.life
+            .copying
             .store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -4960,25 +4996,33 @@ mod tests {
     }
 
     #[test]
-    fn stdio_tap_heartbeat_stops_when_the_child_is_reaped() {
+    fn stdio_tap_heartbeat_stops_when_the_child_is_reaped_or_the_copy_ends() {
         use crate::sys::process::StdoutTap;
 
-        let dir = tempfile::tempdir().unwrap();
-        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        let last_stop = || db.get_instance_full("nova").unwrap().unwrap().last_stop;
-        stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
-        let tap =
-            StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20)).unwrap();
-        wait_until("no heartbeat", || last_stop() > 1);
-        tap.child_exited();
-        // A refresh already under way may still land; none starts after it.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        db.conn()
-            .execute("UPDATE instances SET last_stop = 1 WHERE name = 'nova'", [])
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(last_stop(), 1, "heartbeat continued after the reap");
-        drop(tap);
+        type Stop = (&'static str, fn(&StdioTurnTap));
+        let stops: [Stop; 2] = [
+            ("the reap", |tap| tap.child_exited()),
+            // The client closed stdout while Claude waits on stdin.
+            ("the end of the copy", |tap| tap.copy_ended()),
+        ];
+        for (stop, apply) in stops {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+            let last_stop = || db.get_instance_full("nova").unwrap().unwrap().last_stop;
+            stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
+            let tap = StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20))
+                .unwrap();
+            wait_until("no heartbeat", || last_stop() > 1);
+            apply(&tap);
+            // A refresh already under way may still land; none starts after it.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            db.conn()
+                .execute("UPDATE instances SET last_stop = 1 WHERE name = 'nova'", [])
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(last_stop(), 1, "heartbeat continued after {stop}");
+            drop(tap);
+        }
     }
 
     #[test]

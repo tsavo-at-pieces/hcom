@@ -437,6 +437,107 @@ fn claude_stdio_text_output_starts_no_heartbeat() {
     assert_no_registered_instances(&h);
 }
 
+/// A client that closes stdout but keeps stdin open ends the copy at hcom's
+/// next write. Claude's last frame went into hcom's pipe without error, and
+/// Claude then waits on stdin and writes nothing more, so it never meets the
+/// broken pipe. The heartbeat stops with the copy, as it does at the reap:
+/// nothing reaches the client any longer, so the row must not look live.
+#[test]
+fn claude_stdio_heartbeat_stops_with_the_copy_when_the_client_closes_stdout() {
+    let h = Hcom::new();
+    let wrote = h.root_path().join("wrote");
+    h.set_launch_envs(&[
+        ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
+        ("FAKE_WROTE", wrote.to_str().unwrap()),
+    ]);
+    install_fake_claude(
+        &h,
+        r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=5f2a8c1d-7e3b-4d9a-b6c4-1e0f9a8b7c6d
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
+hook poll "{\"session_id\":\"$sid\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false}"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
+IFS= read -r line
+# The client has closed stdout by now; this still goes into hcom's pipe.
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}\n' "$sid"
+: > "$FAKE_WROTE"
+IFS= read -r line
+exit 0
+"##,
+    );
+    let mut hcom = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = hcom.stdin.take().unwrap();
+    let mut stdout = BufReader::new(hcom.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains("\"subtype\":\"init\""), "{line}");
+    let reset_heartbeat = || {
+        rusqlite::Connection::open(h.hcom_dir.join("hcom.db"))
+            .unwrap()
+            .execute("UPDATE instances SET last_stop = 1", [])
+            .unwrap();
+    };
+    // While the client reads, the heartbeat runs.
+    reset_heartbeat();
+    h.eventually("the heartbeat", Duration::from_secs(60), || {
+        Ok((only_last_stop(&h) > 1).then_some(()))
+    });
+    drop(stdout);
+    writeln!(stdin, "{{\"type\":\"user\"}}").unwrap();
+    stdin.flush().unwrap();
+    // Only a precondition: a loaded host may take long to run the shim.
+    h.eventually("Claude's last frame", Duration::from_secs(300), || {
+        Ok(wrote.exists().then_some(()))
+    });
+    let log = h.hcom_dir.join(".tmp/logs/hcom.log");
+    h.eventually(
+        "the copy to stop at the closed stdout",
+        Duration::from_secs(60),
+        || {
+            Ok(fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("\"event\":\"stdio.stdout_client_closed\"")
+                .then_some(()))
+        },
+    );
+    // A refresh already under way may still land; none starts after the end
+    // of the copy, which hcom reports before it logs that end.
+    std::thread::sleep(Duration::from_secs(1));
+    reset_heartbeat();
+    // More than two heartbeat intervals, with Claude still waiting on stdin.
+    std::thread::sleep(Duration::from_secs(12));
+    assert_eq!(only_last_stop(&h), 1, "the heartbeat outlived the copy");
+    assert!(
+        hcom.try_wait().unwrap().is_none(),
+        "Claude stopped waiting on stdin"
+    );
+    drop(stdin);
+    assert_eq!(
+        wait_for_hcom(&h, &mut hcom, Duration::from_secs(60)).code(),
+        Some(0)
+    );
+    assert_no_registered_instances(&h);
+}
+
 /// A client pipe filled to capacity, so hcom's first write to it waits for
 /// the client. Returns the client's end, hcom's end and the filler's size.
 fn full_client_pipe() -> (std::io::PipeReader, std::io::PipeWriter, usize) {

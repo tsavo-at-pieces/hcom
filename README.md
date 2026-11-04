@@ -212,7 +212,8 @@ hcom copies stdout to the client byte for byte and, before it exits, delivers
 all of Claude's output to a client that keeps reading (a signal can end that
 wait), marks a client-cancelled turn `listening`/`interrupted` when it can
 tell that turn from the next, and refreshes the session's heartbeat while the
-child runs. See [Claude pipe clients](docs/claude-stdio.md).
+child runs and hcom still copies its stdout. See
+[Claude pipe clients](docs/claude-stdio.md).
 
 For subagents, run `hcom claude`, then prompt:
 
