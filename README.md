@@ -208,8 +208,9 @@ hcom claude --headless            # Run normal claude in background pty (works f
 Pipe clients can use `hcom claude --stdio --go -- -p ...` on Unix to retain
 their stdin/stdout/stderr and native exit status. This keeps SDK control frames
 out of a PTY and allows each turn to complete. With `--output-format stream-json`,
-hcom forwards stdout byte-for-byte and marks a client-cancelled turn
-`listening`/`interrupted`. The session heartbeats while the child runs. See
+hcom copies stdout to the client byte for byte, delivering all of Claude's
+output before it exits, marks a client-cancelled turn `listening`/`interrupted`
+and keeps the idle session's heartbeat while the child runs. See
 [Claude pipe clients](docs/claude-stdio.md).
 
 For subagents, run `hcom claude`, then prompt:

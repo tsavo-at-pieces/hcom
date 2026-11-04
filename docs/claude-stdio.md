@@ -6,11 +6,17 @@ such as the Claude Agent SDK, whose JSON control channel cannot run in a PTY.
 The client must supply its own native Claude flags, including `-p`/`--print`.
 hcom preserves the native arguments and does not add stream format defaults.
 
-With `--output-format stream-json`, the SDK protocol, hcom forwards Claude's
-stdout to the caller byte-for-byte: it never adds, alters or reorders output,
-and a caller that closes stdout gives Claude the same broken pipe as before.
-This lets hcom see the `result` frame that ends every turn. Other output
-formats are inherited directly.
+With `--output-format stream-json`, the SDK protocol, Claude writes stdout
+into a pipe that hcom copies to the caller byte for byte: each chunk is
+written as soon as it is read, and nothing is added, changed, reordered or
+held back for a whole line. hcom reads the copied lines only to find the
+frames that end a turn. A caller that closes stdout gives Claude the broken
+pipe it would otherwise get. Everything Claude wrote before it exited reaches
+a caller that keeps stdout open, however slowly it reads, before hcom exits.
+If a descendant of Claude still holds the pipe, hcom stops copying once it
+has been empty for 5 seconds or, while the descendant keeps writing, the next
+time it is empty after 30 seconds. stdin and stderr are inherited, and so is
+stdout for any other output format and for Codex.
 
 hcom prepares its usual per-launch hooks, reserves a fresh process identity,
 and remains the native child's parent. The child runs the executable a lookup
@@ -24,9 +30,13 @@ not the environment of the hcom process itself. It does not create a terminal, p
 launch banner, or redirect output to a background log. Native `SessionStart`
 binds the real session ID. Signals reach the child's process group; hcom returns
 its exit status and cleans up its registration if `SessionEnd` was not emitted.
-While the child runs, hcom refreshes the session's heartbeat every few seconds,
-so an idle pipe client is not reported stale. It never revives a stopped or
-replaced row.
+For a stream-json launch, hcom refreshes the session's heartbeat every 5
+seconds until the child is reaped, so an idle pipe client is not reported
+stale. A single statement sets only the heartbeat, on the row that this
+launch's process binding, launch token and row incarnation still name: a
+stopped row, or one another launch replaced or took over, is never touched.
+Other output formats get no heartbeat, so their idle rows read as stale after
+10 seconds.
 
 The client owns turn completion and idle input. `Stop` drains messages already
 queued, then returns immediately when none remain. Messages arriving while the
@@ -37,10 +47,18 @@ only after hook output has been flushed, as in the other native modes.
 A turn the client cancels runs no `Stop` hook. When its `result` frame reports
 an aborted turn, hcom marks the session `listening` with context `interrupted`
 (another turn that ends without `Stop` is marked `listening` too, or with a
-`failure:<reason>` context for an error). hcom reads the session's state before
-it forwards the frame and records the change just after, so it never overwrites
-a later prompt, a stopped session or another session's row. Queued messages
-still wait for the next native prompt.
+`failure:<reason>` context for an error). A `session_state_changed` frame with
+state `idle`, which Claude writes after each result when the client enables
+session state events, marks a session that is still busy `listening`. A result
+followed by a queued turn, or written during a shutdown, changes nothing.
+hcom records these off the stdout copy, so a busy database never delays
+output, and only while the row is still this launch's, in the frame's session
+and `active` or `blocked`, with no prompt or prompt delivery recorded since
+the frame may have been written (the last time hcom saw the pipe empty before
+reading it). When hcom cannot tell, for example because it read a whole turn
+at once, the status stays as the hooks left it. Nothing on stdout stops a
+session or delivers a message: queued messages still wait for the next native
+prompt.
 
 `--stdio` supports one local Claude print or Codex app-server process. It
 cannot be combined with multiple agents, an unsupported tool, a remote device,
