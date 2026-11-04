@@ -2583,8 +2583,9 @@ fn launch_stdio(
         .get_instance_full(instance_name)?
         .ok_or_else(|| anyhow::anyhow!("stdio launch registration disappeared"))?
         .created_at;
+    let stdout_tap = stdio_stdout_tap(tool, db, &params.args, process_id);
     let mut child_pid = 0;
-    let exit_code = crate::sys::process::run_stdio_child(&mut command, |pid| {
+    let exit_code = crate::sys::process::run_stdio_child(&mut command, stdout_tap, |pid| {
         child_pid = pid;
         db.store_launch_context(
             instance_name,
@@ -2738,6 +2739,396 @@ fn valid_codex_stdio_args(args: &[String]) -> bool {
         i += 1;
     }
     app_server
+}
+
+/// Half the heartbeat age at which a listening row without a TCP endpoint
+/// looks stale ([`crate::instance_lifecycle::HEARTBEAT_THRESHOLD_NO_TCP`]).
+const STDIO_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the post-exit cleanup waits for the tap's recorder to apply what
+/// it has queued.
+const STDIO_RECORDER_FINISH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The pause before the recorder tries again a turn end that another room
+/// writer's lock refused; each try already waits out the busy timeout.
+const STDIO_BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Only a Claude stream-json client needs its turn ends read from stdout:
+/// a cancelled turn there runs no Stop hook, while Codex reports one through
+/// its own Interrupt hook. Every other launch keeps the inherited stdout.
+fn stdio_stdout_tap(
+    tool: &str,
+    db: &HcomDb,
+    args: &[String],
+    process_id: &str,
+) -> Option<Box<dyn crate::sys::process::StdoutTap>> {
+    if tool != "claude" {
+        return None;
+    }
+    let formats = crate::hooks::runtime::take_flag_values(&mut args.to_vec(), &["--output-format"]);
+    if formats.last().map(String::as_str) != Some("stream-json") {
+        return None;
+    }
+    match StdioTurnTap::start(db, process_id, STDIO_HEARTBEAT_INTERVAL) {
+        Ok(tap) => Some(Box::new(tap)),
+        Err(error) => {
+            crate::log::log_warn("launcher", "stdio.turn_tap_failed", &error.to_string());
+            None
+        }
+    }
+}
+
+/// Reads a Claude stream-json client's turn ends off its copied stdout and
+/// keeps the idle row live while hcom still copies that stdout. The copy
+/// thread only classifies lines and queues the few the recorder needs; a
+/// recorder thread with its own connection makes every database read and
+/// write, in the order the frames were read.
+struct StdioTurnTap {
+    copied: Option<std::sync::mpsc::Sender<StdioCopied>>,
+    life: std::sync::Arc<StdioLife>,
+    /// Only the copy thread uses it.
+    watch: std::sync::Mutex<StdioWatch>,
+    /// Disconnects when the recorder thread exits. (A receiver is not `Sync`.)
+    recorder_done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// What the copy hands the recorder, in the order it read it.
+enum StdioCopied {
+    TurnEnd(crate::hooks::claude::StdioTurnEnd),
+    /// After the turn ends handed over since the last of these, the copy
+    /// found Claude's pipe empty and not full, at a line's end, and read no
+    /// frame of a later turn in between: a deferred one is reconciled
+    /// ([`crate::hooks::claude::reconcile_stdio_turn_end`]).
+    Drained,
+    /// A deferred turn end can no longer be reconciled, for this reason.
+    Unreconcilable(&'static str),
+}
+
+/// What the copy thread has seen of the turn ends it handed over.
+#[derive(Default)]
+struct StdioWatch {
+    /// Claude has written a session state frame, so it writes `running`
+    /// before each turn's prompt hook too.
+    reports_state: bool,
+    /// The last turn end handed over (whether it was the idle frame), while
+    /// neither an empty pipe nor a frame of a later turn has followed it.
+    awaiting: Option<bool>,
+}
+
+const STDIO_LATER_TURN: &str =
+    "the copy read a frame of a later turn before it found the pipe empty";
+
+/// What the supervisor and the copy thread tell the recorder: the heartbeat
+/// runs only while both hold.
+struct StdioLife {
+    /// Cleared once the child is reaped.
+    child_running: std::sync::atomic::AtomicBool,
+    /// Cleared once the copy of the child's stdout ends. A client that
+    /// closes stdout ends it at hcom's next write, while Claude, whose last
+    /// frames went into hcom's pipe without error, may wait on stdin for
+    /// good: nothing then reaches the client, and the row must not look
+    /// live.
+    copying: std::sync::atomic::AtomicBool,
+}
+
+impl StdioLife {
+    fn live(&self) -> bool {
+        self.child_running
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.copying.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl StdioTurnTap {
+    fn start(db: &HcomDb, process_id: &str, heartbeat: std::time::Duration) -> Result<Self> {
+        Self::start_recording(HcomDb::open_at(db.path())?, process_id, heartbeat)
+    }
+
+    /// [`Self::start`] with the recorder's own connection.
+    fn start_recording(
+        recorder_db: HcomDb,
+        process_id: &str,
+        heartbeat: std::time::Duration,
+    ) -> Result<Self> {
+        let (copied, queue) = std::sync::mpsc::channel();
+        let (done, recorder_done) = std::sync::mpsc::channel::<()>();
+        let life = std::sync::Arc::new(StdioLife {
+            child_running: std::sync::atomic::AtomicBool::new(true),
+            copying: std::sync::atomic::AtomicBool::new(true),
+        });
+        let recorder_life = life.clone();
+        let process_id = process_id.to_string();
+        std::thread::Builder::new()
+            .name("stdio-recorder".into())
+            .spawn(move || {
+                let _done = done;
+                record_stdio_turns(recorder_db, &process_id, &queue, &recorder_life, heartbeat);
+            })?;
+        Ok(Self {
+            copied: Some(copied),
+            life,
+            watch: Default::default(),
+            recorder_done: std::sync::Mutex::new(recorder_done),
+        })
+    }
+
+    fn hand_over(&self, copied: StdioCopied) {
+        if let Some(sender) = &self.copied {
+            // A recorder that is gone only ends the recording.
+            let _ = sender.send(copied);
+        }
+    }
+
+    fn watch(&self) -> std::sync::MutexGuard<'_, StdioWatch> {
+        self.watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The recorder thread: applies what the copy hands over in order and,
+/// while the child runs and its stdout is still copied, refreshes the
+/// heartbeat every `interval`. A refresh that passed its check before the
+/// reap or the end of the copy was reported may land after it, but records
+/// a time taken before that report.
+///
+/// A turn end that another room writer's lock kept out past the busy
+/// timeout is tried again, before anything queued after it, until it is
+/// recorded or refused, while the child runs, and so is a reconciliation.
+/// That is safe however late: their guards refuse them once a later turn has
+/// started or the row has moved on. Once the child is reaped, the post-exit
+/// cleanup takes over.
+///
+/// A turn end that only the turn-start check refused is deferred: it waits
+/// for [`StdioCopied::Drained`] and is then reconciled once, or dropped at
+/// [`StdioCopied::Unreconcilable`]. The idle frame after a deferred result
+/// leaves the result waiting, which says more.
+fn record_stdio_turns(
+    mut db: HcomDb,
+    process_id: &str,
+    queue: &std::sync::mpsc::Receiver<StdioCopied>,
+    life: &StdioLife,
+    interval: std::time::Duration,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut next_beat = std::time::Instant::now() + interval;
+    let mut refused = None;
+    let mut deferred = None;
+    loop {
+        let next = match refused.take() {
+            Some(copied) => Ok(copied),
+            None => {
+                queue.recv_timeout(next_beat.saturating_duration_since(std::time::Instant::now()))
+            }
+        };
+        match next {
+            Ok(copied) => {
+                db.reconnect_if_stale();
+                if let Err(error) = apply_stdio_copied(&db, process_id, &copied, &mut deferred) {
+                    if room_busy(&error)
+                        && life
+                            .child_running
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        crate::log::log_info("launcher", "stdio.turn_end_busy", &error.to_string());
+                        refused = Some(copied);
+                        std::thread::sleep(STDIO_BUSY_RETRY);
+                    } else {
+                        crate::log::log_warn(
+                            "launcher",
+                            "stdio.turn_end_failed",
+                            &error.to_string(),
+                        );
+                        if let StdioCopied::Drained = copied {
+                            deferred = None;
+                        }
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                next_beat = std::time::Instant::now() + interval;
+                let now = crate::shared::time::now_epoch_i64();
+                if life.live() {
+                    db.reconnect_if_stale();
+                    if let Err(error) = db.update_stdio_heartbeat(process_id, now) {
+                        crate::log::log_warn(
+                            "launcher",
+                            "stdio.heartbeat_failed",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Apply one thing the copy handed over. An error leaves `deferred` as it
+/// was, so that the same thing can be tried again.
+fn apply_stdio_copied(
+    db: &HcomDb,
+    process_id: &str,
+    copied: &StdioCopied,
+    deferred: &mut Option<crate::hooks::claude::StdioTurnEnd>,
+) -> Result<()> {
+    use crate::hooks::claude::{
+        StdioTurnEndOutcome, reconcile_stdio_turn_end, record_stdio_turn_end,
+    };
+
+    match copied {
+        StdioCopied::TurnEnd(end) => match record_stdio_turn_end(db, process_id, end)? {
+            StdioTurnEndOutcome::Deferred => {
+                if deferred.is_none() {
+                    crate::log::log_info(
+                        "launcher",
+                        "stdio.turn_end_deferred",
+                        "a prompt was recorded since the copy last found the pipe empty before the frame: kept until it finds it empty after",
+                    );
+                    *deferred = Some(end.clone());
+                }
+            }
+            StdioTurnEndOutcome::Recorded | StdioTurnEndOutcome::Refused => *deferred = None,
+        },
+        StdioCopied::Drained => {
+            if let Some(end) = deferred {
+                if !reconcile_stdio_turn_end(db, process_id, end)? {
+                    crate::log::log_info(
+                        "launcher",
+                        "stdio.turn_end_dropped",
+                        "the deferred turn end was refused once the copy found the pipe empty",
+                    );
+                }
+                *deferred = None;
+            }
+        }
+        StdioCopied::Unreconcilable(why) => {
+            if deferred.take().is_some() {
+                crate::log::log_info("launcher", "stdio.turn_end_dropped", why);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether another room writer's lock kept `error`'s write out.
+fn room_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    })
+}
+
+impl crate::sys::process::StdoutTap for StdioTurnTap {
+    /// Hands over each turn end, and, once one is handed over, watches what
+    /// follows: a frame of a later turn makes a deferred turn end
+    /// unreconcilable, and so does a second turn end, but for the idle frame
+    /// right after a result.
+    fn observe(
+        &self,
+        line: &[u8],
+        emitted_after: std::time::SystemTime,
+        read_at: std::time::SystemTime,
+    ) {
+        use crate::hooks::claude::StdioFrame;
+
+        let mut watch = self.watch();
+        let turn_frames = watch.awaiting.is_some();
+        match crate::hooks::claude::stdio_frame(line, emitted_after, read_at, turn_frames) {
+            StdioFrame::TurnEnd(end) => {
+                if let Some(after_idle) = watch.awaiting
+                    && (after_idle || !end.idle())
+                {
+                    self.hand_over(StdioCopied::Unreconcilable(STDIO_LATER_TURN));
+                }
+                watch.reports_state |= end.idle();
+                watch.awaiting = Some(end.idle());
+                self.hand_over(StdioCopied::TurnEnd(end));
+            }
+            StdioFrame::TurnState => {
+                watch.reports_state = true;
+                if watch.awaiting.take().is_some() {
+                    self.hand_over(StdioCopied::Unreconcilable(STDIO_LATER_TURN));
+                }
+            }
+            StdioFrame::TurnFrame => {
+                if watch.awaiting.take().is_some() {
+                    self.hand_over(StdioCopied::Unreconcilable(STDIO_LATER_TURN));
+                }
+            }
+            StdioFrame::Other => {}
+        }
+    }
+
+    fn skipped(&self) {
+        if self.watch().awaiting.take().is_some() {
+            self.hand_over(StdioCopied::Unreconcilable(
+                "the copy read a line too long to tell before it found the pipe empty",
+            ));
+        }
+    }
+
+    fn emptied(&self) {
+        let mut watch = self.watch();
+        if watch.awaiting.take().is_some() {
+            self.hand_over(if watch.reports_state {
+                StdioCopied::Drained
+            } else {
+                StdioCopied::Unreconcilable(
+                    "Claude reports no session state, so a later turn would write nothing before its prompt hook",
+                )
+            });
+        }
+    }
+
+    fn child_exited(&self) {
+        self.life
+            .child_running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// No further empty pipe can be seen, so a deferred turn end is dropped.
+    fn copy_ended(&self) {
+        self.life
+            .copying
+            .store(false, std::sync::atomic::Ordering::Release);
+        if self.watch().awaiting.take().is_some() {
+            self.hand_over(StdioCopied::Unreconcilable(
+                "the copy ended before it found the pipe empty",
+            ));
+        }
+    }
+}
+
+impl Drop for StdioTurnTap {
+    /// The recorder applies what is queued, then exits. One still waiting on
+    /// the database after [`STDIO_RECORDER_FINISH`] is left to the post-exit
+    /// cleanup, which removes this launch's binding: a late write then
+    /// matches no row.
+    fn drop(&mut self) {
+        self.copied.take();
+        let done = self
+            .recorder_done
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            done.recv_timeout(STDIO_RECORDER_FINISH)
+        {
+            crate::log::log_warn(
+                "launcher",
+                "stdio.recorder_busy",
+                "turn ends still queued at exit are left to cleanup",
+            );
+        }
+    }
 }
 
 /// Validate tool args (pure parsing, no mutation).
@@ -4696,5 +5087,395 @@ mod tests {
         assert!(win.contains_key("MY_SECRET") && !win.contains_key("HCOM_X"));
         let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
+    }
+
+    /// `name` as a stdio launch of `process_id` leaves it: bound, with its token.
+    fn stdio_launch_row(db: &HcomDb, name: &str, process_id: &str, session_id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, created_at, last_stop, launch_context)
+                 VALUES (?1, ?2, 'claude', 'listening', '', ?3, 1, json_object('process_id', ?4))",
+                rusqlite::params![
+                    name,
+                    session_id,
+                    crate::shared::time::now_epoch_f64(),
+                    process_id
+                ],
+            )
+            .unwrap();
+        db.set_process_binding(process_id, session_id, name)
+            .unwrap();
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn stdio_tap_heartbeat_never_touches_a_row_another_launch_recreated() {
+        for bindings_kept in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+            let last_stop = || db.get_instance_full("kole").unwrap().unwrap().last_stop;
+            // A native `--resume` bound the process to the restored identity.
+            stdio_launch_row(&db, "kole", "stdio-proc", "sess-r");
+            let tap = StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20))
+                .unwrap();
+            wait_until("no heartbeat", || last_stop() > 1);
+
+            // Stopped between two ticks, then recreated by a newer launch of
+            // the same conversation. With its binding kept, this launch's
+            // binding still names the row: the name, and the incarnation read
+            // back by that name, match the successor.
+            db.delete_instance("kole").unwrap();
+            if !bindings_kept {
+                db.delete_process_bindings_for_instance("kole").unwrap();
+            }
+            stdio_launch_row(&db, "kole", "next-proc", "sess-r");
+            assert_eq!(
+                db.get_process_binding("stdio-proc").unwrap().is_some(),
+                bindings_kept
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(
+                last_stop(),
+                1,
+                "bindings_kept={bindings_kept}: the old launch refreshed its successor's row"
+            );
+            drop(tap);
+        }
+    }
+
+    #[test]
+    fn stdio_tap_heartbeat_stops_when_the_child_is_reaped_or_the_copy_ends() {
+        use crate::sys::process::StdoutTap;
+
+        type Stop = (&'static str, fn(&StdioTurnTap));
+        let stops: [Stop; 2] = [
+            ("the reap", |tap| tap.child_exited()),
+            // The client closed stdout while Claude waits on stdin.
+            ("the end of the copy", |tap| tap.copy_ended()),
+        ];
+        for (stop, apply) in stops {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+            let last_stop = || db.get_instance_full("nova").unwrap().unwrap().last_stop;
+            stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
+            let tap = StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_millis(20))
+                .unwrap();
+            wait_until("no heartbeat", || last_stop() > 1);
+            apply(&tap);
+            // A refresh already under way may still land; none starts after it.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            db.conn()
+                .execute("UPDATE instances SET last_stop = 1 WHERE name = 'nova'", [])
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(last_stop(), 1, "heartbeat continued after {stop}");
+            drop(tap);
+        }
+    }
+
+    #[test]
+    fn stdio_tap_records_turn_ends_in_order_off_the_copy_thread() {
+        use crate::sys::process::StdoutTap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
+        crate::instance_lifecycle::set_status(&db, "nova", "active", "prompt", Default::default());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let emitted_after = std::time::SystemTime::now();
+        let tap =
+            StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_secs(60)).unwrap();
+        // Held for the whole recording: observe never waits for the database.
+        db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        tap.observe(
+            br#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-1","terminal_reason":"aborted_streaming","queued_turn_count":0}"#,
+            emitted_after,
+            emitted_after,
+        );
+        // The idle frame that follows changes nothing: the result applied.
+        tap.observe(
+            br#"{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"sess-1"}"#,
+            emitted_after,
+            emitted_after,
+        );
+        tap.observe(b"not json", emitted_after, emitted_after);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        db.conn().execute_batch("COMMIT").unwrap();
+        drop(tap);
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(
+            (
+                row.status.as_str(),
+                row.status_context.as_str(),
+                row.status_detail.as_str()
+            ),
+            ("listening", "interrupted", "aborted_streaming")
+        );
+    }
+
+    #[test]
+    fn stdio_tap_retries_a_turn_end_the_busy_room_kept_out() {
+        use crate::sys::process::StdoutTap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        stdio_launch_row(&db, "nova", "stdio-proc", "sess-1");
+        crate::instance_lifecycle::set_status(&db, "nova", "active", "prompt", Default::default());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let emitted_after = std::time::SystemTime::now();
+        // A short busy timeout stands in for the room's 5 s one.
+        let recorder = HcomDb::open_at(db.path()).unwrap();
+        recorder
+            .conn()
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        let tap = StdioTurnTap::start_recording(
+            recorder,
+            "stdio-proc",
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let status = || {
+            let row = db.get_instance_full("nova").unwrap().unwrap();
+            (row.status, row.status_context)
+        };
+        // Another room writer holds the lock for many busy timeouts.
+        db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        tap.observe(
+            br#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-1","terminal_reason":"aborted_streaming","queued_turn_count":0}"#,
+            emitted_after,
+            emitted_after,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(status(), ("active".to_string(), "prompt".to_string()));
+        db.conn().execute_batch("COMMIT").unwrap();
+        wait_until("the turn end to land once the lock was released", || {
+            status() == ("listening".to_string(), "interrupted".to_string())
+        });
+        drop(tap);
+    }
+
+    const STDIO_RUNNING: &[u8] = br#"{"type":"system","subtype":"session_state_changed","state":"running","session_id":"sess-1"}"#;
+    const STDIO_ABORTED: &[u8] = br#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-1","terminal_reason":"aborted_streaming","queued_turn_count":0}"#;
+    const STDIO_IDLE: &[u8] = br#"{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"sess-1"}"#;
+
+    /// `nova`, a stdio launch's row in its cancelled turn, and the copy's
+    /// times for that turn's end: the pipe was last seen empty before the
+    /// prompt hook, and the read that took the frames began after it.
+    fn stdio_turn_read_whole(db: &HcomDb) -> (std::time::SystemTime, std::time::SystemTime) {
+        stdio_launch_row(db, "nova", "stdio-proc", "sess-1");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let emitted_after = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        crate::instance_lifecycle::set_status(db, "nova", "active", "prompt", Default::default());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        (emitted_after, std::time::SystemTime::now())
+    }
+
+    fn stdio_status(db: &HcomDb) -> (String, String, String) {
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        (row.status, row.status_context, row.status_detail)
+    }
+
+    /// A turn end the copy read with the rest of its turn waits until the
+    /// copy finds the pipe empty after it, with nothing of a later turn read
+    /// in between, and is then reconciled from its read. Anything that shows
+    /// or may hide a later turn drops it instead.
+    #[test]
+    fn stdio_tap_reconciles_a_turn_end_read_whole_once_the_copy_finds_the_pipe_empty() {
+        use crate::sys::process::StdoutTap;
+
+        const RECONCILED: [&str; 3] = ["listening", "interrupted", "aborted_streaming"];
+        const UNCHANGED: [&str; 3] = ["active", "prompt", ""];
+        // What follows the turn's frames, given when the pipe was last seen
+        // empty before them, and the row's status it must leave.
+        type Then = (
+            &'static str,
+            [&'static str; 3],
+            fn(&StdioTurnTap, &HcomDb, std::time::SystemTime),
+        );
+        let cases: [Then; 9] = [
+            ("an empty pipe", RECONCILED, |tap, _, _| tap.emptied()),
+            (
+                "a control response, then an empty pipe",
+                RECONCILED,
+                |tap, _, _| {
+                    let now = std::time::SystemTime::now();
+                    tap.observe(
+                    br#"{"type":"control_response","response":{"subtype":"success","request_id":"r"}}"#,
+                    now,
+                    now,
+                );
+                    tap.emptied();
+                },
+            ),
+            ("no empty pipe", UNCHANGED, |_, _, _| {}),
+            ("the next turn's running state", UNCHANGED, |tap, _, _| {
+                let now = std::time::SystemTime::now();
+                tap.observe(STDIO_RUNNING, now, now);
+                tap.emptied();
+            }),
+            ("the next turn's init", UNCHANGED, |tap, _, _| {
+                let now = std::time::SystemTime::now();
+                tap.observe(
+                    br#"{"type":"system","subtype":"init","session_id":"sess-1"}"#,
+                    now,
+                    now,
+                );
+                tap.emptied();
+            }),
+            // A later turn's own end, read with the rest: it replaces the
+            // first, which it must not leave to be reconciled.
+            (
+                "another turn's result",
+                ["listening", "interrupted", "aborted_tools"],
+                |tap, _, emitted_after| {
+                    tap.observe(
+                        br#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-1","terminal_reason":"aborted_tools","queued_turn_count":0}"#,
+                        emitted_after,
+                        std::time::SystemTime::now(),
+                    );
+                    tap.emptied();
+                },
+            ),
+            ("a line too long to tell", UNCHANGED, |tap, _, _| {
+                tap.skipped();
+                tap.emptied();
+            }),
+            // As a prompt hook that ran once the pipe had been found empty.
+            ("a prompt after the read", UNCHANGED, |tap, db, _| {
+                crate::instance_lifecycle::set_status(
+                    db,
+                    "nova",
+                    "active",
+                    "prompt",
+                    Default::default(),
+                );
+                tap.emptied();
+            }),
+            ("the end of the copy", UNCHANGED, |tap, _, _| {
+                tap.copy_ended();
+                tap.emptied();
+            }),
+        ];
+        for (case, expected, then) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+            let (emitted_after, read_at) = stdio_turn_read_whole(&db);
+            let tap =
+                StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_secs(60)).unwrap();
+            tap.observe(STDIO_RUNNING, emitted_after, emitted_after);
+            tap.observe(STDIO_ABORTED, emitted_after, read_at);
+            tap.observe(STDIO_IDLE, emitted_after, read_at);
+            then(&tap, &db, emitted_after);
+            // The recorder applies everything queued before it exits.
+            drop(tap);
+            let (status, context, detail) = stdio_status(&db);
+            assert_eq!(
+                [status.as_str(), context.as_str(), detail.as_str()],
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// Without session state events, a later turn writes nothing before its
+    /// prompt hook, so an empty pipe proves nothing: the turn end is dropped.
+    #[test]
+    fn stdio_tap_never_reconciles_a_claude_that_reports_no_session_state() {
+        use crate::sys::process::StdoutTap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let (emitted_after, read_at) = stdio_turn_read_whole(&db);
+        let tap =
+            StdioTurnTap::start(&db, "stdio-proc", std::time::Duration::from_secs(60)).unwrap();
+        tap.observe(STDIO_ABORTED, emitted_after, read_at);
+        tap.emptied();
+        drop(tap);
+        assert_eq!(
+            stdio_status(&db),
+            ("active".to_string(), "prompt".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn stdio_tap_retries_a_reconciliation_the_busy_room_kept_out() {
+        use crate::sys::process::StdoutTap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let (emitted_after, read_at) = stdio_turn_read_whole(&db);
+        let recorder = HcomDb::open_at(db.path()).unwrap();
+        recorder
+            .conn()
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        let tap = StdioTurnTap::start_recording(
+            recorder,
+            "stdio-proc",
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        tap.observe(STDIO_RUNNING, emitted_after, emitted_after);
+        tap.observe(STDIO_ABORTED, emitted_after, read_at);
+        tap.observe(STDIO_IDLE, emitted_after, read_at);
+        // Deferred, not yet reconciled: the row is as the hooks left it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(stdio_status(&db).1, "prompt");
+        db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        tap.emptied();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(stdio_status(&db).1, "prompt");
+        db.conn().execute_batch("COMMIT").unwrap();
+        wait_until(
+            "the reconciliation to land once the lock was released",
+            || stdio_status(&db).1 == "interrupted",
+        );
+        drop(tap);
+    }
+
+    #[test]
+    fn stdio_stdout_tap_only_for_claude_with_stream_json_output_before_the_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let tapped = |tool: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            stdio_stdout_tap(tool, &db, &args, "stdio-proc").is_some()
+        };
+        assert!(tapped("claude", &["-p", "--output-format", "stream-json"]));
+        assert!(tapped(
+            "claude",
+            &["-p", "--output-format=stream-json", "--verbose"]
+        ));
+        // The last value wins, as in Claude.
+        assert!(tapped(
+            "claude",
+            &["--output-format=json", "--output-format=stream-json"]
+        ));
+        assert!(!tapped(
+            "claude",
+            &["--output-format=stream-json", "--output-format=text"]
+        ));
+        assert!(!tapped("claude", &["-p", "--input-format", "stream-json"]));
+        assert!(!tapped(
+            "claude",
+            &["-p", "--", "--output-format", "stream-json"]
+        ));
+        assert!(!tapped("claude", &["-p"]));
+        // Codex keeps its inherited stdout and reports turns through hooks.
+        assert!(!tapped(
+            "codex",
+            &["app-server", "--output-format", "stream-json"]
+        ));
+        assert!(!tapped("codex", &["app-server", "--listen", "stdio://"]));
     }
 }

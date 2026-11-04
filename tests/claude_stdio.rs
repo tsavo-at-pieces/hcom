@@ -4,9 +4,10 @@
 mod support;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 use support::Hcom;
 
 fn assert_no_registered_instances(h: &Hcom) {
@@ -17,6 +18,1279 @@ fn assert_no_registered_instances(h: &Hcom) {
         .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0, "exited native process left a registered instance");
+}
+
+/// Make `script` the only `claude` the stdio launch can find.
+fn install_fake_claude(h: &Hcom, script: &str) {
+    let bin = h.root_path().join("pipe-tools");
+    fs::create_dir(&bin).unwrap();
+    let tool = bin.join("claude");
+    fs::write(&tool, script).unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    h.set_launch_env(
+        "PATH",
+        &format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+    );
+}
+
+/// `(status, context, detail)` of the only registered instance.
+fn only_status(h: &Hcom) -> Option<(String, String, String)> {
+    use rusqlite::OptionalExtension;
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    db.query_row(
+        "SELECT status, status_context, status_detail FROM instances",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        },
+    )
+    .optional()
+    .unwrap()
+}
+
+fn status_contexts(h: &Hcom) -> Vec<String> {
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    let mut statement = db
+        .prepare(
+            "SELECT json_extract(data, '$.context') FROM events WHERE type = 'status' ORDER BY id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| row.get::<_, Option<String>>(0))
+        .unwrap()
+        .map(|context| context.unwrap().unwrap_or_default())
+        .collect()
+}
+
+/// A stream-json Claude stand-in. Hooks run through the hcom binary in the
+/// order native Claude runs them, and session state frames follow them as
+/// for a client that opted into them. Turn 2 is cancelled by an interrupt
+/// control request: like native Claude, it then skips Stop and only emits its
+/// result.
+const SDK_CLAUDE: &str = r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=4b8c2f0e-6d3a-4f1b-9e2c-7a5d8c1b3e60
+emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+state() { emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"$1\",\"session_id\":\"$sid\"}"; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+turn=0
+while IFS= read -r line; do
+  case "$line" in *'"type":"user"'*) ;; *) continue ;; esac
+  turn=$((turn + 1))
+  hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"turn $turn\"}"
+  state running
+  emit "{\"type\":\"assistant\",\"session_id\":\"$sid\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"turn $turn héllo ✓ 🎉\"}]}}"
+  if [ "$turn" = 1 ]; then
+    big=$(head -c 200000 /dev/zero | tr '\0' x)
+    emit "{\"type\":\"user\",\"session_id\":\"$sid\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"$big\"}]}}"
+  fi
+  if [ "$turn" = 2 ]; then
+    IFS= read -r line
+    emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"stop-2\"}}"
+    emit "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"$sid\",\"terminal_reason\":\"aborted_streaming\",\"queued_turn_count\":0}"
+  else
+    hook poll "{\"session_id\":\"$sid\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false}"
+    emit "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"$sid\",\"terminal_reason\":\"completed\",\"queued_turn_count\":0,\"result\":\"done $turn\"}"
+  fi
+  state idle
+done
+printf 'crlf\r\nlast frame without newline' >> "$FAKE_STDOUT_COPY"
+printf 'crlf\r\nlast frame without newline'
+exit 7
+"##;
+
+#[test]
+fn claude_stdio_cancelled_turn_becomes_listening_and_stdout_is_byte_exact() {
+    use serde_json::{Value, json};
+    use std::sync::mpsc;
+
+    let h = Hcom::new();
+    install_fake_claude(&h, SDK_CLAUDE);
+    let copy = h.root_path().join("native-stdout");
+    h.set_launch_envs(&[
+        ("FAKE_STDOUT_COPY", copy.to_str().unwrap()),
+        ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
+    ]);
+    let mut child = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (send_line, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut line_start = 0;
+        loop {
+            let read = stdout.read(&mut chunk).unwrap();
+            if read == 0 {
+                return received;
+            }
+            received.extend_from_slice(&chunk[..read]);
+            while let Some(end) = received[line_start..].iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&received[line_start..line_start + end]);
+                let _ = send_line.send(line.into_owned());
+                line_start += end + 1;
+            }
+        }
+    });
+    let next = |kind: &str| -> Value {
+        loop {
+            let line = lines
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("no {kind} frame\n{}", h.diagnostics()));
+            if let Ok(frame) = serde_json::from_str::<Value>(&line)
+                && frame["type"] == kind
+            {
+                return frame;
+            }
+        }
+    };
+    let send = |stdin: &mut std::process::ChildStdin, value: Value| {
+        writeln!(stdin, "{value}").unwrap();
+        stdin.flush().unwrap();
+    };
+    let user = |text: &str| json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null});
+    let idle = Some(("listening".to_string(), String::new(), String::new()));
+
+    next("system");
+    send(&mut stdin, user("one"));
+    assert_eq!(next("result")["terminal_reason"], "completed");
+    assert_eq!(only_status(&h), idle, "Stop records a completed turn");
+
+    send(&mut stdin, user("two"));
+    next("assistant");
+    assert_eq!(only_status(&h).unwrap().1, "prompt");
+    send(
+        &mut stdin,
+        json!({"type": "control_request", "request_id": "stop-2", "request": {"subtype": "interrupt"}}),
+    );
+    assert_eq!(next("result")["terminal_reason"], "aborted_streaming");
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    h.eventually(
+        "the cancelled turn to become listening",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the native process outlives a cancelled turn"
+    );
+
+    send(&mut stdin, user("three"));
+    assert_eq!(next("result")["terminal_reason"], "completed");
+    assert_eq!(only_status(&h), idle);
+
+    drop(stdin);
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+    let received = reader.join().unwrap();
+    assert!(
+        received == fs::read(&copy).unwrap(),
+        "stdout differs from the native output"
+    );
+    assert_no_registered_instances(&h);
+    let contexts = status_contexts(&h);
+    let first_prompt = contexts
+        .iter()
+        .position(|context| context == "prompt")
+        .unwrap();
+    assert_eq!(
+        contexts[first_prompt..],
+        [
+            "prompt",
+            "",
+            "prompt",
+            "interrupted",
+            "prompt",
+            "",
+            "exit:7"
+        ],
+        "{contexts:?}"
+    );
+}
+
+#[test]
+fn claude_stdio_closed_client_stdout_reaches_the_native_process() {
+    let h = Hcom::new();
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+trap '' PIPE
+printf '{"type":"system","subtype":"init"}\n'
+i=0
+while [ "$i" -lt 600 ]; do
+  sleep 0.05
+  printf '{"type":"keep_alive"}\n' | cat || exit 41
+  i=$((i + 1))
+done
+exit 42
+"#,
+    );
+    let mut child = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format=stream-json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "{\"type\":\"system\",\"subtype\":\"init\"}\n");
+    drop(stdout);
+    // hcom survives its broken stdout; the child sees EPIPE and exits itself.
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(41), "{output:?}");
+    assert_no_registered_instances(&h);
+}
+
+/// Kills a process the test started, however the test ends.
+struct KillOnDrop(i32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
+#[test]
+fn claude_stdio_delivers_last_frames_without_waiting_for_descendants() {
+    let h = Hcom::new();
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sleep 600 2>/dev/null &
+printf '%s\n' "$!" > "$FAKE_DESCENDANT_PID"
+printf '{"type":"result","subtype":"success","is_error":false}'
+exit 3
+"#,
+    );
+    let descendant = h.root_path().join("descendant.pid");
+    h.set_launch_env("FAKE_DESCENDANT_PID", descendant.to_str().unwrap());
+    let mut hcom = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = hcom.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut received = String::new();
+        stdout.read_to_string(&mut received).unwrap();
+        received
+    });
+    let descendant = KillOnDrop(shim_pid(&h, &descendant));
+    // The descendant holds the copied pipe for 10 minutes. hcom stops
+    // copying once it has stayed empty for 5 s after the child exits; how
+    // long the launch took before that is up to the host.
+    let status = wait_for_hcom(&h, &mut hcom, Duration::from_secs(120));
+    assert_eq!(
+        unsafe { libc::kill(descendant.0, 0) },
+        0,
+        "hcom waited for the descendant to close the pipe"
+    );
+    drop(descendant);
+    assert_eq!(status.code(), Some(3));
+    assert_eq!(
+        reader.join().unwrap(),
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}"
+    );
+    assert_no_registered_instances(&h);
+}
+
+/// A Claude that completes one turn through its hooks, prints `idle` and runs
+/// no further hook until stdin closes.
+const IDLE_CLAUDE: &str = r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=7d1e5a2b-3c4f-4a6b-8d9e-0f1a2b3c4d5e
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
+hook poll "{\"session_id\":\"$sid\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false}"
+printf 'idle\n'
+IFS= read -r line
+exit 0
+"##;
+
+/// `last_stop`, the heartbeat column, of the only registered instance.
+fn only_last_stop(h: &Hcom) -> i64 {
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    db.query_row("SELECT last_stop FROM instances", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn claude_stdio_listening_row_stays_live_while_the_child_runs() {
+    let h = Hcom::new();
+    install_fake_claude(&h, IDLE_CLAUDE);
+    h.set_launch_env("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom"));
+    // The heartbeat belongs to the stream-json tap.
+    let mut child = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "idle\n");
+    assert_eq!(only_status(&h).unwrap().0, "listening");
+    // Without a heartbeat, `listening` without TCP reads as stale after 10s.
+    std::thread::sleep(Duration::from_secs(12));
+    let rows = h.list_json().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["status"], "listening", "{rows:?}");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    assert_no_registered_instances(&h);
+}
+
+/// Only the stream-json tap refreshes the heartbeat: any other output format
+/// keeps the inherited stdout and the row's liveness as Stop left it.
+#[test]
+fn claude_stdio_text_output_starts_no_heartbeat() {
+    let h = Hcom::new();
+    install_fake_claude(&h, IDLE_CLAUDE);
+    h.set_launch_env("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom"));
+    let mut child = h
+        .cmd()
+        .args(["claude", "--stdio", "--go", "--", "-p"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "idle\n");
+    let stopped = only_last_stop(&h);
+    // Longer than one heartbeat interval.
+    std::thread::sleep(Duration::from_secs(7));
+    assert_eq!(
+        only_last_stop(&h),
+        stopped,
+        "a text-output launch heartbeats"
+    );
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    assert_no_registered_instances(&h);
+}
+
+/// A client that closes stdout but keeps stdin open ends the copy at hcom's
+/// next write. Claude's last frame went into hcom's pipe without error, and
+/// Claude then waits on stdin and writes nothing more, so it never meets the
+/// broken pipe. The heartbeat stops with the copy, as it does at the reap:
+/// nothing reaches the client any longer, so the row must not look live.
+#[test]
+fn claude_stdio_heartbeat_stops_with_the_copy_when_the_client_closes_stdout() {
+    let h = Hcom::new();
+    let wrote = h.root_path().join("wrote");
+    h.set_launch_envs(&[
+        ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
+        ("FAKE_WROTE", wrote.to_str().unwrap()),
+    ]);
+    install_fake_claude(
+        &h,
+        r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=5f2a8c1d-7e3b-4d9a-b6c4-1e0f9a8b7c6d
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
+hook poll "{\"session_id\":\"$sid\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false}"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
+IFS= read -r line
+# The client has closed stdout by now; this still goes into hcom's pipe.
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}\n' "$sid"
+: > "$FAKE_WROTE"
+IFS= read -r line
+exit 0
+"##,
+    );
+    let mut hcom = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = hcom.stdin.take().unwrap();
+    let mut stdout = BufReader::new(hcom.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains("\"subtype\":\"init\""), "{line}");
+    let reset_heartbeat = || {
+        rusqlite::Connection::open(h.hcom_dir.join("hcom.db"))
+            .unwrap()
+            .execute("UPDATE instances SET last_stop = 1", [])
+            .unwrap();
+    };
+    // While the client reads, the heartbeat runs.
+    reset_heartbeat();
+    h.eventually("the heartbeat", Duration::from_secs(60), || {
+        Ok((only_last_stop(&h) > 1).then_some(()))
+    });
+    drop(stdout);
+    writeln!(stdin, "{{\"type\":\"user\"}}").unwrap();
+    stdin.flush().unwrap();
+    // Only a precondition: a loaded host may take long to run the shim.
+    h.eventually("Claude's last frame", Duration::from_secs(300), || {
+        Ok(wrote.exists().then_some(()))
+    });
+    let log = h.hcom_dir.join(".tmp/logs/hcom.log");
+    h.eventually(
+        "the copy to stop at the closed stdout",
+        Duration::from_secs(60),
+        || {
+            Ok(fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("\"event\":\"stdio.stdout_client_closed\"")
+                .then_some(()))
+        },
+    );
+    // A refresh already under way may still land; none starts after the end
+    // of the copy, which hcom reports before it logs that end.
+    std::thread::sleep(Duration::from_secs(1));
+    reset_heartbeat();
+    // More than two heartbeat intervals, with Claude still waiting on stdin.
+    std::thread::sleep(Duration::from_secs(12));
+    assert_eq!(only_last_stop(&h), 1, "the heartbeat outlived the copy");
+    assert!(
+        hcom.try_wait().unwrap().is_none(),
+        "Claude stopped waiting on stdin"
+    );
+    drop(stdin);
+    assert_eq!(
+        wait_for_hcom(&h, &mut hcom, Duration::from_secs(60)).code(),
+        Some(0)
+    );
+    assert_no_registered_instances(&h);
+}
+
+/// A client pipe filled to capacity, so hcom's first write to it waits for
+/// the client. Returns the client's end, hcom's end and the filler's size.
+fn full_client_pipe() -> (std::io::PipeReader, std::io::PipeWriter, usize) {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use std::os::fd::AsFd;
+
+    let (client, sink) = std::io::pipe().unwrap();
+    let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+    fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+    let mut filled = 0;
+    while let Ok(written) = nix::unistd::write(sink.as_fd(), &[b'.'; 4096]) {
+        filled += written;
+    }
+    fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+    (client, sink, filled)
+}
+
+/// The copy keeps every byte the child wrote before it exited, however long
+/// the client takes to read them: hcom delivers them before it exits.
+#[test]
+fn claude_stdio_delivers_output_to_a_client_paused_past_the_drain_bounds() {
+    let h = Hcom::new();
+    let exited = h.root_path().join("exited");
+    h.set_launch_env("FAKE_EXITED", exited.to_str().unwrap());
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+pad=$(head -c 30000 /dev/zero | tr '\0' z)
+printf '{"type":"system","subtype":"init"}\n'
+printf '{"type":"assistant","pad":"%s"}\n' "$pad"
+printf '{"type":"assistant","pad":"%s"}\n' "$pad"
+printf '{"type":"result","subtype":"success","is_error":false}\n'
+: > "$FAKE_EXITED"
+exit 0
+"#,
+    );
+    let pad = "z".repeat(30_000);
+    let expected = format!(
+        "{{\"type\":\"system\",\"subtype\":\"init\"}}\n{assistant}{assistant}{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}\n",
+        assistant = format!("{{\"type\":\"assistant\",\"pad\":\"{pad}\"}}\n")
+    );
+    // The client's pipe starts full, so hcom's first write waits for the
+    // client. The child's output still fits in the copy's buffer and its own
+    // pipe, so the child exits while hcom holds its last bytes.
+    let (mut client, sink, filler) = full_client_pipe();
+    let mut child = {
+        let mut command = h.cmd();
+        command
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::null())
+            .stdout(sink)
+            .stderr(Stdio::null());
+        command.spawn().unwrap()
+    };
+    // Only a precondition: a loaded host may take long to exec the child.
+    h.eventually("the child to exit", Duration::from_secs(300), || {
+        Ok(exited.exists().then_some(()))
+    });
+    // The heartbeat stopped at the reap, before the drain: hcom holding the
+    // output for longer than the 5 s interval refreshes nothing.
+    std::thread::sleep(Duration::from_secs(1));
+    let reaped = only_last_stop(&h);
+    // Longer than the drain's idle bound and the old fixed deadline.
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "hcom exited with the child's output undelivered"
+    );
+    assert_eq!(
+        only_last_stop(&h),
+        reaped,
+        "the heartbeat ran on in the drain"
+    );
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(received.len(), filler + expected.len());
+    assert!(
+        received[filler..] == *expected.as_bytes(),
+        "stdout differs from the native output"
+    );
+}
+
+/// Once the child has exited, HUP, INT or TERM stops hcom waiting for a
+/// client that is not reading, as it would stop a child blocked writing to
+/// that client. hcom still returns the child's status and cleans up.
+#[test]
+fn claude_stdio_signal_after_the_child_exits_ends_a_stalled_copy() {
+    for (signal, name) in [
+        (libc::SIGHUP, "HUP"),
+        (libc::SIGINT, "INT"),
+        (libc::SIGTERM, "TERM"),
+    ] {
+        let h = Hcom::new();
+        let exited = h.root_path().join("exited");
+        h.set_launch_env("FAKE_EXITED", exited.to_str().unwrap());
+        install_fake_claude(
+            &h,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+pad=$(head -c 30000 /dev/zero | tr '\0' z)
+printf '{"type":"assistant","pad":"%s"}\n' "$pad"
+printf '{"type":"result","subtype":"success","is_error":false}\n'
+: > "$FAKE_EXITED"
+exit 5
+"#,
+        );
+        let (client, sink, _) = full_client_pipe();
+        let mut child = h
+            .cmd()
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::null())
+            .stdout(sink)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Only a precondition: a loaded host may take long to exec the child.
+        h.eventually("the child to exit", Duration::from_secs(300), || {
+            Ok(exited.exists().then_some(()))
+        });
+        // hcom has reaped the child by now and still holds its output.
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{name}: hcom exited before the client read"
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let status = wait_for_hcom(&h, &mut child, Duration::from_secs(60));
+        assert_eq!(status.code(), Some(5), "{name}");
+        drop(client);
+        assert_no_registered_instances(&h);
+    }
+}
+
+/// Wait up to `limit` for hcom to exit. One still running then is killed, so
+/// the test fails instead of hanging.
+fn wait_for_hcom(
+    h: &Hcom,
+    hcom: &mut std::process::Child,
+    limit: Duration,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = hcom.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = hcom.kill();
+            let _ = hcom.wait();
+            panic!("hcom still ran after {limit:?}\n{}", h.diagnostics());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The PID a shim wrote to `file`, once it has.
+fn shim_pid(h: &Hcom, file: &std::path::Path) -> i32 {
+    // Only a precondition: a loaded host may take long to exec the shim.
+    h.eventually("the child to start", Duration::from_secs(300), || {
+        Ok(fs::read_to_string(file)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok()))
+    })
+}
+
+/// A cancellation that hcom forwards while Claude runs still ends hcom with
+/// Claude when the client has stopped reading: a write the client has not
+/// taken for the drain's idle bound is not waited for, as hcom would not
+/// wait for a Claude blocked writing to that client.
+#[test]
+fn claude_stdio_forwarded_cancellation_ends_a_copy_the_client_stopped_taking() {
+    let h = Hcom::new();
+    let started = h.root_path().join("started");
+    h.set_launch_env("FAKE_STARTED", started.to_str().unwrap());
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+pad=$(head -c 30000 /dev/zero | tr '\0' z)
+printf '{"type":"stream_event","pad":"%s"}\n' "$pad"
+printf '%s\n' "$$" > "$FAKE_STARTED"
+while :; do printf '{"type":"stream_event","pad":"%s"}\n' "$pad"; done
+"#,
+    );
+    // The client's pipe starts full and is never read: the copy blocks on
+    // its first write, and Claude then blocks writing as well.
+    let (client, sink, _) = full_client_pipe();
+    let mut hcom = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(sink)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = shim_pid(&h, &started);
+    assert_eq!(unsafe { libc::kill(hcom.id() as i32, libc::SIGTERM) }, 0);
+    let status = wait_for_hcom(&h, &mut hcom, Duration::from_secs(60));
+    // hcom forwarded the TERM, and the child died of it.
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM));
+    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the child outlived hcom");
+    drop(client);
+    assert_no_registered_instances(&h);
+}
+
+/// Whether `pid` has exited and waits to be reaped.
+fn is_zombie(pid: i32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
+}
+
+/// TERM that reaches hcom together with the child's exit, so that hcom finds
+/// the child already exited, ends the wait for a client that is not reading
+/// at once, as one arriving during the drain does. hcom is stopped while the
+/// child exits, so both signals are pending when it resumes, and it takes
+/// them in signal-number order: TERM before CHLD.
+#[test]
+fn claude_stdio_signal_arriving_with_the_exit_ends_a_stalled_copy() {
+    let h = Hcom::new();
+    let started = h.root_path().join("started");
+    let go = h.root_path().join("go");
+    h.set_launch_envs(&[
+        ("FAKE_STARTED", started.to_str().unwrap()),
+        ("FAKE_GO", go.to_str().unwrap()),
+    ]);
+    install_fake_claude(
+        &h,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+printf '%s\n' "$$" > "$FAKE_STARTED"
+while [ ! -e "$FAKE_GO" ]; do sleep 0.05; done
+printf '{"type":"result","subtype":"success","is_error":false}\n'
+exit 5
+"#,
+    );
+    // Small enough for the child's pipe while hcom is stopped; the client's
+    // full pipe then holds it in the copy.
+    let (client, sink, _) = full_client_pipe();
+    let mut hcom = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(sink)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = shim_pid(&h, &started);
+    let supervisor = hcom.id() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGSTOP) }, 0);
+    fs::write(&go, "").unwrap();
+    h.eventually("the child to exit", Duration::from_secs(300), || {
+        Ok(is_zombie(pid).then_some(()))
+    });
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGCONT) }, 0);
+    let status = wait_for_hcom(&h, &mut hcom, Duration::from_secs(60));
+    assert_eq!(status.code(), Some(5));
+    drop(client);
+    assert_no_registered_instances(&h);
+}
+
+/// HUP, INT and TERM reach a stream-json child's process group exactly as
+/// they reach an untapped one, and what it writes on the way out arrives.
+#[test]
+fn claude_stdio_stream_json_forwards_hup_int_and_term() {
+    for (signal, name, code) in [
+        (libc::SIGHUP, "HUP", 41),
+        (libc::SIGINT, "INT", 42),
+        (libc::SIGTERM, "TERM", 43),
+    ] {
+        let h = Hcom::new();
+        install_fake_claude(
+            &h,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+trap 'printf "{\"signal\":\"HUP\"}\n"; exit 41' HUP
+trap 'printf "{\"signal\":\"INT\"}\n"; exit 42' INT
+trap 'printf "{\"signal\":\"TERM\"}\n"; exit 43' TERM
+printf '{"type":"system","subtype":"init"}\n'
+while IFS= read -r line; do :; done
+exit 32
+"#,
+        );
+        let mut child = h
+            .cmd()
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, "{\"type\":\"system\",\"subtype\":\"init\"}\n");
+        let _stdin = child.stdin.take().unwrap();
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let mut rest = String::new();
+        stdout.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, format!("{{\"signal\":\"{name}\"}}\n"), "{name}");
+        assert_eq!(child.wait().unwrap().code(), Some(code), "{name}");
+        assert_no_registered_instances(&h);
+    }
+}
+
+/// The copy never waits for the room database. While another process holds
+/// its write lock, a cancelled turn's result and every later frame still
+/// reach a ready client at once; the status lands once the lock is released.
+#[test]
+fn claude_stdio_cancelled_turn_waits_for_a_locked_room_but_its_output_does_not() {
+    use serde_json::{Value, json};
+    use std::sync::mpsc;
+
+    let h = Hcom::new();
+    let copy = h.root_path().join("native-stdout");
+    h.set_launch_envs(&[
+        ("FAKE_STDOUT_COPY", copy.to_str().unwrap()),
+        ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
+    ]);
+    install_fake_claude(
+        &h,
+        r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=0c3e9d2a-5b7f-4e18-a6d4-9f2b1c8e7a50
+emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+IFS= read -r line
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
+emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"running\",\"session_id\":\"$sid\"}"
+emit "{\"type\":\"assistant\",\"session_id\":\"$sid\"}"
+IFS= read -r line
+emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"stop-1\"}}"
+emit "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"$sid\",\"terminal_reason\":\"aborted_streaming\",\"queued_turn_count\":0}"
+emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"idle\",\"session_id\":\"$sid\"}"
+# More than both pipes hold: a stalled copy would stall the child too.
+pad=$(head -c 30000 /dev/zero | tr '\0' y)
+for i in 1 2 3 4 5 6 7 8; do emit "{\"type\":\"stream_event\",\"n\":$i,\"pad\":\"$pad\"}"; done
+emit "{\"type\":\"system\",\"subtype\":\"marker\"}"
+IFS= read -r line
+exit 0
+"##,
+    );
+    let mut child = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (send_line, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let mut line_start = 0;
+        loop {
+            let read = stdout.read(&mut chunk).unwrap();
+            if read == 0 {
+                return received;
+            }
+            received.extend_from_slice(&chunk[..read]);
+            while let Some(end) = received[line_start..].iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&received[line_start..line_start + end]);
+                let _ = send_line.send(line.into_owned());
+                line_start += end + 1;
+            }
+        }
+    });
+    let next = |what: &str, matches: &dyn Fn(&Value) -> bool| -> Value {
+        loop {
+            let line = lines
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("no {what} frame\n{}", h.diagnostics()));
+            if let Ok(frame) = serde_json::from_str::<Value>(&line)
+                && matches(&frame)
+            {
+                return frame;
+            }
+        }
+    };
+    let send = |stdin: &mut std::process::ChildStdin, value: Value| {
+        writeln!(stdin, "{value}").unwrap();
+        stdin.flush().unwrap();
+    };
+    next("init", &|frame| frame["subtype"] == "init");
+    send(
+        &mut stdin,
+        json!({"type": "user", "message": {"role": "user", "content": "one"}}),
+    );
+    next("assistant", &|frame| frame["type"] == "assistant");
+    assert_eq!(only_status(&h).unwrap().1, "prompt");
+
+    // Another room writer holds the write lock across the cancellation.
+    let room = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    room.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locked = Instant::now();
+    send(
+        &mut stdin,
+        json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}}),
+    );
+    next("marker", &|frame| frame["subtype"] == "marker");
+    let delivered = locked.elapsed();
+    assert!(
+        delivered < Duration::from_secs(2),
+        "frames after the result waited {delivered:?} for the database"
+    );
+    assert_eq!(
+        only_status(&h).unwrap().1,
+        "prompt",
+        "recorded through the lock"
+    );
+    // Release well inside the recorder's busy timeout.
+    std::thread::sleep(Duration::from_millis(2500).saturating_sub(locked.elapsed()));
+    room.execute_batch("COMMIT").unwrap();
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    h.eventually(
+        "the cancelled turn to become listening",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+
+    drop(stdin);
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    let received = reader.join().unwrap();
+    assert!(
+        received == fs::read(&copy).unwrap(),
+        "stdout differs from the native output"
+    );
+    assert_no_registered_instances(&h);
+}
+
+/// A Claude that runs one turn the client cancels, writing it as 2.1.309 does
+/// with session state events on: `running` before the prompt hook, `init`
+/// and the turn's output after it. The frame before them is larger than the
+/// copy's buffer, so a copy blocked on a client that takes nothing is
+/// blocked with a full read before the hook runs, however it is scheduled.
+/// A second prompt, if the client sends one, starts a turn left running.
+const WHOLE_TURN_CLAUDE: &str = r##"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
+sid=2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e
+emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
+hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+state() { emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"$1\",\"session_id\":\"$sid\"}"; }
+: > "$PWD/transcript.jsonl"
+hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
+emit "{\"type\":\"system\",\"subtype\":\"hook_response\",\"session_id\":\"$sid\"}"
+IFS= read -r line
+pad=$(head -c 70000 /dev/zero | tr '\0' p)
+emit "{\"type\":\"stream_event\",\"session_id\":\"$sid\",\"pad\":\"$pad\"}"
+state running
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+emit "{\"type\":\"assistant\",\"session_id\":\"$sid\"}"
+IFS= read -r line
+emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"stop-1\"}}"
+emit "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"$sid\",\"terminal_reason\":\"aborted_streaming\",\"queued_turn_count\":0}"
+state idle
+: > "$FAKE_WROTE"
+IFS= read -r line || exit 0
+state running
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"two\"}"
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+emit "{\"type\":\"assistant\",\"session_id\":\"$sid\",\"turn\":2}"
+: > "$FAKE_WROTE_NEXT"
+IFS= read -r line
+exit 0
+"##;
+
+/// The end of [`WHOLE_TURN_CLAUDE`]'s idle frame, and of the next turn's
+/// assistant frame.
+const WHOLE_TURN_IDLE: &[u8] =
+    b"\"state\":\"idle\",\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\"}\n";
+const WHOLE_TURN_NEXT: &[u8] =
+    b"\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\",\"turn\":2}\n";
+
+/// A [`WHOLE_TURN_CLAUDE`] session whose client took nothing from before
+/// the turn's prompt hook until its last frame, and cancelled it meanwhile.
+struct StalledTurn {
+    hcom: std::process::Child,
+    stdin: std::process::ChildStdin,
+    client: std::io::PipeReader,
+    received: Vec<u8>,
+    /// The filler that kept the client's pipe full.
+    filled: usize,
+    copy: std::path::PathBuf,
+    next_written: std::path::PathBuf,
+}
+
+impl StalledTurn {
+    fn start(h: &Hcom) -> Self {
+        use std::os::fd::AsFd;
+
+        let copy = h.root_path().join("native-stdout");
+        let wrote = h.root_path().join("wrote");
+        let next_written = h.root_path().join("wrote-next");
+        h.set_launch_envs(&[
+            ("FAKE_STDOUT_COPY", copy.to_str().unwrap()),
+            ("FAKE_WROTE", wrote.to_str().unwrap()),
+            ("FAKE_WROTE_NEXT", next_written.to_str().unwrap()),
+            ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
+        ]);
+        install_fake_claude(h, WHOLE_TURN_CLAUDE);
+        let (client, sink) = std::io::pipe().unwrap();
+        let filler = sink.try_clone().unwrap();
+        let mut hcom = h
+            .cmd()
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(sink)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = hcom.stdin.take().unwrap();
+        let mut turn = Self {
+            hcom,
+            stdin,
+            client,
+            received: Vec::new(),
+            filled: 0,
+            copy,
+            next_written,
+        };
+        turn.read_through(
+            b"\"hook_response\",\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\"}\n",
+        );
+        // From here the client takes nothing: its pipe is full, so the copy
+        // blocks on its first read of the turn, before the prompt hook commits.
+        turn.filled = {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+            let flags =
+                OFlag::from_bits_truncate(fcntl(filler.as_fd(), FcntlArg::F_GETFL).unwrap());
+            fcntl(filler.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+            let mut filled = 0;
+            while let Ok(written) = nix::unistd::write(filler.as_fd(), &[b'.'; 4096]) {
+                filled += written;
+            }
+            fcntl(filler.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+            filled
+        };
+        drop(filler);
+        turn.send(
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "one"}}),
+        );
+        // Only preconditions: a loaded host may take long to run the hooks.
+        h.eventually("the prompt hook", Duration::from_secs(300), || {
+            Ok(only_status(h)
+                .is_some_and(|row| row.1 == "prompt")
+                .then_some(()))
+        });
+        turn.send(serde_json::json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}}));
+        h.eventually("the turn's last frame", Duration::from_secs(300), || {
+            Ok(wrote.exists().then_some(()))
+        });
+        turn
+    }
+
+    fn send(&mut self, frame: serde_json::Value) {
+        writeln!(self.stdin, "{frame}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// The client reads on until `end` has arrived.
+    fn read_through(&mut self, end: &[u8]) {
+        let mut chunk = [0u8; 65536];
+        while !self.received.ends_with(end) {
+            let read = self.client.read(&mut chunk).unwrap();
+            assert!(read > 0, "EOF before {:?}", String::from_utf8_lossy(end));
+            self.received.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// Close stdin, so that Claude exits 0, and check that every byte it
+    /// wrote reached the client.
+    fn finish(mut self, h: &Hcom) {
+        drop(self.stdin);
+        self.client.read_to_end(&mut self.received).unwrap();
+        assert_eq!(
+            wait_for_hcom(h, &mut self.hcom, Duration::from_secs(60)).code(),
+            Some(0)
+        );
+        let native = fs::read(&self.copy).unwrap();
+        let hook_response = native.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let received = &self.received;
+        assert!(received[..hook_response] == native[..hook_response]);
+        assert!(
+            received[hook_response..hook_response + self.filled]
+                .iter()
+                .all(|&b| b == b'.')
+        );
+        assert!(
+            received[hook_response + self.filled..] == native[hook_response..],
+            "stdout differs from the native output"
+        );
+        assert_no_registered_instances(h);
+    }
+}
+
+/// The status contexts from the first prompt on.
+fn contexts_from_the_first_prompt(h: &Hcom) -> Vec<String> {
+    let contexts = status_contexts(h);
+    let first_prompt = contexts
+        .iter()
+        .position(|context| context == "prompt")
+        .unwrap();
+    contexts[first_prompt..].to_vec()
+}
+
+/// A client that takes nothing for a whole cancelled turn leaves the copy no
+/// moment at which the pipe was seen empty after the turn's prompt, so hcom
+/// cannot tell the turn's end from the end of one before that prompt, and
+/// defers it. Once the client reads on and the copy finds the pipe empty
+/// after the idle frame, with nothing of a later turn read in between, the
+/// cancelled turn settles `listening`/`interrupted`, while Claude waits on an
+/// open stdin with no new prompt; and every byte reaches the client.
+#[test]
+fn claude_stdio_turn_read_whole_behind_a_stalled_client_settles_once_drained() {
+    let h = Hcom::new();
+    let mut turn = StalledTurn::start(&h);
+    assert_eq!(only_status(&h).unwrap().1, "prompt");
+    // The client reads on: the rest of the turn arrives in one read, which
+    // empties the pipe.
+    turn.read_through(WHOLE_TURN_IDLE);
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    // Bounded from the drain: the recorder has nothing left to wait for.
+    h.eventually(
+        "the cancelled turn to settle once drained",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+    assert!(
+        turn.hcom.try_wait().unwrap().is_none(),
+        "Claude stopped waiting on stdin"
+    );
+    turn.finish(&h);
+    assert_eq!(
+        contexts_from_the_first_prompt(&h),
+        ["prompt", "interrupted", "exit:0"]
+    );
+}
+
+/// As above, but before the client reads on it sends the next prompt, whose
+/// hook commits before the copy reads the cancelled turn's end. Neither the
+/// old result nor its idle frame may end the new turn: the copy reads the
+/// new turn's `running` frame before it finds the pipe empty, so the
+/// deferred turn end is dropped and the row keeps the new prompt.
+#[test]
+fn claude_stdio_turn_read_whole_behind_a_stalled_client_keeps_a_prompt_sent_before_the_drain() {
+    let h = Hcom::new();
+    let mut turn = StalledTurn::start(&h);
+    turn.send(serde_json::json!({"type": "user", "message": {"role": "user", "content": "two"}}));
+    // Only preconditions: a loaded host may take long to run the hook.
+    h.eventually("the next prompt hook", Duration::from_secs(300), || {
+        let prompts = status_contexts(&h)
+            .iter()
+            .filter(|context| *context == "prompt")
+            .count();
+        Ok((prompts == 2).then_some(()))
+    });
+    h.eventually("the next turn's frames", Duration::from_secs(300), || {
+        Ok(turn.next_written.exists().then_some(()))
+    });
+    turn.read_through(WHOLE_TURN_NEXT);
+    // Long enough for the recorder to have applied either frame.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        only_status(&h),
+        Some(("active".to_string(), "prompt".to_string(), String::new()))
+    );
+    turn.finish(&h);
+    assert_eq!(
+        contexts_from_the_first_prompt(&h),
+        ["prompt", "prompt", "exit:0"]
+    );
 }
 
 #[test]
@@ -610,4 +1884,193 @@ fn real_claude_stdio_two_turns_permission_channel_and_eof() {
         calls.lines().all(|line| line == "relay push"),
         "native hooks used ordinary hcom from PATH: {calls}"
     );
+}
+
+/// A real SDK interrupt, as X1 captured it: the native CLI aborts the streamed
+/// reply, answers the control request, runs no Stop hook and writes a
+/// `result` with `terminal_reason: aborted_streaming`, then the idle session
+/// state. The mock provider holds the reply open; no hosted model is used.
+#[test]
+#[ignore = "requires the real Claude CLI installed by scripts/install-mock-tools.sh"]
+fn real_claude_stdio_interrupt_marks_the_turn_listening_interrupted() {
+    use serde_json::{Value, json};
+    use std::sync::mpsc;
+    use support::claude_mock::{
+        ClaudeCase, MODEL, claude_partial_text, claude_text, latest_user_turn,
+    };
+    use support::mock_http::{MockHttp, Reply};
+    use support::real_tool::ToolCase;
+
+    let h = Hcom::new();
+    h.set_launch_env(
+        "PATH",
+        &format!(
+            "{}:{}",
+            support::pins::mock_tools_bin().display(),
+            std::env::var("PATH").unwrap()
+        ),
+    );
+    let mock = MockHttp::start(|request| {
+        if request.method.eq_ignore_ascii_case("HEAD") {
+            return Reply::Empty(200);
+        }
+        if request.path.contains("count_tokens") {
+            return Reply::Json(json!({"input_tokens": 1}).to_string());
+        }
+        if !request.path.contains("/v1/messages") {
+            return Reply::Status(404);
+        }
+        // The newer turn first: Claude may fold the interrupted prompt into
+        // the next request's last user message.
+        let (_, text) = latest_user_turn(&request.body).unwrap_or_default();
+        if text.contains("STDIO_AFTER") {
+            Reply::Sse(claude_text("msg_after", "STDIO_AFTER_DONE"))
+        } else if text.contains("STDIO_STALL") {
+            Reply::Stall(claude_partial_text("msg_stall", "Counting: 1 2 3"))
+        } else {
+            Reply::Status(500)
+        }
+    })
+    .unwrap();
+    ClaudeCase.prepare(&h, &ClaudeCase.provider_base_url(mock.port()));
+    // As the Agent SDK host launches it, session state frames included.
+    h.set_launch_envs(&[
+        ("CLAUDE_CODE_ENTRYPOINT", "sdk-ts"),
+        ("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"),
+    ]);
+    let mut child = h
+        .cmd()
+        .args([
+            "claude",
+            "--stdio",
+            "--go",
+            "--",
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            MODEL,
+            "--setting-sources",
+            "user",
+            "--tools",
+            "Bash",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let mut reader = stderr;
+        reader.read_to_string(&mut text).unwrap();
+        text
+    });
+    let (send, receive) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if send.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let send_json = |input: &mut std::process::ChildStdin, value: Value| {
+        writeln!(input, "{value}").unwrap();
+        input.flush().unwrap();
+    };
+    let next = |kind: &str| -> Value {
+        loop {
+            let line = receive
+                .recv_timeout(Duration::from_secs(90))
+                .unwrap_or_else(|_| panic!("no {kind} frame\n{}", h.diagnostics()));
+            let frame: Value =
+                serde_json::from_str(&line).expect("stdout contains only native JSON frames");
+            if frame["type"] == kind {
+                return frame;
+            }
+        }
+    };
+    send_json(
+        &mut stdin,
+        json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}}),
+    );
+    send_json(
+        &mut stdin,
+        json!({"type": "user", "message": {"role": "user", "content": "STDIO_STALL"}, "parent_tool_use_id": null}),
+    );
+    // The turn is under way once the provider holds its reply open.
+    h.eventually(
+        "the stalled turn to reach the provider",
+        Duration::from_secs(90),
+        || {
+            let started = mock.requests().iter().any(|request| {
+                request.path.contains("/v1/messages")
+                    && !request.path.contains("count_tokens")
+                    && request.body.contains("STDIO_STALL")
+            });
+            Ok((started && only_status(&h).is_some_and(|row| row.1 == "prompt")).then_some(()))
+        },
+    );
+    send_json(
+        &mut stdin,
+        json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}}),
+    );
+    let result = next("result");
+    assert_eq!(result["terminal_reason"], "aborted_streaming", "{result}");
+    assert_eq!(result["is_error"], true, "{result}");
+    // The fallback trigger as the client sees it: the idle state, in the session.
+    let idle = loop {
+        let frame = next("system");
+        if frame["subtype"] == "session_state_changed" {
+            break frame;
+        }
+    };
+    assert_eq!(idle["state"], "idle", "{idle}");
+    assert_eq!(idle["session_id"], result["session_id"], "{idle}");
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    h.eventually(
+        "the interrupted turn to become listening",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the native process outlives a cancelled turn"
+    );
+
+    send_json(
+        &mut stdin,
+        json!({"type": "user", "message": {"role": "user", "content": "STDIO_AFTER"}, "parent_tool_use_id": null}),
+    );
+    let result = next("result");
+    assert_eq!(result["is_error"], false, "{result}");
+    assert!(
+        result["result"]
+            .as_str()
+            .unwrap()
+            .contains("STDIO_AFTER_DONE"),
+        "{result}"
+    );
+    h.eventually("the next turn to end", Duration::from_secs(10), || {
+        Ok(
+            (only_status(&h).is_some_and(|row| row.0 == "listening" && row.1.is_empty()))
+                .then_some(()),
+        )
+    });
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+    let stderr = errors.join().unwrap();
+    assert!(!stderr.contains("requires --print"), "{stderr}");
+    assert_no_registered_instances(&h);
 }

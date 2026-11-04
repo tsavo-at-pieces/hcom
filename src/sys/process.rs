@@ -5,29 +5,99 @@
 
 use std::process::Command;
 
+/// Observes a pipe client's stdout while [`run_stdio_child`] copies it. The
+/// tap is shown each complete line only after hcom's stdout took it, and can
+/// change neither the bytes nor when they are written. Every call runs on
+/// the only copy of the stream: none may block.
+///
+/// Off Unix, `run_stdio_child` refuses to start, so nothing calls a tap there.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub trait StdoutTap: Send + Sync {
+    /// A complete line without its `\n`. The child wrote all of it after
+    /// `emitted_after`, a time at which its stdout pipe was seen empty and
+    /// not full, so that a child writing whatever it has as soon as the pipe
+    /// has room had nothing waiting. `read_at` is when the copy began the
+    /// read that took the line's first byte.
+    fn observe(
+        &self,
+        line: &[u8],
+        emitted_after: std::time::SystemTime,
+        read_at: std::time::SystemTime,
+    );
+    /// A complete line too long to be shown. It was copied whole.
+    fn skipped(&self);
+    /// The copy found the pipe empty, and not full, with a read that ended
+    /// at a line's end: the tap has been shown, or told it skipped, every
+    /// line read so far, and a child writing whatever it has as soon as the
+    /// pipe has room had nothing waiting when that read began.
+    fn emptied(&self);
+    /// The child has been reaped; its remaining output drains next.
+    fn child_exited(&self);
+    /// The copy has ended: at EOF, at a write to hcom's stdout that failed
+    /// (EPIPE once the client closed it), at a failed read, or where the
+    /// drain stops. Nothing follows, and the child's pipe closes with it,
+    /// while the child itself may still run, waiting on stdin.
+    fn copy_ended(&self);
+}
+
 /// Run a foreground pipe client without a shell or PTY. The hcom process
 /// remains the native child's parent and forwards cancellation to its group.
 /// SIGCHLD wakes the same loop as cancellation: no polling, and no signalling
 /// thread can race the reaping of a PID that the OS might reuse.
+///
+/// With a `stdout_tap`, the child writes into a pipe that a thread copies to
+/// hcom's own stdout; otherwise it inherits that stdout directly. The copy
+/// delivers everything the child wrote before it was reaped and is joined
+/// before this returns, unless HUP, INT or TERM reaches hcom once the child
+/// has exited, or hcom signalled the child and the client then takes nothing
+/// for the drain's idle bound. Either ends the wait, as hcom would not wait
+/// for a child blocked writing to that client.
 #[cfg(unix)]
 pub fn run_stdio_child(
     command: &mut Command,
+    stdout_tap: Option<Box<dyn StdoutTap>>,
     on_spawn: impl FnOnce(u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<i32> {
     use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
+    use std::os::fd::AsFd;
     use std::os::unix::process::ExitStatusExt;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::Stdio;
+    use std::sync::Arc;
+    use tapped_stdout::DrainWait;
 
     let mut signals = Signals::new([SIGCHLD, SIGHUP, SIGINT, SIGTERM])?;
+    let tap = stdout_tap.map(Arc::<dyn StdoutTap>::from);
+    let sink = if tap.is_some() {
+        Some(std::io::stdout().as_fd().try_clone_to_owned()?)
+    } else {
+        None
+    };
     command
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdout(if sink.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .stderr(Stdio::inherit());
     detach_session(command);
+    // Taken before the child exists, so all of its output follows it.
+    let spawned_at = std::time::SystemTime::now();
     let mut child = command.spawn()?;
     let pid = child.id();
+    let mut forwarder = None;
+    let mut drain_wait = DrainWait::Delivered;
     let result = (|| {
+        if let (Some(source), Some(sink), Some(tap)) = (child.stdout.take(), sink, tap.clone()) {
+            forwarder = Some(tapped_stdout::Forwarder::spawn(
+                source.into(),
+                sink,
+                tap,
+                spawned_at,
+            )?);
+        }
         on_spawn(pid)?;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -39,6 +109,9 @@ pub fn run_stdio_child(
                 // The child stays unreaped until this single-threaded loop
                 // observes it. Never signal after a successful wait.
                 if let Some(status) = child.try_wait()? {
+                    if signal != SIGCHLD {
+                        drain_wait = DrainWait::Signalled(signal);
+                    }
                     return Ok(status
                         .code()
                         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
@@ -48,6 +121,7 @@ pub fn run_stdio_child(
                     unsafe {
                         libc::kill(-(pid as i32), signal);
                     }
+                    drain_wait = DrainWait::Cancelled;
                 }
             }
         }
@@ -55,16 +129,1249 @@ pub fn run_stdio_child(
     if result.is_err() {
         kill_group(pid);
         let _ = child.wait();
+        if let DrainWait::Delivered = drain_wait {
+            drain_wait = DrainWait::Cancelled;
+        }
     }
+    // Reaped on every path: whatever needs a live child stops before the
+    // drain, which has no deadline while the client takes the output.
+    if let Some(tap) = &tap {
+        let _ = catch_unwind(AssertUnwindSafe(|| tap.child_exited()));
+    }
+    if let Some(forwarder) = forwarder {
+        forwarder.finish(&mut signals, drain_wait);
+    }
+    drop(tap);
     result
 }
 
 #[cfg(not(unix))]
 pub fn run_stdio_child(
     _command: &mut Command,
+    _stdout_tap: Option<Box<dyn StdoutTap>>,
     _on_spawn: impl FnOnce(u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<i32> {
     anyhow::bail!("--stdio is currently supported on Unix only")
+}
+
+/// The copy of a pipe client's stdout behind a [`StdoutTap`].
+#[cfg(unix)]
+mod tapped_stdout {
+    use super::StdoutTap;
+    use nix::errno::Errno;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use signal_hook::consts::SIGCHLD;
+    use signal_hook::iterator::{Handle, Signals};
+    use std::io::ErrorKind;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+    use std::time::{Duration, Instant, SystemTime};
+
+    /// Longest line a tap is shown. Longer lines are still forwarded whole.
+    const LINE_LIMIT: usize = 16 * 1024 * 1024;
+
+    /// When the copy ends after the child exits. Bytes it has read, and those
+    /// the pipe held at the exit, are always delivered; after them it waits
+    /// for a descendant that inherited the pipe.
+    #[derive(Clone, Copy)]
+    struct DrainLimits {
+        /// How long the pipe may stay empty before the copy ends.
+        idle: Duration,
+        /// After this, the copy ends the next time the pipe is empty.
+        cap: Duration,
+    }
+
+    const DRAIN: DrainLimits = DrainLimits {
+        idle: Duration::from_secs(5),
+        cap: Duration::from_secs(30),
+    };
+
+    /// Copies the child's stdout to hcom's own on a dedicated thread.
+    pub(super) struct Forwarder {
+        thread: std::thread::JoinHandle<()>,
+        /// Closed once the child is reaped, which starts the drain.
+        exited: std::io::PipeWriter,
+        ended: Arc<Mutex<Ended>>,
+    }
+
+    /// What ends the wait for an exited child's output besides its delivery
+    /// and HUP, INT or TERM reaching hcom meanwhile.
+    #[derive(Clone, Copy)]
+    pub(super) enum DrainWait {
+        /// Nothing else: the client gets it however slowly it reads.
+        Delivered,
+        /// One write to hcom's stdout under way for the idle bound. hcom
+        /// signalled the child (forwarding HUP, INT or TERM, or killing it
+        /// after a failed launch), so it does not wait for a client that
+        /// takes nothing that long, as it would not have waited for a child
+        /// blocked writing to that client.
+        Cancelled,
+        /// This signal, which reached hcom once the child had exited.
+        Signalled(libc::c_int),
+    }
+
+    /// Whether the copy has ended, or has stalled writing to hcom's stdout.
+    /// A supervisor waiting for signals leaves its handle here, so that
+    /// either wakes it.
+    #[derive(Default)]
+    struct Ended {
+        done: bool,
+        stalled: bool,
+        waiter: Option<Handle>,
+        /// When the write to hcom's stdout now under way began.
+        writing_since: Option<Instant>,
+    }
+
+    fn lock(ended: &Mutex<Ended>) -> MutexGuard<'_, Ended> {
+        ended.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Held by the copy thread: records the end however the thread exits.
+    struct EndGuard(Arc<Mutex<Ended>>);
+
+    impl Drop for EndGuard {
+        fn drop(&mut self) {
+            let mut ended = lock(&self.0);
+            ended.done = true;
+            if let Some(waiter) = ended.waiter.take() {
+                waiter.close();
+            }
+        }
+    }
+
+    /// Held by the copy thread: tells the tap the copy ended, however the
+    /// thread exits, even after the tap panicked out of the line split.
+    struct TapEnd(Arc<dyn StdoutTap>);
+
+    impl Drop for TapEnd {
+        fn drop(&mut self) {
+            let _ = catch_unwind(AssertUnwindSafe(|| self.0.copy_ended()));
+        }
+    }
+
+    impl Forwarder {
+        pub(super) fn spawn(
+            source: OwnedFd,
+            sink: OwnedFd,
+            tap: Arc<dyn StdoutTap>,
+            spawned_at: SystemTime,
+        ) -> std::io::Result<Self> {
+            let (exit_notice, exited) = std::io::pipe()?;
+            let lines = LineTap::new(tap.clone(), LINE_LIMIT);
+            let ended = Arc::new(Mutex::new(Ended::default()));
+            let guard = EndGuard(ended.clone());
+            let writes = ended.clone();
+            let thread = std::thread::Builder::new()
+                .name("stdio-stdout".into())
+                .spawn(move || {
+                    let _guard = guard;
+                    let tap_end = TapEnd(tap);
+                    let end = forward(
+                        source.as_fd(),
+                        exit_notice.as_fd(),
+                        |bytes| {
+                            lock(&writes).writing_since = Some(Instant::now());
+                            let written = write_all(sink.as_fd(), bytes);
+                            lock(&writes).writing_since = None;
+                            written
+                        },
+                        lines,
+                        spawned_at,
+                        DRAIN,
+                    );
+                    // The tap first, so that what it stops has stopped by
+                    // the time the end is logged.
+                    drop(tap_end);
+                    end.log();
+                })?;
+            Ok(Self {
+                thread,
+                exited,
+                ended,
+            })
+        }
+
+        /// Report the child's exit and wait until its output is delivered,
+        /// or as `wait` allows. The copy, perhaps blocked writing to a client
+        /// that is not reading, is then left to end with hcom.
+        pub(super) fn finish(self, signals: &mut Signals, wait: DrainWait) {
+            {
+                let mut ended = lock(&self.ended);
+                if !ended.done {
+                    ended.waiter = Some(signals.handle());
+                }
+            }
+            drop(self.exited);
+            let mut stop = None;
+            match wait {
+                DrainWait::Delivered => {}
+                DrainWait::Cancelled => watch_for_a_stall(self.ended.clone(), DRAIN.idle),
+                DrainWait::Signalled(signal) => stop = Some(signal),
+            }
+            loop {
+                let (done, stalled) = {
+                    let ended = lock(&self.ended);
+                    (ended.done, ended.stalled)
+                };
+                if done {
+                    let _ = self.thread.join();
+                    return;
+                }
+                if stalled {
+                    copy_stopped(&format!(
+                        "hcom signalled the child and one write waited {}s for the client",
+                        DRAIN.idle.as_secs()
+                    ));
+                    return;
+                }
+                // Closing the handle at the end of the copy, or once it
+                // stalls, wakes this wait.
+                let signal = stop
+                    .take()
+                    .or_else(|| signals.wait().find(|&signal| signal != SIGCHLD));
+                if let Some(signal) = signal {
+                    copy_stopped(&format!("signal {signal} reached hcom"));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The supervisor stopped waiting for the exited child's stdout copy.
+    fn copy_stopped(why: &str) {
+        crate::log::log_warn(
+            "launcher",
+            "stdio.stdout_copy_stopped",
+            &format!("stopped waiting for the copy of the exited child's stdout: {why}"),
+        );
+    }
+
+    /// Mark the copy stalled and wake the supervisor once one write to
+    /// hcom's stdout has been under way for `idle`.
+    fn watch_for_a_stall(ended: Arc<Mutex<Ended>>, idle: Duration) {
+        let watch = move || {
+            loop {
+                let wait = {
+                    let mut ended = lock(&ended);
+                    if ended.done {
+                        return;
+                    }
+                    match ended.writing_since.map(|since| since.elapsed()) {
+                        Some(waited) if waited >= idle => {
+                            ended.stalled = true;
+                            if let Some(waiter) = ended.waiter.take() {
+                                waiter.close();
+                            }
+                            return;
+                        }
+                        Some(waited) => idle - waited,
+                        None => idle,
+                    }
+                };
+                std::thread::sleep(wait);
+            }
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("stdio-stall".into())
+            .spawn(watch)
+        {
+            // Without the watch, only the copy's end or a signal ends the wait.
+            crate::log::log_warn("launcher", "stdio.stall_watch_failed", &error.to_string());
+        }
+    }
+
+    /// The copy after the child's exit (see [`DrainLimits`]).
+    struct Drain {
+        /// Bytes still to read of those the pipe held when the exit was seen.
+        owed: usize,
+        started: Instant,
+        last_read: Instant,
+        limits: DrainLimits,
+    }
+
+    impl Drain {
+        fn start(owed: usize, limits: DrainLimits) -> Self {
+            let now = Instant::now();
+            Self {
+                owed,
+                started: now,
+                last_read: now,
+                limits,
+            }
+        }
+
+        /// How long to wait for more output before the copy ends.
+        fn timeout(&self) -> PollTimeout {
+            if self.owed > 0 {
+                return PollTimeout::NONE;
+            }
+            let wait = if self.started.elapsed() >= self.limits.cap {
+                Duration::ZERO
+            } else {
+                self.limits.idle.saturating_sub(self.last_read.elapsed())
+            };
+            // Rounded up: poll counts whole milliseconds.
+            PollTimeout::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(PollTimeout::MAX)
+        }
+
+        /// Whether the copy may end with the pipe empty now.
+        fn expired(&self) -> bool {
+            self.owed == 0
+                && (self.started.elapsed() >= self.limits.cap
+                    || self.last_read.elapsed() >= self.limits.idle)
+        }
+
+        /// Count one read; whether the copy may end now.
+        fn read(&mut self, read: usize, drained: bool) -> bool {
+            self.owed = if drained {
+                0
+            } else {
+                self.owed.saturating_sub(read)
+            };
+            self.last_read = Instant::now();
+            drained && self.started.elapsed() >= self.limits.cap
+        }
+    }
+
+    /// Why [`forward`] stopped copying.
+    #[derive(Debug)]
+    enum End {
+        /// Every writer closed the pipe.
+        Eof,
+        /// The drain ended before EOF, for this reason.
+        Drained(&'static str),
+        /// hcom's stdout refused a write: EPIPE once the client closed it.
+        WriteFailed(std::io::Error),
+        ReadFailed(Errno),
+        PollFailed(Errno),
+    }
+
+    impl End {
+        fn log(&self) {
+            match self {
+                Self::Eof => {}
+                Self::Drained(why) => crate::log::log_info(
+                    "launcher",
+                    "stdio.stdout_drain_ended",
+                    &format!("stopped copying the exited child's stdout: {why}"),
+                ),
+                Self::WriteFailed(error) if error.kind() == ErrorKind::BrokenPipe => {
+                    crate::log::log_info(
+                        "launcher",
+                        "stdio.stdout_client_closed",
+                        "the client closed stdout: the copy stopped, and the child's pipe closes with it",
+                    )
+                }
+                Self::WriteFailed(error) => crate::log::log_warn(
+                    "launcher",
+                    "stdio.stdout_write_failed",
+                    &error.to_string(),
+                ),
+                Self::ReadFailed(errno) => {
+                    crate::log::log_warn("launcher", "stdio.stdout_read_failed", &errno.to_string())
+                }
+                Self::PollFailed(errno) => {
+                    crate::log::log_warn("launcher", "stdio.stdout_poll_failed", &errno.to_string())
+                }
+            }
+        }
+    }
+
+    /// Copy `source` to `write` chunk by chunk as it arrives, then show the
+    /// tap each complete line. Ends at EOF or a failed write, or, once
+    /// `exited` reports the child reaped, as [`DrainLimits`] allow.
+    ///
+    /// Each line carries the last time the pipe was seen empty, and not
+    /// full, before its first byte was read: a child that writes what it has
+    /// whenever the pipe has room wrote the line later. The time is taken
+    /// just before a read that poll has reported ready, so the read never
+    /// waits. Only a read shorter than the pipe's capacity (and the buffer)
+    /// shows that: a full pipe may have left the child more to write. Such a
+    /// read that ends at a line's end is reported to the tap as well, once
+    /// it has been shown the lines the read completed.
+    fn forward(
+        source: BorrowedFd<'_>,
+        exited: BorrowedFd<'_>,
+        mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
+        mut lines: LineTap,
+        spawned_at: SystemTime,
+        limits: DrainLimits,
+    ) -> End {
+        let mut buf = vec![0; 64 * 1024];
+        let mut empty_at = spawned_at;
+        let mut drain: Option<Drain> = None;
+        loop {
+            let mut fds = [
+                PollFd::new(source, PollFlags::POLLIN),
+                PollFd::new(exited, PollFlags::POLLIN),
+            ];
+            let watched = if drain.is_some() { 1 } else { 2 };
+            let timeout = drain.as_ref().map_or(PollTimeout::NONE, Drain::timeout);
+            match poll(&mut fds[..watched], timeout) {
+                // Only a drain has a timeout: the pipe stayed empty.
+                Ok(0) if drain.as_ref().is_some_and(Drain::expired) => {
+                    return End::Drained("it stayed empty, held open by a descendant");
+                }
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(errno) => return End::PollFailed(errno),
+            }
+            if drain.is_none() && fds[1].revents().is_some_and(|events| !events.is_empty()) {
+                drain = Some(Drain::start(pending(source), limits));
+                continue;
+            }
+            if fds[0].revents().is_none_or(|events| events.is_empty()) {
+                continue;
+            }
+            let capacity = pipe_capacity(source).min(buf.len());
+            let before = SystemTime::now();
+            let read = match nix::unistd::read(source, &mut buf) {
+                Ok(0) => return End::Eof,
+                Ok(read) => read,
+                Err(Errno::EINTR | Errno::EAGAIN) => continue,
+                Err(errno) => return End::ReadFailed(errno),
+            };
+            if let Err(error) = write(&buf[..read]) {
+                // Returning drops the read end, so the child gets the same
+                // EPIPE it would have received writing to the client's pipe.
+                return End::WriteFailed(error);
+            }
+            lines.push(&buf[..read], empty_at, before);
+            let drained = read < capacity;
+            if drained {
+                empty_at = before;
+                lines.emptied();
+            }
+            if let Some(drain) = &mut drain
+                && drain.read(read, drained)
+            {
+                return End::Drained("it was empty once the cap had passed");
+            }
+        }
+    }
+
+    /// How many bytes the pipe can hold now, or 0 when that is unknown, so
+    /// that no read counts as emptying it. Linux pipes hold 64 KiB unless
+    /// resized.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn pipe_capacity(fd: BorrowedFd<'_>) -> usize {
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETPIPE_SZ)
+            .map_or(0, |size| usize::try_from(size).unwrap_or(0))
+    }
+
+    /// How many bytes the pipe can hold now, or 0 when that is unknown, so
+    /// that no read counts as emptying it. macOS reports a pipe's buffer as
+    /// its block size: 16 KiB at first, 64 KiB once a write needed more room
+    /// and the kernel had it to give. Elsewhere the block size may be
+    /// smaller than the buffer, which only counts fewer reads as emptying it.
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    fn pipe_capacity(fd: BorrowedFd<'_>) -> usize {
+        nix::sys::stat::fstat(fd).map_or(0, |stat| usize::try_from(stat.st_blksize).unwrap_or(0))
+    }
+
+    /// Bytes waiting in a pipe, or 0 when that is unknown.
+    fn pending(fd: BorrowedFd<'_>) -> usize {
+        let mut pending: libc::c_int = 0;
+        // SAFETY: FIONREAD stores one c_int for this open descriptor.
+        let status = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut pending) };
+        if status == 0 {
+            usize::try_from(pending).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Write all of `bytes` without changing the file status flags: the
+    /// client may have made its end nonblocking.
+    fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            match nix::unistd::write(fd, bytes) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(written) => bytes = &bytes[written..],
+                Err(Errno::EINTR) => {}
+                Err(Errno::EAGAIN) => {
+                    let _ = poll(
+                        &mut [PollFd::new(fd, PollFlags::POLLOUT)],
+                        PollTimeout::NONE,
+                    );
+                }
+                Err(errno) => return Err(errno.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Splits the copied bytes into lines for a [`StdoutTap`]. A tap that
+    /// panics is dropped; the copy continues without it.
+    struct LineTap {
+        tap: Option<Arc<dyn StdoutTap>>,
+        limit: usize,
+        /// Start of the current line, unless it outgrew `limit`.
+        line: Vec<u8>,
+        /// The `emitted_after` and start of the read holding the current
+        /// line's first byte; none between lines.
+        started: Option<(SystemTime, SystemTime)>,
+        overflowed: bool,
+    }
+
+    impl LineTap {
+        fn new(tap: Arc<dyn StdoutTap>, limit: usize) -> Self {
+            Self {
+                tap: Some(tap),
+                limit,
+                line: Vec::new(),
+                started: None,
+                overflowed: false,
+            }
+        }
+
+        /// One chunk as read; `emitted_after` is when the pipe was last seen
+        /// empty before that read, and `read_at` when the read began.
+        fn push(&mut self, mut chunk: &[u8], emitted_after: SystemTime, read_at: SystemTime) {
+            while self.tap.is_some()
+                && let Some(end) = chunk.iter().position(|&byte| byte == b'\n')
+            {
+                let head = &chunk[..end];
+                let (emitted, read) = self.started.take().unwrap_or((emitted_after, read_at));
+                if !self.overflowed && self.line.len() + head.len() <= self.limit {
+                    if self.line.is_empty() {
+                        self.tell(|tap| tap.observe(head, emitted, read));
+                    } else {
+                        let mut line = std::mem::take(&mut self.line);
+                        line.extend_from_slice(head);
+                        self.tell(|tap| tap.observe(&line, emitted, read));
+                    }
+                } else {
+                    self.tell(|tap| tap.skipped());
+                }
+                self.line.clear();
+                self.overflowed = false;
+                chunk = &chunk[end + 1..];
+            }
+            if self.tap.is_none() || chunk.is_empty() {
+                return;
+            }
+            self.started.get_or_insert((emitted_after, read_at));
+            if self.overflowed {
+                return;
+            }
+            if self.line.len() + chunk.len() <= self.limit {
+                self.line.extend_from_slice(chunk);
+            } else {
+                self.line = Vec::new();
+                self.overflowed = true;
+            }
+        }
+
+        /// The read last pushed found the pipe empty. The tap learns of it
+        /// only when that read ended at a line's end, so that it has been
+        /// shown everything read: part of a line may be a frame it would
+        /// need to see first.
+        fn emptied(&mut self) {
+            if self.started.is_none() {
+                self.tell(|tap| tap.emptied());
+            }
+        }
+
+        fn tell(&mut self, call: impl FnOnce(&dyn StdoutTap)) {
+            let Some(tap) = &self.tap else {
+                return;
+            };
+            if catch_unwind(AssertUnwindSafe(|| call(tap.as_ref()))).is_err() {
+                self.tap = None;
+                self.line = Vec::new();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::sync::Mutex;
+
+        /// One tap call or sink write, in the order the forwarder made them.
+        #[derive(Debug, Clone, PartialEq)]
+        enum Copied {
+            /// A line, its `emitted_after` and its `read_at`.
+            Observed(Vec<u8>, SystemTime, SystemTime),
+            Skipped,
+            Emptied,
+            Wrote(Vec<u8>),
+            Ended,
+        }
+
+        struct RecordingTap {
+            log: Arc<Mutex<Vec<Copied>>>,
+            panic_on_observe: bool,
+        }
+
+        impl StdoutTap for RecordingTap {
+            fn observe(&self, line: &[u8], emitted_after: SystemTime, read_at: SystemTime) {
+                self.log.lock().unwrap().push(Copied::Observed(
+                    line.to_vec(),
+                    emitted_after,
+                    read_at,
+                ));
+                assert!(!self.panic_on_observe, "tap failure");
+            }
+
+            fn skipped(&self) {
+                self.log.lock().unwrap().push(Copied::Skipped);
+            }
+
+            fn emptied(&self) {
+                self.log.lock().unwrap().push(Copied::Emptied);
+            }
+
+            fn child_exited(&self) {}
+
+            fn copy_ended(&self) {
+                self.log.lock().unwrap().push(Copied::Ended);
+            }
+        }
+
+        fn recording_tap(log: &Arc<Mutex<Vec<Copied>>>, panic_on_observe: bool) -> LineTap {
+            LineTap::new(
+                Arc::new(RecordingTap {
+                    log: log.clone(),
+                    panic_on_observe,
+                }),
+                256,
+            )
+        }
+
+        fn at(seconds: u64) -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+        }
+
+        const FAST: DrainLimits = DrainLimits {
+            idle: Duration::from_millis(200),
+            cap: Duration::from_secs(5),
+        };
+
+        /// Run [`forward`] on its own thread over a fresh pipe, as the
+        /// launcher does; the test plays the child, holding the write end.
+        struct Copier {
+            log: Arc<Mutex<Vec<Copied>>>,
+            child: Option<std::io::PipeWriter>,
+            /// Dropping it reports the child's exit.
+            exited: Option<std::io::PipeWriter>,
+            copier: Option<std::thread::JoinHandle<End>>,
+        }
+
+        impl Copier {
+            fn start(
+                sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
+                log: &Arc<Mutex<Vec<Copied>>>,
+                panic_on_observe: bool,
+                limits: DrainLimits,
+            ) -> Self {
+                Self::start_on(
+                    std::io::pipe().unwrap(),
+                    sink,
+                    log,
+                    panic_on_observe,
+                    limits,
+                )
+            }
+
+            /// [`Self::start`] over a pipe the test may have written to.
+            fn start_on(
+                (source, child): (std::io::PipeReader, std::io::PipeWriter),
+                sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
+                log: &Arc<Mutex<Vec<Copied>>>,
+                panic_on_observe: bool,
+                limits: DrainLimits,
+            ) -> Self {
+                let (exit_notice, exited) = std::io::pipe().unwrap();
+                let lines = recording_tap(log, panic_on_observe);
+                let copier = std::thread::spawn(move || {
+                    forward(
+                        source.as_fd(),
+                        exit_notice.as_fd(),
+                        sink,
+                        lines,
+                        at(1),
+                        limits,
+                    )
+                });
+                Self {
+                    log: log.clone(),
+                    child: Some(child),
+                    exited: Some(exited),
+                    copier: Some(copier),
+                }
+            }
+
+            fn recording(
+                log: &Arc<Mutex<Vec<Copied>>>,
+                panic_on_observe: bool,
+                limits: DrainLimits,
+            ) -> Self {
+                Self::recording_on(std::io::pipe().unwrap(), log, panic_on_observe, limits)
+            }
+
+            fn recording_on(
+                pipe: (std::io::PipeReader, std::io::PipeWriter),
+                log: &Arc<Mutex<Vec<Copied>>>,
+                panic_on_observe: bool,
+                limits: DrainLimits,
+            ) -> Self {
+                let sink = log.clone();
+                Self::start_on(
+                    pipe,
+                    move |bytes| {
+                        sink.lock().unwrap().push(Copied::Wrote(bytes.to_vec()));
+                        Ok(())
+                    },
+                    log,
+                    panic_on_observe,
+                    limits,
+                )
+            }
+
+            fn child(&mut self) -> &mut std::io::PipeWriter {
+                self.child.as_mut().unwrap()
+            }
+
+            /// Wait for the copy to end. A copy that never ends fails the
+            /// test instead of hanging it.
+            fn wait(self) -> Vec<Copied> {
+                self.wait_for_end().0
+            }
+
+            /// [`Self::wait`], with why the copy ended.
+            fn wait_for_end(mut self) -> (Vec<Copied>, End) {
+                let copier = self.copier.take().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !copier.is_finished() {
+                    assert!(Instant::now() < deadline, "the copy never ended");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let end = copier.join().unwrap();
+                (self.log.lock().unwrap().clone(), end)
+            }
+        }
+
+        fn written(copied: &[Copied]) -> Vec<u8> {
+            copied
+                .iter()
+                .filter_map(|event| match event {
+                    Copied::Wrote(bytes) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .flatten()
+                .copied()
+                .collect()
+        }
+
+        /// The lines shown, with their `emitted_after`.
+        fn observed(copied: &[Copied]) -> Vec<(Vec<u8>, SystemTime)> {
+            copied
+                .iter()
+                .filter_map(|event| match event {
+                    Copied::Observed(line, at, _) => Some((line.clone(), *at)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Lines of `data` as the tap must see them: those within the 256-byte
+        /// test limit, with the offset of their first byte and their newline.
+        fn expected_lines(data: &[u8]) -> Vec<(Vec<u8>, usize, usize)> {
+            let mut lines = Vec::new();
+            let mut start = 0;
+            while let Some(end) = data[start..].iter().position(|&byte| byte == b'\n') {
+                let line = &data[start..start + end];
+                if line.len() <= 256 {
+                    lines.push((line.to_vec(), start, start + end));
+                }
+                start += end + 1;
+            }
+            lines
+        }
+
+        fn sample() -> Vec<u8> {
+            let mut data = Vec::new();
+            for line in [
+                "{\"type\":\"assistant\",\"text\":\"h\u{e9}llo \u{2713} \u{1f389}\"}".as_bytes(),
+                b"{\"type\":\"user\"}\r",
+                b"",
+                // Over the 256-byte test limit: forwarded whole, never shown.
+                &[b'x'; 300],
+                "{\"type\":\"result\",\"result\":\"\u{2713}\"}".as_bytes(),
+            ] {
+                data.extend_from_slice(line);
+                data.push(b'\n');
+            }
+            // A final line without newline, ending inside a UTF-8 sequence.
+            data.extend_from_slice(b"partial \xe2\x9c");
+            data
+        }
+
+        #[test]
+        fn lines_carry_the_empty_time_of_the_read_holding_their_first_byte() {
+            let data = sample();
+            let lines = expected_lines(&data);
+            for seed in 1..=64u64 {
+                for max_read in [1, 2, 3, 7, 64, 100_000] {
+                    let log = Arc::new(Mutex::new(Vec::new()));
+                    let mut tap = recording_tap(&log, false);
+                    // Chunk `k` is stamped `k`, its read having begun at
+                    // `1000 + k`.
+                    let mut state = seed;
+                    let mut chunks = Vec::new();
+                    let mut offset = 0;
+                    while offset < data.len() {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let size = (1 + (state % max_read) as usize).min(data.len() - offset);
+                        chunks.push(offset);
+                        let stamp = chunks.len() as u64;
+                        tap.push(&data[offset..offset + size], at(stamp), at(1000 + stamp));
+                        offset += size;
+                    }
+                    let log = log.lock().unwrap();
+                    let shown: Vec<_> = log
+                        .iter()
+                        .filter_map(|event| match event {
+                            Copied::Observed(line, emitted, read) => Some((line, emitted, read)),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(shown.len(), lines.len(), "seed={seed} max_read={max_read}");
+                    for ((line, emitted, read), (expected, first, _)) in shown.iter().zip(&lines) {
+                        assert_eq!(*line, expected, "seed={seed} max_read={max_read}");
+                        let chunk = chunks.iter().rposition(|start| start <= first).unwrap() as u64;
+                        assert_eq!(**emitted, at(chunk + 1), "seed={seed}");
+                        assert_eq!(**read, at(1000 + chunk + 1), "seed={seed}");
+                    }
+                    // The over-limit line is reported in its place.
+                    let order: Vec<_> = log
+                        .iter()
+                        .map(|event| matches!(event, Copied::Skipped))
+                        .collect();
+                    assert_eq!(order, [false, false, false, true, false], "seed={seed}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_copy_is_byte_exact_and_shows_lines_only_once_written() {
+            let mut data = Vec::new();
+            for round in 0..40 {
+                data.extend_from_slice(&sample());
+                data.extend_from_slice(format!("\n{{\"round\":{round}}}\n").as_bytes());
+                // Larger than one read, so lines span reads.
+                data.extend_from_slice(&vec![b'z'; 20_000 + round * 997]);
+                data.push(b'\n');
+            }
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, FAST);
+            let mut state = 0x9e37_79b9_u64;
+            let mut offset = 0;
+            while offset < data.len() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let size = (1 + (state % 70_000) as usize).min(data.len() - offset);
+                copy.child()
+                    .write_all(&data[offset..offset + size])
+                    .unwrap();
+                offset += size;
+            }
+            copy.child.take();
+            let copied = copy.wait();
+            assert!(written(&copied) == data, "bytes differ");
+            let lines = expected_lines(&data);
+            assert_eq!(observed(&copied).len(), lines.len());
+            let mut sent = 0;
+            let mut shown = lines.iter();
+            for event in &copied {
+                match event {
+                    Copied::Wrote(bytes) => sent += bytes.len(),
+                    Copied::Observed(line, _, _) => {
+                        let (expected, _, newline) = shown.next().unwrap();
+                        assert_eq!(line, expected);
+                        assert!(sent > *newline, "shown before its newline was written");
+                    }
+                    Copied::Skipped | Copied::Emptied => {}
+                    Copied::Ended => panic!("forward itself never reports its end"),
+                }
+            }
+        }
+
+        /// What the tap was told, but the bytes written: a line shown,
+        /// `skipped` or `emptied`.
+        fn told(copied: &[Copied]) -> Vec<String> {
+            copied
+                .iter()
+                .filter_map(|event| match event {
+                    Copied::Observed(line, _, _) => Some(String::from_utf8_lossy(line).into()),
+                    Copied::Skipped => Some("skipped".into()),
+                    Copied::Emptied => Some("emptied".into()),
+                    Copied::Wrote(_) => None,
+                    Copied::Ended => Some("ended".into()),
+                })
+                .collect()
+        }
+
+        /// The tap hears that a read found the pipe empty only when that
+        /// read ended at a line's end, after the lines it completed: a read
+        /// that ends inside a line leaves it to the read that ends it. A
+        /// line spanning reads carries the start of the first.
+        #[test]
+        fn the_tap_hears_of_an_empty_pipe_only_when_a_read_ends_a_line() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, FAST);
+            let copied_up_to = |bytes: &[u8]| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while written(&log.lock().unwrap()) != bytes {
+                    assert!(Instant::now() < deadline, "not copied: {bytes:?}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            copy.child().write_all(b"one\n").unwrap();
+            copied_up_to(b"one\n");
+            let before_part = SystemTime::now();
+            copy.child().write_all(b"tw").unwrap();
+            copied_up_to(b"one\ntw");
+            let before_rest = SystemTime::now();
+            copy.child().write_all(b"o\n").unwrap();
+            copied_up_to(b"one\ntwo\n");
+            // Over the 256-byte test limit.
+            let mut long = vec![b'x'; 300];
+            long.push(b'\n');
+            copy.child().write_all(&long).unwrap();
+            copy.child.take();
+            let copied = copy.wait();
+            assert_eq!(
+                told(&copied),
+                ["one", "emptied", "two", "emptied", "skipped", "emptied"]
+            );
+            let read_at = copied
+                .iter()
+                .find_map(|event| match event {
+                    Copied::Observed(line, _, read_at) if line == b"two" => Some(*read_at),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(before_part <= read_at && read_at <= before_rest);
+        }
+
+        #[test]
+        fn a_line_follows_the_time_the_pipe_was_last_seen_empty() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, FAST);
+            let delivered = |count: usize| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while observed(&log.lock().unwrap()).len() < count {
+                    assert!(Instant::now() < deadline, "line not copied");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            let before_first = SystemTime::now();
+            copy.child().write_all(b"first\n").unwrap();
+            delivered(1);
+            let before_second = SystemTime::now();
+            copy.child().write_all(b"second\n").unwrap();
+            delivered(2);
+            copy.child.take();
+            let shown = observed(&copy.wait());
+            // Nothing was seen empty before the first line but the spawn.
+            assert_eq!(shown[0], (b"first".to_vec(), at(1)));
+            // The read that drained the first line began after it was
+            // written, and before the second one was.
+            let (line, emitted_after) = &shown[1];
+            assert_eq!(line, b"second");
+            assert!(before_first <= *emitted_after && *emitted_after <= before_second);
+        }
+
+        #[test]
+        fn a_line_is_written_before_its_newline_arrives() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, FAST);
+            copy.child().write_all(b"{\"type\":\"partial\"").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while written(&log.lock().unwrap()) != b"{\"type\":\"partial\"" {
+                assert!(
+                    Instant::now() < deadline,
+                    "the copy held back a partial line"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(observed(&log.lock().unwrap()).is_empty());
+            copy.child().write_all(b"}\n").unwrap();
+            copy.child.take();
+            let copied = copy.wait();
+            assert_eq!(written(&copied), b"{\"type\":\"partial\"}\n");
+            assert_eq!(
+                observed(&copied),
+                [(b"{\"type\":\"partial\"}".to_vec(), at(1))]
+            );
+        }
+
+        /// A read that takes all a full pipe held, however short of the
+        /// copy's buffer, does not show the pipe empty: the child may have
+        /// had more waiting for room, so a line read later keeps the time
+        /// from before.
+        #[test]
+        fn a_read_that_takes_a_full_pipe_leaves_the_empty_time() {
+            let (source, mut child) = std::io::pipe().unwrap();
+            // macOS pipes start at 16 KiB. Linux ones hold the copy's 64 KiB
+            // buffer, so shrink this one to what macOS starts with.
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            nix::fcntl::fcntl(child.as_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(16 * 1024))
+                .unwrap();
+            let capacity = pipe_capacity(source.as_fd());
+            assert!(capacity > 0 && capacity < 64 * 1024, "{capacity}");
+            // Filled before the copy starts, so its first read takes all of
+            // it, in writes small enough not to grow the pipe.
+            let mut chunk = vec![b'x'; 4096 - 1];
+            chunk.push(b'\n');
+            for _ in 0..capacity / chunk.len() {
+                child.write_all(&chunk).unwrap();
+            }
+            assert_eq!(pending(source.as_fd()), capacity, "the pipe is not full");
+            assert_eq!(pipe_capacity(source.as_fd()), capacity, "the pipe grew");
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording_on((source, child), &log, false, FAST);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while written(&log.lock().unwrap()).len() < capacity {
+                assert!(Instant::now() < deadline, "the full pipe was not copied");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            copy.child().write_all(b"late\n").unwrap();
+            copy.child.take();
+            let copied = copy.wait();
+            assert_eq!(written(&copied).len(), capacity + 5);
+            // The full lines are over the test limit, so never shown. The
+            // pipe was last seen empty at the spawn.
+            assert_eq!(observed(&copied), [(b"late".to_vec(), at(1))]);
+            // Nor does the tap hear of an empty pipe before `late` is read.
+            let mut expected = vec!["skipped"; capacity / chunk.len()];
+            expected.extend(["late", "emptied"]);
+            assert_eq!(told(&copied), expected);
+        }
+
+        #[test]
+        fn a_failed_tap_never_interrupts_the_copy() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, true, FAST);
+            copy.child().write_all(b"one\ntwo\nthree\n").unwrap();
+            copy.child.take();
+            let copied = copy.wait();
+            assert_eq!(written(&copied), b"one\ntwo\nthree\n");
+            // The first line panics the tap; nothing reaches it afterwards.
+            assert_eq!(observed(&copied), [(b"one".to_vec(), at(1))]);
+        }
+
+        #[test]
+        fn a_closed_client_stdout_closes_the_child_pipe_too() {
+            let (client, sink) = std::io::pipe().unwrap();
+            drop(client);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::start(
+                move |bytes| write_all(sink.as_fd(), bytes),
+                &log,
+                false,
+                FAST,
+            );
+            copy.child().write_all(b"{\"type\":\"result\"}\n").unwrap();
+            let mut child = copy.child.take().unwrap();
+            let (copied, end) = copy.wait_for_end();
+            assert!(copied.is_empty(), "a line nobody received was shown");
+            assert!(
+                matches!(&end, End::WriteFailed(error) if error.kind() == ErrorKind::BrokenPipe),
+                "{end:?}"
+            );
+            assert_eq!(
+                child.write_all(b"next\n").unwrap_err().kind(),
+                ErrorKind::BrokenPipe
+            );
+        }
+
+        /// The copy thread tells the tap when the copy ends, however it
+        /// ends, and does not wait for the child: a client that closed
+        /// stdout ends it at hcom's first failed write, although the child,
+        /// whose last line went into the pipe without error, runs on and
+        /// writes nothing more.
+        #[test]
+        fn the_tap_learns_that_the_copy_ended_while_the_child_runs_on() {
+            for client_closed in [true, false] {
+                let (client, sink) = std::io::pipe().unwrap();
+                let (source, child) = std::io::pipe().unwrap();
+                let mut child = Some(child);
+                let _client = (!client_closed).then_some(client);
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let tap = Arc::new(RecordingTap {
+                    log: log.clone(),
+                    panic_on_observe: false,
+                });
+                let forwarder = Forwarder::spawn(source.into(), sink.into(), tap, at(1)).unwrap();
+                if client_closed {
+                    let child = child.as_mut().unwrap();
+                    child.write_all(b"{\"type\":\"result\"}\n").unwrap();
+                } else {
+                    // EOF: every writer of the pipe closed it.
+                    child = None;
+                }
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !forwarder.thread.is_finished() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "client_closed={client_closed}: the copy never ended"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                forwarder.thread.join().unwrap();
+                assert_eq!(
+                    *log.lock().unwrap(),
+                    [Copied::Ended],
+                    "client_closed={client_closed}"
+                );
+                if let Some(mut child) = child {
+                    assert_eq!(
+                        child.write_all(b"next\n").unwrap_err().kind(),
+                        ErrorKind::BrokenPipe
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_nonblocking_client_stdout_is_waited_for_not_reconfigured() {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+            let (mut client, sink) = std::io::pipe().unwrap();
+            let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+            fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+            let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+            let reader = std::thread::spawn(move || {
+                // Let the pipe fill first, so the writer meets EAGAIN.
+                std::thread::sleep(Duration::from_millis(100));
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).unwrap();
+                received
+            });
+            write_all(sink.as_fd(), &data).unwrap();
+            let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+            assert!(flags.contains(OFlag::O_NONBLOCK));
+            drop(sink);
+            assert!(reader.join().unwrap() == data);
+        }
+
+        /// A client pipe filled to capacity, so the next write blocks until
+        /// the client reads. Returns the filler.
+        fn fill(sink: &std::io::PipeWriter) -> usize {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+            let flags = OFlag::from_bits_truncate(fcntl(sink.as_fd(), FcntlArg::F_GETFL).unwrap());
+            fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+            let mut filled = 0;
+            while let Ok(written) = nix::unistd::write(sink.as_fd(), &[b'.'; 4096]) {
+                filled += written;
+            }
+            fcntl(sink.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+            filled
+        }
+
+        #[test]
+        fn the_drain_delivers_everything_to_a_client_paused_past_the_idle_bound() {
+            for descendant in [false, true] {
+                let (mut client, sink) = std::io::pipe().unwrap();
+                let filler = fill(&sink);
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let mut copy = Copier::start(
+                    move |bytes| write_all(sink.as_fd(), bytes),
+                    &log,
+                    false,
+                    FAST,
+                );
+                // The child's last output: more than the client pipe holds
+                // with the filler still in it, less than the copy's buffer
+                // and the child pipe together, so the child can exit first.
+                let data: Vec<u8> = (0..60_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+                copy.child().write_all(&data).unwrap();
+                let held = copy.child.take().filter(|_| descendant);
+                copy.exited.take();
+                // The client reads nothing for several idle bounds.
+                std::thread::sleep(FAST.idle * 5);
+                let mut received = Vec::new();
+                let reader = std::thread::spawn(move || {
+                    client.read_to_end(&mut received).unwrap();
+                    received
+                });
+                let started = Instant::now();
+                copy.wait();
+                // With a descendant holding the pipe, the copy ends one idle
+                // bound after the pipe went empty.
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "descendant={descendant}"
+                );
+                drop(held);
+                let received = reader.join().unwrap();
+                assert_eq!(
+                    received.len(),
+                    filler + data.len(),
+                    "descendant={descendant}"
+                );
+                assert!(received[filler..] == data[..], "descendant={descendant}");
+            }
+        }
+
+        #[test]
+        fn a_descendant_holding_an_empty_pipe_ends_the_drain_at_the_idle_bound() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, FAST);
+            copy.child().write_all(b"last\n").unwrap();
+            let _descendant = copy.child.take();
+            std::thread::sleep(Duration::from_millis(50));
+            let exited = Instant::now();
+            copy.exited.take();
+            let copied = copy.wait();
+            let elapsed = exited.elapsed();
+            assert_eq!(written(&copied), b"last\n");
+            assert!(elapsed >= FAST.idle, "{elapsed:?}");
+            assert!(elapsed < FAST.idle + Duration::from_secs(2), "{elapsed:?}");
+        }
+
+        #[test]
+        fn past_the_cap_a_writing_descendant_ends_the_drain_once_the_pipe_is_empty() {
+            let limits = DrainLimits {
+                idle: Duration::from_secs(60),
+                cap: Duration::from_millis(300),
+            };
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, limits);
+            let mut descendant = copy.child.take().unwrap();
+            let writer = std::thread::spawn(move || {
+                let mut sent = 0;
+                // Until the copy is gone and the pipe breaks.
+                while descendant.write_all(b"tick\n").is_ok() {
+                    sent += 5;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                sent
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            let exited = Instant::now();
+            copy.exited.take();
+            let copied = copy.wait();
+            let elapsed = exited.elapsed();
+            assert!(elapsed >= limits.cap, "{elapsed:?}");
+            assert!(elapsed < limits.cap + Duration::from_secs(2), "{elapsed:?}");
+            assert!(written(&copied).chunks(5).all(|tick| tick == b"tick\n"));
+            // The read end closed with the copy, so the descendant's next
+            // write fails instead of blocking.
+            writer.join().unwrap();
+        }
+    }
 }
 
 /// Stable identity for one PID incarnation.

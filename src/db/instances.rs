@@ -1197,6 +1197,41 @@ impl HcomDb {
         Ok(())
     }
 
+    /// The row a foreground pipe client's launch still owns: the process
+    /// binding of `process_id` names it, it carries that launch token (a
+    /// takeover moves the token to its own supervisor), and it is not newer
+    /// than the binding, which was written for the incarnation it names.
+    pub fn get_stdio_owned_instance(&self, process_id: &str) -> Result<Option<InstanceRow>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT i.* FROM instances i JOIN process_bindings b ON b.instance_name = i.name
+                 WHERE b.process_id = ?1 AND i.created_at <= b.updated_at
+                   AND CASE WHEN json_valid(i.launch_context)
+                       THEN json_extract(i.launch_context, '$.process_id') = ?1 ELSE 0 END",
+            )?
+            .query_row(params![process_id], InstanceRow::from_row)
+            .optional()?)
+    }
+
+    /// Set the heartbeat of the row [`Self::get_stdio_owned_instance`] names
+    /// to `now` (epoch seconds), unless it stopped. One statement, so
+    /// ownership is checked where it is written. Unlike
+    /// [`Self::update_heartbeat`], this claims no TCP listener and never
+    /// touches status. Returns whether a row was refreshed.
+    pub fn update_stdio_heartbeat(&self, process_id: &str, now: i64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE instances SET last_stop = ?2
+             WHERE status != ?3
+               AND name = (SELECT instance_name FROM process_bindings WHERE process_id = ?1)
+               AND created_at <= (SELECT updated_at FROM process_bindings WHERE process_id = ?1)
+               AND CASE WHEN json_valid(launch_context)
+                   THEN json_extract(launch_context, '$.process_id') = ?1 ELSE 0 END",
+            params![process_id, now, ST_INACTIVE],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Update instance position with tcp_mode flag
     pub fn update_tcp_mode(&self, name: &str, tcp_mode: bool) -> Result<()> {
         self.conn.execute(
@@ -1211,6 +1246,7 @@ impl HcomDb {
 mod tests {
     use super::super::HcomDb;
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
+    use crate::shared::time::now_epoch_i64;
     use rusqlite::params;
 
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
@@ -1727,5 +1763,97 @@ mod tests {
         assert_eq!(instances[1]["name"], "nova");
 
         cleanup_test_db(db_path);
+    }
+
+    /// `name` as a stdio launch leaves it: bound to `process_id`, carrying its token.
+    fn stdio_owned_row(db: &HcomDb, name: &str, process_id: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, last_stop, tcp_mode, launch_context)
+                 VALUES (?1, 'listening', '', ?2, 1, 0, json_object('process_id', ?3))",
+                params![name, crate::shared::time::now_epoch_f64(), process_id],
+            )
+            .unwrap();
+        db.set_process_binding(process_id, "", name).unwrap();
+    }
+
+    #[test]
+    fn stdio_heartbeat_refreshes_only_the_row_its_launch_still_owns() {
+        let heartbeat = |db: &HcomDb| -> (i64, i64, String) {
+            db.conn
+                .query_row(
+                    "SELECT last_stop, tcp_mode, status FROM instances WHERE name = 'nova'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        let (db, db_path) = setup_full_test_db();
+        stdio_owned_row(&db, "nova", "proc-a");
+        assert_eq!(
+            db.get_stdio_owned_instance("proc-a").unwrap().unwrap().name,
+            "nova"
+        );
+        assert!(
+            db.update_stdio_heartbeat("proc-a", now_epoch_i64())
+                .unwrap()
+        );
+        let (last_stop, tcp_mode, status) = heartbeat(&db);
+        assert!(last_stop > 1);
+        assert_eq!(tcp_mode, 0, "a pipe client has no TCP listener");
+        assert_eq!(status, "listening");
+        assert!(
+            !db.update_stdio_heartbeat("proc-other", now_epoch_i64())
+                .unwrap()
+        );
+        cleanup_test_db(db_path);
+
+        type Change = (&'static str, fn(&HcomDb));
+        let changes: [Change; 5] = [
+            ("taken over by another supervisor", |db| {
+                db.conn
+                    .execute(
+                        "UPDATE instances SET launch_context = json_set(launch_context, '$.process_id', 'proc-b')
+                         WHERE name = 'nova'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+            ("bound before this incarnation existed", |db| {
+                db.conn
+                    .execute(
+                        "UPDATE process_bindings SET updated_at = 0 WHERE process_id = 'proc-a'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+            ("unbound", |db| db.delete_process_binding("proc-a").unwrap()),
+            ("stopped", |db| db.mark_killed("nova", "luna").unwrap()),
+            ("replaced by another launch", |db| {
+                db.delete_instance("nova").unwrap();
+                db.delete_process_bindings_for_instance("nova").unwrap();
+                stdio_owned_row(db, "nova", "proc-b");
+            }),
+        ];
+        for (change, apply) in changes {
+            let (db, db_path) = setup_full_test_db();
+            stdio_owned_row(&db, "nova", "proc-a");
+            apply(&db);
+            let before = heartbeat(&db);
+            assert!(
+                !db.update_stdio_heartbeat("proc-a", now_epoch_i64())
+                    .unwrap(),
+                "{change}"
+            );
+            // A stopped row is still the launch's own, but never refreshed.
+            assert_eq!(
+                db.get_stdio_owned_instance("proc-a").unwrap().is_some(),
+                change == "stopped",
+                "{change}"
+            );
+            assert_eq!(heartbeat(&db), before, "{change}");
+            assert_eq!(before.0, 1, "{change}");
+            cleanup_test_db(db_path);
+        }
     }
 }

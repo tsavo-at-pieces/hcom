@@ -658,6 +658,27 @@ pub fn try_set_status(
     context: &str,
     upd: StatusUpdate<'_>,
 ) -> anyhow::Result<()> {
+    try_set_status_where(
+        db,
+        || Ok(Some(instance_name.to_string())),
+        status,
+        context,
+        upd,
+    )?;
+    Ok(())
+}
+
+/// [`try_set_status`] for the row `pick` names inside the same write
+/// transaction, if it names one; returns that row. Its wake and subscriptions
+/// run once this transaction commits, so it must not run inside another
+/// write scope.
+pub fn try_set_status_where(
+    db: &HcomDb,
+    pick: impl FnOnce() -> anyhow::Result<Option<String>>,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+) -> anyhow::Result<Option<String>> {
     let StatusUpdate {
         detail,
         msg_ts,
@@ -669,7 +690,10 @@ pub fn try_set_status(
     // per hook instead of two. Wake and subscriptions run after commit so
     // woken readers see both.
     let committed = db.with_write_scope(|| {
-        let current_data = db.get_instance_full(instance_name)?;
+        let Some(instance_name) = pick()? else {
+            return Ok(None);
+        };
+        let current_data = db.get_instance_full(&instance_name)?;
         let now = now_epoch_i64();
         let mut updates = serde_json::Map::new();
         updates.insert("status".into(), serde_json::json!(status));
@@ -684,7 +708,7 @@ pub fn try_set_status(
         let old_status = current_data.as_ref().map(|d| d.status.as_str());
         let status_changed = old_status != Some(status);
 
-        db.update_instance_fields(instance_name, &updates)?;
+        db.update_instance_fields(&instance_name, &updates)?;
 
         let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
         let mut data = serde_json::json!({
@@ -712,20 +736,22 @@ pub fn try_set_status(
         }
         // Best-effort like the row update: a failed event must not roll it back.
         let event = db
-            .insert_event_row("status", instance_name, &data, None)
+            .insert_event_row("status", &instance_name, &data, None)
             .ok()
             .map(|id| (id, data));
-        Ok((status_changed, event))
+        Ok(Some((instance_name, status_changed, event)))
     });
 
-    let (status_changed, event) = committed?;
+    let Some((instance_name, status_changed, event)) = committed? else {
+        return Ok(None);
+    };
     if status_changed {
-        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+        crate::notify::wake(db, &instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
     if let Some((event_id, data)) = event {
-        db.after_event_logged(event_id, "status", instance_name, &data);
+        db.after_event_logged(event_id, "status", &instance_name, &data);
     }
-    Ok(())
+    Ok(Some(instance_name))
 }
 
 /// Delete placeholder instances that have been launching too long.

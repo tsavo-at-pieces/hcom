@@ -658,6 +658,39 @@ impl HcomDb {
             .unwrap_or(0)
     }
 
+    /// Whether `instance` logged a status event at or after `since` that
+    /// starts a turn: a prompt (`active`/`prompt`) or the delivery a prompt
+    /// hook makes instead (`active`/`deliver:*`). Timestamps are parsed and
+    /// compared at their microsecond precision; one that does not parse counts.
+    pub fn turn_started_since(&self, instance: &str, since: std::time::SystemTime) -> Result<bool> {
+        let since = chrono::DateTime::<chrono::Utc>::from(since);
+        // Callers hold the write lock, so skip a long session's old events
+        // before parsing anything. hcom stamps events in UTC with a fixed
+        // layout, so text a day earlier bounds them whatever the precision.
+        let window = (since - chrono::TimeDelta::days(1))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let since = since.timestamp_micros();
+        let mut statement = self.conn.prepare_cached(
+            "SELECT timestamp FROM events
+             WHERE type = 'status' AND instance = ?1 AND timestamp >= ?2
+               AND json_extract(data, '$.status') = 'active'
+               AND (json_extract(data, '$.context') = 'prompt'
+                    OR json_extract(data, '$.context') LIKE 'deliver:%')",
+        )?;
+        let mut rows = statement.query(params![instance, window])?;
+        while let Some(row) = rows.next()? {
+            let started = match chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(0)?) {
+                Ok(at) => at.timestamp_micros() >= since,
+                Err(_) => true,
+            };
+            if started {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Log a bare status event (test fixture for status-driven subscriptions).
     #[cfg(test)]
     pub fn log_status_event(
@@ -703,6 +736,78 @@ mod tests {
         assert_eq!(id2, id1 + 1);
 
         cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn turn_started_since_counts_prompts_and_deliveries_at_or_after_the_time() {
+        let (db, db_path) = setup_full_test_db();
+        let since =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(1_793_772_000_123_456).unwrap();
+        let micros = |offset: i64| {
+            (since + chrono::TimeDelta::microseconds(offset))
+                .format("%Y-%m-%dT%H:%M:%S%.6f+00:00")
+                .to_string()
+        };
+        let log = |instance: &str, at: &str, status: &str, context: &str| {
+            db.log_event_with_ts(
+                "status",
+                instance,
+                &serde_json::json!({"status": status, "context": context}),
+                Some(at),
+            )
+            .unwrap();
+        };
+        let started = |instance: &str| db.turn_started_since(instance, since.into()).unwrap();
+
+        // The prompt of the turn that wrote the frame, and what happens mid-turn.
+        log("nova", &micros(-1), "active", "prompt");
+        log("nova", &micros(-1), "active", "deliver:luna");
+        log("nova", &micros(5), "active", "tool:Bash");
+        log("nova", &micros(5), "blocked", "approval");
+        log("nova", &micros(5), "listening", "");
+        log("luna", &micros(5), "active", "prompt");
+        assert!(!started("nova"));
+        assert!(started("luna"), "another instance's prompt is its own");
+
+        // The same microsecond counts.
+        log("nova", &micros(0), "active", "prompt");
+        assert!(started("nova"));
+
+        let (db, db_path_2) = setup_full_test_db();
+        let log = |at: &str, context: &str| {
+            db.log_event_with_ts(
+                "status",
+                "nova",
+                &serde_json::json!({"status": "active", "context": context}),
+                Some(at),
+            )
+            .unwrap();
+        };
+        let started = || db.turn_started_since("nova", since.into()).unwrap();
+        // Other layouts are parsed, not compared as text.
+        log("2026-11-03T08:40:00Z", "prompt");
+        assert!(!started());
+        log(
+            &(since + chrono::TimeDelta::seconds(1)).to_rfc3339(),
+            "deliver:luna",
+        );
+        assert!(started());
+        let (db, db_path_3) = setup_full_test_db();
+        db.log_event_with_ts(
+            "status",
+            "nova",
+            &serde_json::json!({"status": "active", "context": "prompt"}),
+            Some(&format!("{}T99", micros(0).split('T').next().unwrap())),
+        )
+        .unwrap();
+        assert!(
+            db.turn_started_since("nova", since.into()).unwrap(),
+            "a timestamp that does not parse counts"
+        );
+
+        cleanup_test_db(db_path);
+        cleanup_test_db(db_path_2);
+        cleanup_test_db(db_path_3);
     }
 
     // Regression: a missing recipient must yield no unread messages, not the whole
