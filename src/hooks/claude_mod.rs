@@ -169,21 +169,24 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
                 opt_out(name)
             ),
         ),
-        _ if recently_busy(
-            db.path(),
-            session,
-            process,
-            current.as_ref().map_or(0.0, |s| s.checked_at),
-        ) =>
+        // A new session (/clear, /resume) has not finished its first wait yet.
+        Some(s) if s.checked_at == 0.0 && s.started_at + HEALTH_TIMEOUT >= now_epoch_f64() => {
+            ("", String::new())
+        }
+        _ if current
+            .as_ref()
+            .is_none_or(|s| s.checked_at + HEALTH_TIMEOUT < now_epoch_f64())
+            && recently_busy(
+                db.path(),
+                session,
+                process,
+                current.as_ref().map_or(0.0, |s| s.checked_at),
+            ) =>
         {
             (
                 "tui:mod-busy",
                 "Claude mod is retrying SQLite contention; messages remain queued".into(),
             )
-        }
-        // A new session (/clear, /resume) has not finished its first wait yet.
-        Some(s) if s.checked_at == 0.0 && s.started_at + HEALTH_TIMEOUT >= now_epoch_f64() => {
-            ("", String::new())
         }
         Some(s) if s.checked_at == 0.0 || s.checked_at + HEALTH_TIMEOUT < now_epoch_f64() => (
             "tui:mod-unavailable",
@@ -386,14 +389,14 @@ fn record_report(
     event: &str,
     detail: &str,
 ) -> Result<()> {
+    if event == "poll-busy" {
+        mark_busy(db.path(), session, process);
+    }
     db.with_write_scope(|| {
         let Some(mut current) = load(db, session, process)? else {
             log(&format!("claude.mod_{event}"), session, process, "", detail);
             return Ok(());
         };
-        if event == "poll-busy" {
-            mark_busy(db.path(), session, process);
-        }
         // Claude holds a submitted wake until the session is idle. When a turn
         // delivered the batch first (load() just saw the cursor move), the
         // hook blocks the late wake as having nothing pending: no failure.
@@ -588,6 +591,33 @@ mod tests {
             checked_at
         );
         assert_eq!(db.get_cursor("nova"), 0);
+    }
+
+    #[test]
+    fn a_short_busy_retry_does_not_flag_a_healthy_or_connecting_mod() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        load(&db, "session-1", "process-1").unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        report_health(&db, "process-1", "nova").unwrap();
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
+        finish(&db, "session-1", "process-1", false).unwrap();
+        mark_busy(db.path(), "session-1", "process-1");
+        report_health(&db, "process-1", "nova").unwrap();
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
     }
 
     #[test]
