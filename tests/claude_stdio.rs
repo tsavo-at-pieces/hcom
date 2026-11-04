@@ -1313,7 +1313,9 @@ fn claude_stdio_turn_read_whole_behind_a_stalled_client_keeps_a_prompt_sent_befo
 ///   `running` frame until the pipe refuses one, which is dropped, so that
 ///   the next turn's `running` frame waits;
 /// - `refused_before_result`: the same before the control response, so that
-///   the cancelled turn's result waits, with what follows it.
+///   the cancelled turn's result waits, with what follows it;
+/// - `exact`: they end at the idle frame's newline exactly at the pipe's
+///   capacity, in pages that Linux fills whole.
 ///
 /// A next prompt runs its hook while frames wait, and the next turn's own
 /// frames follow once the client has read on.
@@ -1352,6 +1354,8 @@ def flusher():
             while not out:
                 lock.wait()
         select.select([], [OUT], [])
+        # Far slower than Bun's few milliseconds, well within hcom's 2 s.
+        time.sleep(0.3)
         with lock:
             flush()
 
@@ -1427,8 +1431,17 @@ end = [control, result, state("idle")]
 if TAIL == "refused_before_result":
     while emit_if_taken(sized(len(frame(running)))):
         pass
+if TAIL == "exact":
+    page = os.sysconf("SC_PAGE_SIZE") if LINUX else 4096
+    capacity = fcntl.fcntl(OUT, getattr(fcntl, "F_GETPIPE_SZ", 1032)) if LINUX else 65536
+    held = sum(len(frame(f)) for f in (running, init, assistant))
+    emit(sized(page - held + (capacity // page - 2) * page))
+    emit(sized(page - sum(len(frame(f)) for f in end)))
 for f in end:
     emit(f)
+if TAIL == "exact":
+    with lock:
+        assert not out and in_pipe() == capacity, "the turn's frames did not fill the pipe"
 if TAIL == "refused_after_idle":
     while emit_if_taken(sized(len(frame(running)))):
         pass
@@ -1444,6 +1457,40 @@ if stdin.readline():
         pass
 flushed()
 "##;
+
+/// The cancelled turn's frames end exactly at the pipe's capacity, at the
+/// idle frame's newline: hcom takes them in one read that fills its buffer
+/// to what the pipe holds, which cannot show that Claude had nothing more
+/// waiting, and Claude then writes nothing more. Once the pipe has stayed
+/// empty longer than Claude takes to write what waits for room, the turn
+/// settles, with Claude still waiting on an open stdin and no new prompt.
+#[test]
+fn claude_stdio_turn_read_whole_to_the_pipe_capacity_settles_once_drained() {
+    let h = Hcom::new();
+    let mut turn = StalledTurn::start_with(&h, BUN_CLAUDE, &[("FAKE_TAIL", "exact")]);
+    assert_eq!(only_status(&h).unwrap().1, "prompt");
+    turn.read_through(WHOLE_TURN_IDLE);
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    // Bounded from the drain: 2 s of an empty pipe, then the recorder.
+    h.eventually(
+        "the cancelled turn to settle once drained",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+    assert!(
+        turn.hcom.try_wait().unwrap().is_none(),
+        "Claude stopped waiting on stdin"
+    );
+    turn.finish(&h);
+    assert_eq!(
+        contexts_from_the_first_prompt(&h),
+        ["prompt", "interrupted", "exit:0"]
+    );
+}
 
 /// The client sends the next prompt before it reads on, and that turn's
 /// `running` frame, short enough to be written whole or not at all, waits

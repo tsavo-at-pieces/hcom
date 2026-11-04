@@ -14,11 +14,11 @@ use std::process::Command;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub trait StdoutTap: Send + Sync {
     /// A complete line without its `\n`. The child wrote all of it after
-    /// `emitted_after`, a time at which its stdout pipe was seen empty with
-    /// room for any write it might have refused, so that a child writing
-    /// whatever it has as soon as the pipe has room had nothing waiting.
-    /// `read_at` is when the copy began the read that took the line's first
-    /// byte.
+    /// `emitted_after`: the spawn, or the start of a read that found its
+    /// stdout pipe empty as [`Self::emptied`] says, so that a child writing
+    /// whatever it has as soon as the pipe has room had nothing waiting
+    /// then. `read_at` is when the copy began the read that took the line's
+    /// first byte.
     fn observe(
         &self,
         line: &[u8],
@@ -27,11 +27,13 @@ pub trait StdoutTap: Send + Sync {
     );
     /// A complete line too long to be shown. It was copied whole.
     fn skipped(&self);
-    /// The copy found the pipe empty, with room for any write it might have
-    /// refused, with a read that ended at a line's end: the tap has been
-    /// shown, or told it skipped, every line read so far, and a child
-    /// writing whatever it has as soon as the pipe has room had nothing
-    /// waiting when that read began.
+    /// The copy found the pipe empty with a read that ended at a line's
+    /// end, and that showed a child writing whatever it has as soon as the
+    /// pipe has room to have had nothing waiting when the read began: the
+    /// read left room for any write the pipe might have refused, or the pipe
+    /// then stayed empty for longer than such a child takes to write what
+    /// waits. The tap has been shown, or told it skipped, every line read so
+    /// far.
     fn emptied(&self);
     /// The child has been reaped; its remaining output drains next.
     fn child_exited(&self);
@@ -189,6 +191,13 @@ mod tapped_stdout {
         cap: Duration::from_secs(30),
     };
 
+    /// How long the pipe must stay empty after a read that ended at a
+    /// line's end, but left too little room to show that the child had
+    /// nothing waiting, for that read to count as having emptied it: far
+    /// longer than a child writing what it has as soon as the pipe has room
+    /// takes once a read has emptied it (Bun 1.4.4 took at most 6 ms).
+    const SETTLE: Duration = Duration::from_secs(2);
+
     /// Copies the child's stdout to hcom's own on a dedicated thread.
     pub(super) struct Forwarder {
         thread: std::thread::JoinHandle<()>,
@@ -281,6 +290,7 @@ mod tapped_stdout {
                         lines,
                         spawned_at,
                         DRAIN,
+                        SETTLE,
                     );
                     // The tap first, so that what it stops has stopped by
                     // the time the end is logged.
@@ -403,18 +413,17 @@ mod tapped_stdout {
             }
         }
 
-        /// How long to wait for more output before the copy ends.
-        fn timeout(&self) -> PollTimeout {
+        /// How long to wait for more output before the copy ends, or none
+        /// while it may not end.
+        fn wait(&self) -> Option<Duration> {
             if self.owed > 0 {
-                return PollTimeout::NONE;
+                return None;
             }
-            let wait = if self.started.elapsed() >= self.limits.cap {
+            Some(if self.started.elapsed() >= self.limits.cap {
                 Duration::ZERO
             } else {
                 self.limits.idle.saturating_sub(self.last_read.elapsed())
-            };
-            // Rounded up: poll counts whole milliseconds.
-            PollTimeout::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(PollTimeout::MAX)
+            })
         }
 
         /// Whether the copy may end with the pipe empty now.
@@ -488,12 +497,14 @@ mod tapped_stdout {
     /// waiting to be written, before its first byte was read: a child that
     /// writes what it has whenever the pipe has room wrote the line later.
     /// The time is taken just before a read that poll has reported ready, so
-    /// the read never waits. Only a read that left room for any write the
-    /// pipe might have refused shows that ([`left_room_for_any_write`]): a
-    /// pipe refuses a short write before it is full, so a read that took
-    /// little less than the pipe holds may have left the child more to
-    /// write. Such a read that ends at a line's end is reported to the tap as
-    /// well, once it has been shown the lines the read completed.
+    /// the read never waits. A read that left room for any write the pipe
+    /// might have refused shows that at once ([`left_room_for_any_write`]).
+    /// One that took little less than the pipe holds may have left the child
+    /// more to write, as a pipe refuses a short write before it is full; if
+    /// it ended at a line's end, it shows that too once the pipe has then
+    /// stayed empty for `settle`, which such a child would not have left
+    /// empty so long. Either is reported to the tap as well, once it has been
+    /// shown the lines the read completed, if the read ended at a line's end.
     fn forward(
         source: BorrowedFd<'_>,
         exited: BorrowedFd<'_>,
@@ -501,23 +512,43 @@ mod tapped_stdout {
         mut lines: LineTap,
         spawned_at: SystemTime,
         limits: DrainLimits,
+        settle: Duration,
     ) -> End {
         let mut buf = vec![0; 64 * 1024];
         let mut empty_at = spawned_at;
         let mut drain: Option<Drain> = None;
+        // A read that ended at a line's end without showing the pipe empty:
+        // when it began, and when it was done.
+        let mut settling: Option<(SystemTime, Instant)> = None;
         loop {
             let mut fds = [
                 PollFd::new(source, PollFlags::POLLIN),
                 PollFd::new(exited, PollFlags::POLLIN),
             ];
             let watched = if drain.is_some() { 1 } else { 2 };
-            let timeout = drain.as_ref().map_or(PollTimeout::NONE, Drain::timeout);
-            match poll(&mut fds[..watched], timeout) {
-                // Only a drain has a timeout: the pipe stayed empty.
-                Ok(0) if drain.as_ref().is_some_and(Drain::expired) => {
-                    return End::Drained("it stayed empty, held open by a descendant");
+            let waits = [
+                drain.as_ref().and_then(Drain::wait),
+                settling.map(|(_, done)| settle.saturating_sub(done.elapsed())),
+            ];
+            match poll(
+                &mut fds[..watched],
+                poll_timeout(waits.into_iter().flatten().min()),
+            ) {
+                // Only a drain or a settle has a timeout: the pipe stayed
+                // empty.
+                Ok(0) => {
+                    if let Some((began, done)) = settling
+                        && done.elapsed() >= settle
+                    {
+                        settling = None;
+                        empty_at = began;
+                        lines.emptied();
+                    }
+                    if drain.as_ref().is_some_and(Drain::expired) {
+                        return End::Drained("it stayed empty, held open by a descendant");
+                    }
+                    continue;
                 }
-                Ok(0) => continue,
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
                 Err(errno) => return End::PollFailed(errno),
@@ -543,9 +574,12 @@ mod tapped_stdout {
                 return End::WriteFailed(error);
             }
             lines.push(&buf[..read], empty_at, before);
+            settling = None;
             if left_room_for_any_write(read, capacity, buf.len()) {
                 empty_at = before;
                 lines.emptied();
+            } else if lines.at_line_end() {
+                settling = Some((before, Instant::now()));
             }
             // Short of what the pipe or the buffer holds, the read took all
             // the pipe held.
@@ -556,6 +590,14 @@ mod tapped_stdout {
                 return End::Drained("it was empty once the cap had passed");
             }
         }
+    }
+
+    /// `wait` as a poll timeout, rounded up: poll counts whole milliseconds.
+    /// No wait is no timeout.
+    fn poll_timeout(wait: Option<Duration>) -> PollTimeout {
+        wait.map_or(PollTimeout::NONE, |wait| {
+            PollTimeout::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(PollTimeout::MAX)
+        })
     }
 
     /// Whether a read that took `read` bytes, of a pipe that could hold
@@ -700,12 +742,17 @@ mod tapped_stdout {
             }
         }
 
+        /// Whether the last chunk pushed ended at a line's end.
+        fn at_line_end(&self) -> bool {
+            self.started.is_none()
+        }
+
         /// The read last pushed found the pipe empty. The tap learns of it
         /// only when that read ended at a line's end, so that it has been
         /// shown everything read: part of a line may be a frame it would
         /// need to see first.
         fn emptied(&mut self) {
-            if self.started.is_none() {
+            if self.at_line_end() {
                 self.tell(|tap| tap.emptied());
             }
         }
@@ -787,6 +834,9 @@ mod tapped_stdout {
             cap: Duration::from_secs(5),
         };
 
+        /// A settle longer than any test runs.
+        const NO_SETTLE: Duration = Duration::from_secs(3600);
+
         /// Run [`forward`] on its own thread over a fresh pipe, as the
         /// launcher does; the test plays the child, holding the write end.
         struct Copier {
@@ -810,16 +860,19 @@ mod tapped_stdout {
                     log,
                     panic_on_observe,
                     limits,
+                    NO_SETTLE,
                 )
             }
 
-            /// [`Self::start`] over a pipe the test may have written to.
+            /// [`Self::start`] over a pipe the test may have written to,
+            /// with a settle of its own.
             fn start_on(
                 (source, child): (std::io::PipeReader, std::io::PipeWriter),
                 sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
                 log: &Arc<Mutex<Vec<Copied>>>,
                 panic_on_observe: bool,
                 limits: DrainLimits,
+                settle: Duration,
             ) -> Self {
                 let (exit_notice, exited) = std::io::pipe().unwrap();
                 let lines = recording_tap(log, panic_on_observe);
@@ -831,6 +884,7 @@ mod tapped_stdout {
                         lines,
                         at(1),
                         limits,
+                        settle,
                     )
                 });
                 Self {
@@ -855,6 +909,17 @@ mod tapped_stdout {
                 panic_on_observe: bool,
                 limits: DrainLimits,
             ) -> Self {
+                Self::settling_on(pipe, log, panic_on_observe, limits, NO_SETTLE)
+            }
+
+            /// [`Self::recording_on`] with a settle of its own.
+            fn settling_on(
+                pipe: (std::io::PipeReader, std::io::PipeWriter),
+                log: &Arc<Mutex<Vec<Copied>>>,
+                panic_on_observe: bool,
+                limits: DrainLimits,
+                settle: Duration,
+            ) -> Self {
                 let sink = log.clone();
                 Self::start_on(
                     pipe,
@@ -865,6 +930,7 @@ mod tapped_stdout {
                     log,
                     panic_on_observe,
                     limits,
+                    settle,
                 )
             }
 
@@ -1191,6 +1257,51 @@ mod tapped_stdout {
             let mut expected = vec!["skipped"; capacity / chunk.len()];
             expected.extend(["late", "emptied"]);
             assert_eq!(told(&copied), expected);
+        }
+
+        /// The same read, ending at a line's end, shows the pipe empty once
+        /// the pipe has stayed empty for the settle after it, with no other
+        /// write: the tap hears of the empty pipe then, not at once, and a
+        /// line read later carries that read's start.
+        #[test]
+        fn a_full_read_ending_a_line_shows_the_pipe_empty_once_it_stays_empty() {
+            let (source, mut child) = std::io::pipe().unwrap();
+            let capacity = pipe_capacity(source.as_fd());
+            let mut chunk = vec![b'x'; 4096 - 1];
+            chunk.push(b'\n');
+            for _ in 0..capacity / chunk.len() {
+                child.write_all(&chunk).unwrap();
+            }
+            assert_eq!(pending(source.as_fd()), capacity, "the pipe is not full");
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let started = SystemTime::now();
+            let mut copy =
+                Copier::settling_on((source, child), &log, false, FAST, Duration::from_secs(1));
+            let emptied =
+                |log: &Mutex<Vec<Copied>>| told(&log.lock().unwrap()).contains(&"emptied".into());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while written(&log.lock().unwrap()).len() < capacity {
+                assert!(Instant::now() < deadline, "the full pipe was not copied");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let copied = SystemTime::now();
+            assert!(!emptied(&log), "the copy reported the empty pipe at once");
+            while !emptied(&log) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the copy never reported the empty pipe"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            copy.child().write_all(b"late\n").unwrap();
+            copy.child.take();
+            let copied_events = copy.wait();
+            let mut expected = vec!["skipped"; capacity / chunk.len()];
+            expected.extend(["emptied", "late", "emptied"]);
+            assert_eq!(told(&copied_events), expected);
+            let (line, emitted_after) = observed(&copied_events).pop().unwrap();
+            assert_eq!(line, b"late");
+            assert!(started <= emitted_after && emitted_after <= copied);
         }
 
         /// A pipe refuses a short write that does not fit the room it has
