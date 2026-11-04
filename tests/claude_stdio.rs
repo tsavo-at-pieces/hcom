@@ -1035,154 +1035,261 @@ exit 0
     assert_no_registered_instances(&h);
 }
 
-/// A client that takes nothing for a whole cancelled turn leaves the copy no
-/// moment at which the pipe was seen empty after the turn's prompt. hcom
-/// cannot tell that turn's end from the end of one before the prompt, so it
-/// records neither the result nor the idle frame: the row stays as the hooks
-/// left it, while every byte still reaches the client.
-#[test]
-fn claude_stdio_turn_read_whole_behind_a_stalled_client_keeps_the_hooks_status() {
-    use std::os::fd::AsFd;
-
-    let h = Hcom::new();
-    let copy = h.root_path().join("native-stdout");
-    let wrote = h.root_path().join("wrote");
-    h.set_launch_envs(&[
-        ("FAKE_STDOUT_COPY", copy.to_str().unwrap()),
-        ("FAKE_WROTE", wrote.to_str().unwrap()),
-        ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
-    ]);
-    // Claude reports the `running` state before the prompt hook, and `init`
-    // and the turn's output after it. The frame before them is larger than
-    // the copy's buffer, so the copy is blocked on the client with a full
-    // read before the hook runs, however it is scheduled.
-    install_fake_claude(
-        &h,
-        r##"#!/bin/sh
+/// A Claude that runs one turn the client cancels, writing it as 2.1.309 does
+/// with session state events on: `running` before the prompt hook, `init`
+/// and the turn's output after it. The frame before them is larger than the
+/// copy's buffer, so a copy blocked on a client that takes nothing is
+/// blocked with a full read before the hook runs, however it is scheduled.
+/// A second prompt, if the client sends one, starts a turn left running.
+const WHOLE_TURN_CLAUDE: &str = r##"#!/bin/sh
 if [ "$1" = --version ]; then printf '2.1.309 (Claude Code)\n'; exit 0; fi
 sid=2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e
 emit() { printf '%s\n' "$1" >> "$FAKE_STDOUT_COPY"; printf '%s\n' "$1"; }
 hook() { printf '%s' "$2" | "$FAKE_HCOM" "$1" > /dev/null; }
+state() { emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"$1\",\"session_id\":\"$sid\"}"; }
 : > "$PWD/transcript.jsonl"
 hook sessionstart "{\"session_id\":\"$sid\",\"transcript_path\":\"$PWD/transcript.jsonl\",\"cwd\":\"$PWD\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}"
 emit "{\"type\":\"system\",\"subtype\":\"hook_response\",\"session_id\":\"$sid\"}"
 IFS= read -r line
 pad=$(head -c 70000 /dev/zero | tr '\0' p)
 emit "{\"type\":\"stream_event\",\"session_id\":\"$sid\",\"pad\":\"$pad\"}"
-emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"running\",\"session_id\":\"$sid\"}"
+state running
 hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"one\"}"
 emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
 emit "{\"type\":\"assistant\",\"session_id\":\"$sid\"}"
 IFS= read -r line
 emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"stop-1\"}}"
 emit "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"$sid\",\"terminal_reason\":\"aborted_streaming\",\"queued_turn_count\":0}"
-emit "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"idle\",\"session_id\":\"$sid\"}"
+state idle
 : > "$FAKE_WROTE"
+IFS= read -r line || exit 0
+state running
+hook userpromptsubmit "{\"session_id\":\"$sid\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"two\"}"
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+emit "{\"type\":\"assistant\",\"session_id\":\"$sid\",\"turn\":2}"
+: > "$FAKE_WROTE_NEXT"
 IFS= read -r line
 exit 0
-"##,
-    );
-    let (mut client, sink) = std::io::pipe().unwrap();
-    let filler = sink.try_clone().unwrap();
-    let mut hcom = h
-        .cmd()
-        .args([
-            "claude",
-            "--stdio",
-            "--go",
-            "--",
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(sink)
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut stdin = hcom.stdin.take().unwrap();
-    let mut received = Vec::new();
-    let mut chunk = [0u8; 65536];
-    while !received
-        .ends_with(b"\"hook_response\",\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\"}\n")
-    {
-        let read = client.read(&mut chunk).unwrap();
-        assert!(read > 0, "EOF before the session started");
-        received.extend_from_slice(&chunk[..read]);
+"##;
+
+/// The end of [`WHOLE_TURN_CLAUDE`]'s idle frame, and of the next turn's
+/// assistant frame.
+const WHOLE_TURN_IDLE: &[u8] =
+    b"\"state\":\"idle\",\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\"}\n";
+const WHOLE_TURN_NEXT: &[u8] =
+    b"\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\",\"turn\":2}\n";
+
+/// A [`WHOLE_TURN_CLAUDE`] session whose client took nothing from before
+/// the turn's prompt hook until its last frame, and cancelled it meanwhile.
+struct StalledTurn {
+    hcom: std::process::Child,
+    stdin: std::process::ChildStdin,
+    client: std::io::PipeReader,
+    received: Vec<u8>,
+    /// The filler that kept the client's pipe full.
+    filled: usize,
+    copy: std::path::PathBuf,
+    next_written: std::path::PathBuf,
+}
+
+impl StalledTurn {
+    fn start(h: &Hcom) -> Self {
+        use std::os::fd::AsFd;
+
+        let copy = h.root_path().join("native-stdout");
+        let wrote = h.root_path().join("wrote");
+        let next_written = h.root_path().join("wrote-next");
+        h.set_launch_envs(&[
+            ("FAKE_STDOUT_COPY", copy.to_str().unwrap()),
+            ("FAKE_WROTE", wrote.to_str().unwrap()),
+            ("FAKE_WROTE_NEXT", next_written.to_str().unwrap()),
+            ("FAKE_HCOM", env!("CARGO_BIN_EXE_hcom")),
+        ]);
+        install_fake_claude(h, WHOLE_TURN_CLAUDE);
+        let (client, sink) = std::io::pipe().unwrap();
+        let filler = sink.try_clone().unwrap();
+        let mut hcom = h
+            .cmd()
+            .args([
+                "claude",
+                "--stdio",
+                "--go",
+                "--",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(sink)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = hcom.stdin.take().unwrap();
+        let mut turn = Self {
+            hcom,
+            stdin,
+            client,
+            received: Vec::new(),
+            filled: 0,
+            copy,
+            next_written,
+        };
+        turn.read_through(
+            b"\"hook_response\",\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\"}\n",
+        );
+        // From here the client takes nothing: its pipe is full, so the copy
+        // blocks on its first read of the turn, before the prompt hook commits.
+        turn.filled = {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+            let flags =
+                OFlag::from_bits_truncate(fcntl(filler.as_fd(), FcntlArg::F_GETFL).unwrap());
+            fcntl(filler.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+            let mut filled = 0;
+            while let Ok(written) = nix::unistd::write(filler.as_fd(), &[b'.'; 4096]) {
+                filled += written;
+            }
+            fcntl(filler.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+            filled
+        };
+        drop(filler);
+        turn.send(
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "one"}}),
+        );
+        // Only preconditions: a loaded host may take long to run the hooks.
+        h.eventually("the prompt hook", Duration::from_secs(300), || {
+            Ok(only_status(h)
+                .is_some_and(|row| row.1 == "prompt")
+                .then_some(()))
+        });
+        turn.send(serde_json::json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}}));
+        h.eventually("the turn's last frame", Duration::from_secs(300), || {
+            Ok(wrote.exists().then_some(()))
+        });
+        turn
     }
-    // From here the client takes nothing: its pipe is full, so the copy
-    // blocks on its first read of the turn, before the prompt hook commits.
-    let filled = {
-        use nix::fcntl::{FcntlArg, OFlag, fcntl};
-        let flags = OFlag::from_bits_truncate(fcntl(filler.as_fd(), FcntlArg::F_GETFL).unwrap());
-        fcntl(filler.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
-        let mut filled = 0;
-        while let Ok(written) = nix::unistd::write(filler.as_fd(), &[b'.'; 4096]) {
-            filled += written;
+
+    fn send(&mut self, frame: serde_json::Value) {
+        writeln!(self.stdin, "{frame}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// The client reads on until `end` has arrived.
+    fn read_through(&mut self, end: &[u8]) {
+        let mut chunk = [0u8; 65536];
+        while !self.received.ends_with(end) {
+            let read = self.client.read(&mut chunk).unwrap();
+            assert!(read > 0, "EOF before {:?}", String::from_utf8_lossy(end));
+            self.received.extend_from_slice(&chunk[..read]);
         }
-        fcntl(filler.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
-        filled
-    };
-    drop(filler);
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"type": "user", "message": {"role": "user", "content": "one"}})
-    )
-    .unwrap();
-    // Only preconditions: a loaded host may take long to run the hooks.
-    h.eventually("the prompt hook", Duration::from_secs(300), || {
-        Ok(only_status(&h)
-            .is_some_and(|row| row.1 == "prompt")
-            .then_some(()))
-    });
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}})
-    )
-    .unwrap();
-    h.eventually("the turn's last frame", Duration::from_secs(300), || {
-        Ok(wrote.exists().then_some(()))
-    });
-    // The client reads on: the rest of the turn arrives in one read.
-    let idle = b"\"state\":\"idle\",\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\"}\n";
-    while !received.ends_with(idle) {
-        let read = client.read(&mut chunk).unwrap();
-        assert!(read > 0, "EOF before the idle frame");
-        received.extend_from_slice(&chunk[..read]);
     }
+
+    /// Close stdin, so that Claude exits 0, and check that every byte it
+    /// wrote reached the client.
+    fn finish(mut self, h: &Hcom) {
+        drop(self.stdin);
+        self.client.read_to_end(&mut self.received).unwrap();
+        assert_eq!(
+            wait_for_hcom(h, &mut self.hcom, Duration::from_secs(60)).code(),
+            Some(0)
+        );
+        let native = fs::read(&self.copy).unwrap();
+        let hook_response = native.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let received = &self.received;
+        assert!(received[..hook_response] == native[..hook_response]);
+        assert!(
+            received[hook_response..hook_response + self.filled]
+                .iter()
+                .all(|&b| b == b'.')
+        );
+        assert!(
+            received[hook_response + self.filled..] == native[hook_response..],
+            "stdout differs from the native output"
+        );
+        assert_no_registered_instances(h);
+    }
+}
+
+/// The status contexts from the first prompt on.
+fn contexts_from_the_first_prompt(h: &Hcom) -> Vec<String> {
+    let contexts = status_contexts(h);
+    let first_prompt = contexts
+        .iter()
+        .position(|context| context == "prompt")
+        .unwrap();
+    contexts[first_prompt..].to_vec()
+}
+
+/// A client that takes nothing for a whole cancelled turn leaves the copy no
+/// moment at which the pipe was seen empty after the turn's prompt, so hcom
+/// cannot tell the turn's end from the end of one before that prompt, and
+/// defers it. Once the client reads on and the copy finds the pipe empty
+/// after the idle frame, with nothing of a later turn read in between, the
+/// cancelled turn settles `listening`/`interrupted`, while Claude waits on an
+/// open stdin with no new prompt; and every byte reaches the client.
+#[test]
+fn claude_stdio_turn_read_whole_behind_a_stalled_client_settles_once_drained() {
+    let h = Hcom::new();
+    let mut turn = StalledTurn::start(&h);
+    assert_eq!(only_status(&h).unwrap().1, "prompt");
+    // The client reads on: the rest of the turn arrives in one read, which
+    // empties the pipe.
+    turn.read_through(WHOLE_TURN_IDLE);
+    let interrupted = Some((
+        "listening".to_string(),
+        "interrupted".to_string(),
+        "aborted_streaming".to_string(),
+    ));
+    // Bounded from the drain: the recorder has nothing left to wait for.
+    h.eventually(
+        "the cancelled turn to settle once drained",
+        Duration::from_secs(10),
+        || Ok((only_status(&h) == interrupted).then_some(())),
+    );
+    assert!(
+        turn.hcom.try_wait().unwrap().is_none(),
+        "Claude stopped waiting on stdin"
+    );
+    turn.finish(&h);
+    assert_eq!(
+        contexts_from_the_first_prompt(&h),
+        ["prompt", "interrupted", "exit:0"]
+    );
+}
+
+/// As above, but before the client reads on it sends the next prompt, whose
+/// hook commits before the copy reads the cancelled turn's end. Neither the
+/// old result nor its idle frame may end the new turn: the copy reads the
+/// new turn's `running` frame before it finds the pipe empty, so the
+/// deferred turn end is dropped and the row keeps the new prompt.
+#[test]
+fn claude_stdio_turn_read_whole_behind_a_stalled_client_keeps_a_prompt_sent_before_the_drain() {
+    let h = Hcom::new();
+    let mut turn = StalledTurn::start(&h);
+    turn.send(serde_json::json!({"type": "user", "message": {"role": "user", "content": "two"}}));
+    // Only preconditions: a loaded host may take long to run the hook.
+    h.eventually("the next prompt hook", Duration::from_secs(300), || {
+        let prompts = status_contexts(&h)
+            .iter()
+            .filter(|context| *context == "prompt")
+            .count();
+        Ok((prompts == 2).then_some(()))
+    });
+    h.eventually("the next turn's frames", Duration::from_secs(300), || {
+        Ok(turn.next_written.exists().then_some(()))
+    });
+    turn.read_through(WHOLE_TURN_NEXT);
     // Long enough for the recorder to have applied either frame.
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
         only_status(&h),
         Some(("active".to_string(), "prompt".to_string(), String::new()))
     );
-    drop(stdin);
-    client.read_to_end(&mut received).unwrap();
+    turn.finish(&h);
     assert_eq!(
-        wait_for_hcom(&h, &mut hcom, Duration::from_secs(60)).code(),
-        Some(0)
-    );
-    let native = fs::read(&copy).unwrap();
-    let hook_response = native.iter().position(|&b| b == b'\n').unwrap() + 1;
-    assert!(received[..hook_response] == native[..hook_response]);
-    assert!(
-        received[hook_response..hook_response + filled]
-            .iter()
-            .all(|&b| b == b'.')
-    );
-    assert!(
-        received[hook_response + filled..] == native[hook_response..],
-        "stdout differs from the native output"
-    );
-    assert_no_registered_instances(&h);
-    let contexts = status_contexts(&h);
-    assert!(
-        !contexts.iter().any(|context| context == "interrupted"),
-        "{contexts:?}"
+        contexts_from_the_first_prompt(&h),
+        ["prompt", "prompt", "exit:0"]
     );
 }
 

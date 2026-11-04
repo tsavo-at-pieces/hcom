@@ -7,7 +7,8 @@ use std::process::Command;
 
 /// Observes a pipe client's stdout while [`run_stdio_child`] copies it. The
 /// tap is shown each complete line only after hcom's stdout took it, and can
-/// change neither the bytes nor when they are written.
+/// change neither the bytes nor when they are written. Every call runs on
+/// the only copy of the stream: none may block.
 ///
 /// Off Unix, `run_stdio_child` refuses to start, so nothing calls a tap there.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -15,9 +16,21 @@ pub trait StdoutTap: Send + Sync {
     /// A complete line without its `\n`. The child wrote all of it after
     /// `emitted_after`, a time at which its stdout pipe was seen empty and
     /// not full, so that a child writing whatever it has as soon as the pipe
-    /// has room had nothing waiting. This runs on the only copy of the
-    /// stream: it must not block.
-    fn observe(&self, line: &[u8], emitted_after: std::time::SystemTime);
+    /// has room had nothing waiting. `read_at` is when the copy began the
+    /// read that took the line's first byte.
+    fn observe(
+        &self,
+        line: &[u8],
+        emitted_after: std::time::SystemTime,
+        read_at: std::time::SystemTime,
+    );
+    /// A complete line too long to be shown. It was copied whole.
+    fn skipped(&self);
+    /// The copy found the pipe empty, and not full, with a read that ended
+    /// at a line's end: the tap has been shown, or told it skipped, every
+    /// line read so far, and a child writing whatever it has as soon as the
+    /// pipe has room had nothing waiting when that read began.
+    fn emptied(&self);
     /// The child has been reaped; its remaining output drains next.
     fn child_exited(&self);
     /// The copy has ended: at EOF, at a write to hcom's stdout that failed
@@ -474,7 +487,9 @@ mod tapped_stdout {
     /// whenever the pipe has room wrote the line later. The time is taken
     /// just before a read that poll has reported ready, so the read never
     /// waits. Only a read shorter than the pipe's capacity (and the buffer)
-    /// shows that: a full pipe may have left the child more to write.
+    /// shows that: a full pipe may have left the child more to write. Such a
+    /// read that ends at a line's end is reported to the tap as well, once
+    /// it has been shown the lines the read completed.
     fn forward(
         source: BorrowedFd<'_>,
         exited: BorrowedFd<'_>,
@@ -523,10 +538,11 @@ mod tapped_stdout {
                 // EPIPE it would have received writing to the client's pipe.
                 return End::WriteFailed(error);
             }
-            lines.push(&buf[..read], empty_at);
+            lines.push(&buf[..read], empty_at, before);
             let drained = read < capacity;
             if drained {
                 empty_at = before;
+                lines.emptied();
             }
             if let Some(drain) = &mut drain
                 && drain.read(read, drained)
@@ -594,8 +610,9 @@ mod tapped_stdout {
         limit: usize,
         /// Start of the current line, unless it outgrew `limit`.
         line: Vec<u8>,
-        /// The `emitted_after` of the read holding the current line's first byte.
-        started: Option<SystemTime>,
+        /// The `emitted_after` and start of the read holding the current
+        /// line's first byte; none between lines.
+        started: Option<(SystemTime, SystemTime)>,
         overflowed: bool,
     }
 
@@ -611,21 +628,23 @@ mod tapped_stdout {
         }
 
         /// One chunk as read; `emitted_after` is when the pipe was last seen
-        /// empty before that read.
-        fn push(&mut self, mut chunk: &[u8], emitted_after: SystemTime) {
+        /// empty before that read, and `read_at` when the read began.
+        fn push(&mut self, mut chunk: &[u8], emitted_after: SystemTime, read_at: SystemTime) {
             while self.tap.is_some()
                 && let Some(end) = chunk.iter().position(|&byte| byte == b'\n')
             {
                 let head = &chunk[..end];
-                let started = self.started.take().unwrap_or(emitted_after);
+                let (emitted, read) = self.started.take().unwrap_or((emitted_after, read_at));
                 if !self.overflowed && self.line.len() + head.len() <= self.limit {
                     if self.line.is_empty() {
-                        self.call(head, started);
+                        self.tell(|tap| tap.observe(head, emitted, read));
                     } else {
                         let mut line = std::mem::take(&mut self.line);
                         line.extend_from_slice(head);
-                        self.call(&line, started);
+                        self.tell(|tap| tap.observe(&line, emitted, read));
                     }
+                } else {
+                    self.tell(|tap| tap.skipped());
                 }
                 self.line.clear();
                 self.overflowed = false;
@@ -634,7 +653,7 @@ mod tapped_stdout {
             if self.tap.is_none() || chunk.is_empty() {
                 return;
             }
-            self.started.get_or_insert(emitted_after);
+            self.started.get_or_insert((emitted_after, read_at));
             if self.overflowed {
                 return;
             }
@@ -646,11 +665,21 @@ mod tapped_stdout {
             }
         }
 
-        fn call(&mut self, line: &[u8], emitted_after: SystemTime) {
+        /// The read last pushed found the pipe empty. The tap learns of it
+        /// only when that read ended at a line's end, so that it has been
+        /// shown everything read: part of a line may be a frame it would
+        /// need to see first.
+        fn emptied(&mut self) {
+            if self.started.is_none() {
+                self.tell(|tap| tap.emptied());
+            }
+        }
+
+        fn tell(&mut self, call: impl FnOnce(&dyn StdoutTap)) {
             let Some(tap) = &self.tap else {
                 return;
             };
-            if catch_unwind(AssertUnwindSafe(|| tap.observe(line, emitted_after))).is_err() {
+            if catch_unwind(AssertUnwindSafe(|| call(tap.as_ref()))).is_err() {
                 self.tap = None;
                 self.line = Vec::new();
             }
@@ -666,7 +695,10 @@ mod tapped_stdout {
         /// One tap call or sink write, in the order the forwarder made them.
         #[derive(Debug, Clone, PartialEq)]
         enum Copied {
-            Observed(Vec<u8>, SystemTime),
+            /// A line, its `emitted_after` and its `read_at`.
+            Observed(Vec<u8>, SystemTime, SystemTime),
+            Skipped,
+            Emptied,
             Wrote(Vec<u8>),
             Ended,
         }
@@ -677,12 +709,21 @@ mod tapped_stdout {
         }
 
         impl StdoutTap for RecordingTap {
-            fn observe(&self, line: &[u8], emitted_after: SystemTime) {
-                self.log
-                    .lock()
-                    .unwrap()
-                    .push(Copied::Observed(line.to_vec(), emitted_after));
+            fn observe(&self, line: &[u8], emitted_after: SystemTime, read_at: SystemTime) {
+                self.log.lock().unwrap().push(Copied::Observed(
+                    line.to_vec(),
+                    emitted_after,
+                    read_at,
+                ));
                 assert!(!self.panic_on_observe, "tap failure");
+            }
+
+            fn skipped(&self) {
+                self.log.lock().unwrap().push(Copied::Skipped);
+            }
+
+            fn emptied(&self) {
+                self.log.lock().unwrap().push(Copied::Emptied);
             }
 
             fn child_exited(&self) {}
@@ -827,11 +868,12 @@ mod tapped_stdout {
                 .collect()
         }
 
+        /// The lines shown, with their `emitted_after`.
         fn observed(copied: &[Copied]) -> Vec<(Vec<u8>, SystemTime)> {
             copied
                 .iter()
                 .filter_map(|event| match event {
-                    Copied::Observed(line, at) => Some((line.clone(), *at)),
+                    Copied::Observed(line, at, _) => Some((line.clone(), *at)),
                     _ => None,
                 })
                 .collect()
@@ -878,7 +920,8 @@ mod tapped_stdout {
                 for max_read in [1, 2, 3, 7, 64, 100_000] {
                     let log = Arc::new(Mutex::new(Vec::new()));
                     let mut tap = recording_tap(&log, false);
-                    // Chunk `k` is stamped `k`: its read began after then.
+                    // Chunk `k` is stamped `k`, its read having begun at
+                    // `1000 + k`.
                     let mut state = seed;
                     let mut chunks = Vec::new();
                     let mut offset = 0;
@@ -888,16 +931,31 @@ mod tapped_stdout {
                         state ^= state << 17;
                         let size = (1 + (state % max_read) as usize).min(data.len() - offset);
                         chunks.push(offset);
-                        tap.push(&data[offset..offset + size], at(chunks.len() as u64));
+                        let stamp = chunks.len() as u64;
+                        tap.push(&data[offset..offset + size], at(stamp), at(1000 + stamp));
                         offset += size;
                     }
-                    let shown = observed(&log.lock().unwrap());
+                    let log = log.lock().unwrap();
+                    let shown: Vec<_> = log
+                        .iter()
+                        .filter_map(|event| match event {
+                            Copied::Observed(line, emitted, read) => Some((line, emitted, read)),
+                            _ => None,
+                        })
+                        .collect();
                     assert_eq!(shown.len(), lines.len(), "seed={seed} max_read={max_read}");
-                    for ((line, stamp), (expected, first, _)) in shown.iter().zip(&lines) {
-                        assert_eq!(line, expected, "seed={seed} max_read={max_read}");
-                        let chunk = chunks.iter().rposition(|start| start <= first).unwrap();
-                        assert_eq!(*stamp, at(chunk as u64 + 1), "seed={seed}");
+                    for ((line, emitted, read), (expected, first, _)) in shown.iter().zip(&lines) {
+                        assert_eq!(*line, expected, "seed={seed} max_read={max_read}");
+                        let chunk = chunks.iter().rposition(|start| start <= first).unwrap() as u64;
+                        assert_eq!(**emitted, at(chunk + 1), "seed={seed}");
+                        assert_eq!(**read, at(1000 + chunk + 1), "seed={seed}");
                     }
+                    // The over-limit line is reported in its place.
+                    let order: Vec<_> = log
+                        .iter()
+                        .map(|event| matches!(event, Copied::Skipped))
+                        .collect();
+                    assert_eq!(order, [false, false, false, true, false], "seed={seed}");
                 }
             }
         }
@@ -936,14 +994,73 @@ mod tapped_stdout {
             for event in &copied {
                 match event {
                     Copied::Wrote(bytes) => sent += bytes.len(),
-                    Copied::Observed(line, _) => {
+                    Copied::Observed(line, _, _) => {
                         let (expected, _, newline) = shown.next().unwrap();
                         assert_eq!(line, expected);
                         assert!(sent > *newline, "shown before its newline was written");
                     }
+                    Copied::Skipped | Copied::Emptied => {}
                     Copied::Ended => panic!("forward itself never reports its end"),
                 }
             }
+        }
+
+        /// What the tap was told, but the bytes written: a line shown,
+        /// `skipped` or `emptied`.
+        fn told(copied: &[Copied]) -> Vec<String> {
+            copied
+                .iter()
+                .filter_map(|event| match event {
+                    Copied::Observed(line, _, _) => Some(String::from_utf8_lossy(line).into()),
+                    Copied::Skipped => Some("skipped".into()),
+                    Copied::Emptied => Some("emptied".into()),
+                    Copied::Wrote(_) => None,
+                    Copied::Ended => Some("ended".into()),
+                })
+                .collect()
+        }
+
+        /// The tap hears that a read found the pipe empty only when that
+        /// read ended at a line's end, after the lines it completed: a read
+        /// that ends inside a line leaves it to the read that ends it. A
+        /// line spanning reads carries the start of the first.
+        #[test]
+        fn the_tap_hears_of_an_empty_pipe_only_when_a_read_ends_a_line() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut copy = Copier::recording(&log, false, FAST);
+            let copied_up_to = |bytes: &[u8]| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while written(&log.lock().unwrap()) != bytes {
+                    assert!(Instant::now() < deadline, "not copied: {bytes:?}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            copy.child().write_all(b"one\n").unwrap();
+            copied_up_to(b"one\n");
+            let before_part = SystemTime::now();
+            copy.child().write_all(b"tw").unwrap();
+            copied_up_to(b"one\ntw");
+            let before_rest = SystemTime::now();
+            copy.child().write_all(b"o\n").unwrap();
+            copied_up_to(b"one\ntwo\n");
+            // Over the 256-byte test limit.
+            let mut long = vec![b'x'; 300];
+            long.push(b'\n');
+            copy.child().write_all(&long).unwrap();
+            copy.child.take();
+            let copied = copy.wait();
+            assert_eq!(
+                told(&copied),
+                ["one", "emptied", "two", "emptied", "skipped", "emptied"]
+            );
+            let read_at = copied
+                .iter()
+                .find_map(|event| match event {
+                    Copied::Observed(line, _, read_at) if line == b"two" => Some(*read_at),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(before_part <= read_at && read_at <= before_rest);
         }
 
         #[test]
@@ -1035,6 +1152,10 @@ mod tapped_stdout {
             // The full lines are over the test limit, so never shown. The
             // pipe was last seen empty at the spawn.
             assert_eq!(observed(&copied), [(b"late".to_vec(), at(1))]);
+            // Nor does the tap hear of an empty pipe before `late` is read.
+            let mut expected = vec!["skipped"; capacity / chunk.len()];
+            expected.extend(["late", "emptied"]);
+            assert_eq!(told(&copied), expected);
         }
 
         #[test]

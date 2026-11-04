@@ -79,10 +79,30 @@ the last time hcom saw the pipe empty, and not full, before reading it. That
 keeps a turn end from overwriting the next turn's prompt as long as Claude
 writes a turn's result before it runs the next prompt hook, and writes what
 it has queued as soon as the pipe has room, as Claude 2.1.309 does (it holds
-results back only once its input has closed). When hcom cannot tell, for
-example because it read a whole turn at once, the status stays as the hooks
-left it. Nothing on stdout stops a session or delivers a message: queued
-messages still wait for the next native prompt.
+results back only once its input has closed).
+
+When hcom saw no empty pipe between a turn's prompt and its end, because it
+read the whole turn at once or the client took nothing for the whole turn,
+that prompt may be the turn's own or the next one's, so the turn end waits
+and the status stays as the hooks left it. Once hcom has read through the
+turn end (and the idle frame after a result) and then finds the pipe empty,
+and not full, at the end of a line, with no frame of a later turn read in
+between (a session state other than `idle`, `init`, a message, a stream
+event or another result), it records the turn end under the same
+conditions, but counts prompts and deliveries only from when it began the
+read that took the turn end: Claude wrote the turn end after the turn's own
+prompt, so that one came before. A later turn's prompt is still seen
+because, with session state events on, Claude 2.1.309 writes `running` at
+the top of its loop, before the turn's prompt hook: a later turn that had
+started would have put that frame into the pipe before hcom found it empty,
+so its prompt hook ran after hcom began the read that found the pipe empty,
+which is no earlier than the read that took the turn end. Without session
+state events, a later turn writes nothing before its prompt hook, so such a
+turn end is dropped. It is dropped too if a frame of a later turn, or a line
+too long for hcom to inspect (over 16 MiB), comes first, or if the copy
+ends first, as nothing can then show the pipe empty. Nothing on stdout
+stops a session or delivers a message: queued messages still wait for the
+next native prompt.
 
 `--stdio` supports one local Claude print or Codex app-server process. It
 cannot be combined with multiple agents, an unsupported tool, a remote device,

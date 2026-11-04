@@ -1868,18 +1868,55 @@ pub(crate) struct StdioTurnEnd {
     /// The child wrote the frame after this time
     /// ([`crate::sys::process::StdoutTap::observe`]).
     emitted_after: SystemTime,
+    /// When the copy began the read that took the frame's first byte. Claude
+    /// wrote the frame after the turn's own prompt, so that prompt was
+    /// recorded earlier, unless the copy stalled for the turn's whole run
+    /// between taking this time and reading.
+    read_at: SystemTime,
+    /// The `session_state_changed` idle frame rather than the result.
+    idle: bool,
 }
 
-/// The turn end a stream-json stdout line reports, if any. This runs on the
-/// stdout copy: only a line naming a result or a session state is parsed, and
-/// only the top-level fields read here are kept.
+impl StdioTurnEnd {
+    pub(crate) fn idle(&self) -> bool {
+        self.idle
+    }
+}
+
+/// What a stream-json stdout line tells the recorder of a pipe client's turns.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StdioFrame {
+    /// The turn ended (see [`StdioTurnEnd`]).
+    TurnEnd(StdioTurnEnd),
+    /// `session_state_changed` with a state other than idle: a turn is under
+    /// way. With session state events on, Claude 2.1.309 writes `running` at
+    /// the top of its loop, before the turn's prompt hook.
+    TurnState,
+    /// Another frame only a turn writes: `system/init`, a message, a stream
+    /// event, or a result that ends no turn here.
+    TurnFrame,
+    /// Anything else, such as a control response, and every line that names
+    /// neither a result nor a session state unless `turn_frames` was asked.
+    Other,
+}
+
+/// What a stream-json stdout line reports. This runs on the stdout copy: only
+/// a line naming a result or a session state is parsed, unless `turn_frames`
+/// asks for every frame a turn writes (as the recorder does only while a
+/// turn end awaits [`reconcile_stdio_turn_end`]), and only the top-level
+/// fields read here are kept.
 ///
 /// A top-level `result` frame ends the turn unless a queued turn follows or
 /// the host shut the process down mid-turn. `session_state_changed` with state
 /// `idle` ends it too: Claude writes it right after the result when the client
 /// opts into session state events. A frame without a session id cannot be tied
 /// to the bound conversation.
-pub(crate) fn stdio_turn_end(line: &[u8], emitted_after: SystemTime) -> Option<StdioTurnEnd> {
+pub(crate) fn stdio_frame(
+    line: &[u8],
+    emitted_after: SystemTime,
+    read_at: SystemTime,
+    turn_frames: bool,
+) -> StdioFrame {
     #[derive(Deserialize)]
     struct Frame {
         #[serde(rename = "type", default)]
@@ -1900,22 +1937,28 @@ pub(crate) fn stdio_turn_end(line: &[u8], emitted_after: SystemTime) -> Option<S
         interrupted_by_shutdown: Value,
     }
 
-    let text = std::str::from_utf8(line).ok()?;
+    let Ok(text) = std::str::from_utf8(line) else {
+        return StdioFrame::Other;
+    };
     if !text.trim_start().starts_with('{')
-        || !(text.contains("\"result\"") || text.contains("\"session_state_changed\""))
+        || !(turn_frames
+            || text.contains("\"result\"")
+            || text.contains("\"session_state_changed\""))
     {
-        return None;
+        return StdioFrame::Other;
     }
-    let frame: Frame = serde_json::from_str(text).ok()?;
-    let (context, detail) = match frame.kind.as_str() {
-        Some("result") => {
+    let Ok(frame) = serde_json::from_str::<Frame>(text) else {
+        return StdioFrame::Other;
+    };
+    let (context, detail, idle) = match (frame.kind.as_str(), frame.subtype.as_str()) {
+        (Some("result"), _) => {
             if frame
                 .queued_turn_count
                 .as_i64()
                 .is_some_and(|count| count > 0)
                 || frame.interrupted_by_shutdown.as_bool() == Some(true)
             {
-                return None;
+                return StdioFrame::TurnFrame;
             }
             let reason = frame.terminal_reason.as_str();
             let context = match reason {
@@ -1926,23 +1969,45 @@ pub(crate) fn stdio_turn_end(line: &[u8], emitted_after: SystemTime) -> Option<S
                 ),
                 _ => String::new(),
             };
-            (context, reason.unwrap_or_default().to_string())
+            (context, reason.unwrap_or_default().to_string(), false)
         }
-        Some("system")
-            if frame.subtype.as_str() == Some("session_state_changed")
-                && frame.state.as_str() == Some("idle") =>
-        {
-            (String::new(), String::new())
+        (Some("system"), Some("session_state_changed")) => {
+            if frame.state.as_str() != Some("idle") {
+                return StdioFrame::TurnState;
+            }
+            (String::new(), String::new(), true)
         }
-        _ => return None,
+        (Some("system"), Some("init")) | (Some("assistant" | "user" | "stream_event"), _) => {
+            return StdioFrame::TurnFrame;
+        }
+        _ => return StdioFrame::Other,
     };
-    let session_id = frame.session_id.as_str().filter(|id| !id.is_empty())?;
-    Some(StdioTurnEnd {
-        session_id: session_id.to_string(),
-        context,
-        detail,
-        emitted_after,
-    })
+    match frame.session_id.as_str().filter(|id| !id.is_empty()) {
+        Some(session_id) => StdioFrame::TurnEnd(StdioTurnEnd {
+            session_id: session_id.to_string(),
+            context,
+            detail,
+            emitted_after,
+            read_at,
+            idle,
+        }),
+        None if idle => StdioFrame::Other,
+        None => StdioFrame::TurnFrame,
+    }
+}
+
+/// What became of a pipe client's turn end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StdioTurnEndOutcome {
+    /// The row is now `listening`.
+    Recorded,
+    /// The row is not this launch's, is in another session or is no longer
+    /// busy: the turn end has nothing left to do.
+    Refused,
+    /// Only the turn-start check refused it: a prompt or delivery was
+    /// recorded since the frame's `emitted_after`, possibly the turn's own.
+    /// It can wait for [`reconcile_stdio_turn_end`].
+    Deferred,
 }
 
 /// Mark a pipe client `listening` after a turn that ended without Stop. One
@@ -1966,15 +2031,66 @@ pub(crate) fn stdio_turn_end(line: &[u8], emitted_after: SystemTime) -> Option<S
 /// turn's `init` frame and output only after that (its `running` state comes
 /// before the hook); a read that empties the pipe after one of those moves
 /// the copy's empty time past the commit. When none did, as when the copy
-/// read the whole turn at once, the turn end is skipped, leaving the status
-/// as the hooks set it. Tool contexts and blocked states start no turn and
-/// never cause a skip.
+/// read the whole turn at once, the check cannot tell the turn's own prompt
+/// from the next one's: the turn end is deferred, leaving the status as the
+/// hooks set it until it is reconciled. Tool contexts and blocked states
+/// start no turn and never defer one.
 pub(crate) fn record_stdio_turn_end(
     db: &HcomDb,
     process_id: &str,
     end: &StdioTurnEnd,
+) -> Result<StdioTurnEndOutcome> {
+    set_stdio_turn_end(db, process_id, end, end.emitted_after, "stdio.turn_end")
+}
+
+/// Record a turn end [`record_stdio_turn_end`] deferred, once the copy has
+/// read through it (and through the idle frame after a result) and then
+/// found Claude's pipe empty and not full, at a line's end, with no frame of
+/// a later turn read in between: no `session_state_changed` other than
+/// idle, `system/init`, message, stream event or further result. The write
+/// transaction and its guards are the same, but the turn-start check counts
+/// from `read_at`, when the copy began the read that took the frame: the
+/// turn's own prompt was recorded before that (a copy stalled at that very
+/// point for the turn's whole run only leaves the turn end unrecorded), and
+/// a later turn's prompt after.
+///
+/// The latter rests on the writer model above and on one more fact of
+/// Claude 2.1.309: with session state events on, it writes `running` at the
+/// top of its loop, before the turn's prompt hook. The read that found the
+/// pipe empty, and not full, shows that Claude had nothing waiting to be
+/// written when that read began, no earlier than `read_at`. A later turn
+/// that had started by then would have had its `running` frame in the pipe,
+/// and the copy would have read it before finding the pipe empty; none came,
+/// so a later turn's prompt hook ran after that read began, and its prompt
+/// or delivery is seen. Without session state events, a later turn writes
+/// nothing before its prompt hook, so the recorder reconciles only a child
+/// that has written a session state frame. Returns whether it recorded it;
+/// a refusal is final.
+pub(crate) fn reconcile_stdio_turn_end(
+    db: &HcomDb,
+    process_id: &str,
+    end: &StdioTurnEnd,
 ) -> Result<bool> {
+    let outcome = set_stdio_turn_end(
+        db,
+        process_id,
+        end,
+        end.read_at,
+        "stdio.turn_end_reconciled",
+    )?;
+    Ok(outcome == StdioTurnEndOutcome::Recorded)
+}
+
+/// [`record_stdio_turn_end`] with the turn-start check counting from `since`.
+fn set_stdio_turn_end(
+    db: &HcomDb,
+    process_id: &str,
+    end: &StdioTurnEnd,
+    since: SystemTime,
+    event: &str,
+) -> Result<StdioTurnEndOutcome> {
     let emitted_after = crate::shared::time::system_time_to_epoch_f64(end.emitted_after);
+    let mut deferred = false;
     let recorded = lifecycle::try_set_status_where(
         db,
         || {
@@ -1984,8 +2100,11 @@ pub(crate) fn record_stdio_turn_end(
             if row.created_at > emitted_after
                 || row.session_id.as_deref() != Some(end.session_id.as_str())
                 || !matches!(row.status.as_str(), ST_ACTIVE | ST_BLOCKED)
-                || db.turn_started_since(&row.name, end.emitted_after)?
             {
+                return Ok(None);
+            }
+            if db.turn_started_since(&row.name, since)? {
+                deferred = true;
                 return Ok(None);
             }
             Ok(Some(row.name))
@@ -1998,18 +2117,22 @@ pub(crate) fn record_stdio_turn_end(
         },
     )?;
     let Some(name) = recorded else {
-        return Ok(false);
+        return Ok(if deferred {
+            StdioTurnEndOutcome::Deferred
+        } else {
+            StdioTurnEndOutcome::Refused
+        });
     };
     common::notify_hook_instance_with_db(db, &name);
     log::log_info(
         "hooks",
-        "stdio.turn_end",
+        event,
         &format!(
             "instance={name} context={} detail={}",
             end.context, end.detail
         ),
     );
-    Ok(true)
+    Ok(StdioTurnEndOutcome::Recorded)
 }
 
 /// Parent UserPromptSubmit: fallback bootstrap, PTY mode message delivery.
@@ -5580,10 +5703,23 @@ mod tests {
         assert!(ack.is_some());
     }
 
+    /// What a stream-json frame reports, with turn frames asked for or not.
+    fn frame_of(frame: &Value, turn_frames: bool) -> StdioFrame {
+        let line = frame.to_string();
+        stdio_frame(
+            line.as_bytes(),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            turn_frames,
+        )
+    }
+
     /// `(session, context, detail)` of the turn end a stream-json frame reports.
     fn turn_end(frame: Value) -> Option<(String, String, String)> {
-        stdio_turn_end(frame.to_string().as_bytes(), SystemTime::UNIX_EPOCH)
-            .map(|end| (end.session_id, end.context, end.detail))
+        match frame_of(&frame, false) {
+            StdioFrame::TurnEnd(end) => Some((end.session_id, end.context, end.detail)),
+            _ => None,
+        }
     }
 
     #[test]
@@ -5669,11 +5805,87 @@ mod tests {
             b"{\"type\":\"result\",\"session_id\":\"s\xff\"}",
             b"",
         ] {
-            assert_eq!(stdio_turn_end(line, SystemTime::UNIX_EPOCH), None);
+            for turn_frames in [false, true] {
+                assert_eq!(
+                    stdio_frame(
+                        line,
+                        SystemTime::UNIX_EPOCH,
+                        SystemTime::UNIX_EPOCH,
+                        turn_frames
+                    ),
+                    StdioFrame::Other
+                );
+            }
         }
-        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7);
-        let end = stdio_turn_end(br#"{"type":"result","session_id":"s"}"#, at).unwrap();
-        assert_eq!(end.emitted_after, at);
+        let emitted_after = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7);
+        let read_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9);
+        for (line, idle) in [
+            (&br#"{"type":"result","session_id":"s"}"#[..], false),
+            (
+                br#"{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"s"}"#,
+                true,
+            ),
+        ] {
+            let StdioFrame::TurnEnd(end) = stdio_frame(line, emitted_after, read_at, false) else {
+                panic!("no turn end");
+            };
+            assert_eq!(
+                (end.emitted_after, end.read_at, end.idle()),
+                (emitted_after, read_at, idle)
+            );
+        }
+    }
+
+    /// While a turn end awaits reconciliation, the recorder must hear of any
+    /// frame a later turn writes. `running` comes first, before the prompt
+    /// hook; the rest are told apart too.
+    #[test]
+    fn stdio_frame_tells_a_turn_s_frames_from_the_rest() {
+        use serde_json::json;
+        for state in ["running", "requires_action"] {
+            let frame = json!({"type": "system", "subtype": "session_state_changed",
+                "state": state, "session_id": "s"});
+            for turn_frames in [false, true] {
+                assert_eq!(
+                    frame_of(&frame, turn_frames),
+                    StdioFrame::TurnState,
+                    "{frame}"
+                );
+            }
+        }
+        for frame in [
+            json!({"type": "system", "subtype": "init", "session_id": "s"}),
+            json!({"type": "assistant", "message": {"content": []}, "session_id": "s"}),
+            json!({"type": "user", "message": {"content": "next"}, "session_id": "s"}),
+            json!({"type": "stream_event", "event": {"type": "message_start"}, "session_id": "s"}),
+            // Results that end no turn here.
+            json!({"type": "result", "is_error": false, "session_id": "s", "queued_turn_count": 1}),
+            json!({"type": "result", "is_error": true, "session_id": "s",
+                "interrupted_by_shutdown": true}),
+            json!({"type": "result", "is_error": false}),
+        ] {
+            assert_eq!(frame_of(&frame, true), StdioFrame::TurnFrame, "{frame}");
+        }
+        // Unasked, a frame that names neither a result nor a session state
+        // is never parsed.
+        assert_eq!(
+            frame_of(&json!({"type": "assistant", "session_id": "s"}), false),
+            StdioFrame::Other
+        );
+        for frame in [
+            json!({"type": "control_response",
+                "response": {"subtype": "success", "request_id": "stop-1"}}),
+            json!({"type": "keep_alive"}),
+            json!({"type": "system", "subtype": "status", "status": "compacting", "session_id": "s"}),
+            // An idle frame without a session ends no turn here.
+            json!({"type": "system", "subtype": "session_state_changed", "state": "idle"}),
+            json!(["assistant"]),
+            json!("result"),
+        ] {
+            for turn_frames in [false, true] {
+                assert_eq!(frame_of(&frame, turn_frames), StdioFrame::Other, "{frame}");
+            }
+        }
     }
 
     /// `nova` is the row stdio process `stdio-proc` owns, in session `sess-1`.
@@ -5702,11 +5914,25 @@ mod tests {
 
     /// A cancelled turn's result for `session_id`, written just now.
     fn stdio_result(session_id: &str, reason: &str) -> StdioTurnEnd {
+        let now = now_between();
+        stdio_result_read(session_id, reason, now, now)
+    }
+
+    /// [`stdio_result`] with the copy's times.
+    fn stdio_result_read(
+        session_id: &str,
+        reason: &str,
+        emitted_after: SystemTime,
+        read_at: SystemTime,
+    ) -> StdioTurnEnd {
         let frame = serde_json::json!({
             "type": "result", "subtype": "error_during_execution", "is_error": true,
             "session_id": session_id, "terminal_reason": reason, "queued_turn_count": 0,
         });
-        stdio_turn_end(frame.to_string().as_bytes(), now_between()).unwrap()
+        match stdio_frame(frame.to_string().as_bytes(), emitted_after, read_at, false) {
+            StdioFrame::TurnEnd(end) => end,
+            other => panic!("not a turn end: {other:?}"),
+        }
     }
 
     fn status_triplet(db: &HcomDb, name: &str) -> (String, String, String) {
@@ -5734,7 +5960,10 @@ mod tests {
         ] {
             let (_dir, _guard, db) = stdio_turn_db(status, context);
             let end = stdio_result("sess-1", reason);
-            assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+            assert_eq!(
+                record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+                StdioTurnEndOutcome::Recorded
+            );
             assert_eq!(
                 status_triplet(&db, "nova"),
                 (ST_LISTENING.into(), "interrupted".into(), reason.into()),
@@ -5748,10 +5977,16 @@ mod tests {
     fn stdio_turn_end_needs_the_launch_row_busy_in_the_frame_session() {
         let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
         let end = stdio_result("sess-1", "aborted_streaming");
-        assert!(!record_stdio_turn_end(&db, "other-proc", &end).unwrap());
+        assert_eq!(
+            record_stdio_turn_end(&db, "other-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Refused
+        );
         // Another session's frame never matches this row.
         let end = stdio_result("sess-x", "aborted_streaming");
-        assert!(!record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(
+            record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Refused
+        );
         assert_eq!(status_triplet(&db, "nova").1, "prompt");
 
         // Stop already recorded the turn end; stopped rows are never revived.
@@ -5762,8 +5997,9 @@ mod tests {
         ] {
             db.set_status("nova", status, context).unwrap();
             let end = stdio_result("sess-1", "aborted_streaming");
-            assert!(
-                !record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            assert_eq!(
+                record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+                StdioTurnEndOutcome::Refused,
                 "{status}/{context}"
             );
             assert_eq!(status_triplet(&db, "nova").1, context);
@@ -5858,8 +6094,20 @@ mod tests {
                 .unwrap()
                 .map(|row| (row.status, row.status_context, row.status_time));
             let events = status_event_count(&db);
+            // Only a turn start leaves the turn end anything to wait for.
+            let outcome = if change.starts_with("next prompt") {
+                StdioTurnEndOutcome::Deferred
+            } else {
+                StdioTurnEndOutcome::Refused
+            };
+            assert_eq!(
+                record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+                outcome,
+                "{change}"
+            );
+            // Nor would reconciling it, the copy having read it before.
             assert!(
-                !record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+                !reconcile_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
                 "{change}"
             );
             assert_eq!(
@@ -5889,7 +6137,12 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         userpromptsubmit_prompt(&db, &ctx, "next question");
-        assert!(!record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(
+            record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Deferred
+        );
+        // The prompt followed the read that took the frame, too.
+        assert!(!reconcile_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
         assert_eq!(status_triplet(&db, "nova").1, "prompt");
 
         // Mid-turn tool and permission states start no turn: a turn end
@@ -5898,7 +6151,10 @@ mod tests {
         let end = stdio_result("sess-1", "aborted_tools");
         lifecycle::set_status(&db, "nova", ST_ACTIVE, "tool:Bash", Default::default());
         lifecycle::set_status(&db, "nova", ST_BLOCKED, "approval", Default::default());
-        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(
+            record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Recorded
+        );
         assert_eq!(
             status_triplet(&db, "nova"),
             (
@@ -5914,11 +6170,14 @@ mod tests {
     fn stdio_idle_frame_ends_a_busy_turn_but_keeps_an_interrupted_one() {
         let idle = |db: &HcomDb| {
             let frame = br#"{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"sess-1"}"#;
-            let end = stdio_turn_end(frame, now_between()).unwrap();
+            let now = now_between();
+            let StdioFrame::TurnEnd(end) = stdio_frame(frame, now, now, false) else {
+                panic!("no turn end");
+            };
             record_stdio_turn_end(db, "stdio-proc", &end).unwrap()
         };
         let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "tool:Bash");
-        assert!(idle(&db));
+        assert_eq!(idle(&db), StdioTurnEndOutcome::Recorded);
         assert_eq!(
             status_triplet(&db, "nova"),
             (ST_LISTENING.into(), String::new(), String::new())
@@ -5926,9 +6185,91 @@ mod tests {
 
         let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
         let end = stdio_result("sess-1", "aborted_streaming");
-        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
-        assert!(!idle(&db), "the result already ended the turn");
+        assert_eq!(
+            record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Recorded
+        );
+        assert_eq!(
+            idle(&db),
+            StdioTurnEndOutcome::Refused,
+            "the result already ended the turn"
+        );
         assert_eq!(status_triplet(&db, "nova").1, "interrupted");
+    }
+
+    /// The whole-turn case: the copy saw no empty pipe between the turn's
+    /// prompt and its end, so the frame's `emitted_after` comes before that
+    /// prompt and the turn end is deferred. Reconciled once the copy found
+    /// the pipe empty after it, it counts from the read that took the frame,
+    /// which followed the prompt, under the same guards: any change the
+    /// turn end would yield to still refuses it.
+    #[test]
+    #[serial]
+    fn stdio_turn_end_deferred_behind_its_own_prompt_is_reconciled_from_its_read() {
+        type Change = (&'static str, bool, fn(&HcomDb));
+        let changes: [Change; 7] = [
+            ("nothing", true, |_| {}),
+            ("next prompt", false, |db| {
+                lifecycle::set_status(db, "nova", ST_ACTIVE, "prompt", Default::default())
+            }),
+            ("next prompt's delivery", false, |db| {
+                lifecycle::set_status(db, "nova", ST_ACTIVE, "deliver:luna", Default::default())
+            }),
+            ("late Stop", false, |db| {
+                lifecycle::set_status(db, "nova", ST_LISTENING, "", Default::default())
+            }),
+            ("killed", false, |db| {
+                db.mark_killed("nova", "luna").unwrap()
+            }),
+            ("session switched", false, |db| {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET session_id = 'sess-2' WHERE name = 'nova'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+            ("taken over by another supervisor", false, |db| {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET launch_context = json_set(launch_context, '$.process_id', 'next-proc')
+                         WHERE name = 'nova'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+        ];
+        for (change, reconciled, apply) in changes {
+            // The pipe was last seen empty before the prompt hook; the copy
+            // read the turn's result after it.
+            let emitted_after = now_between();
+            let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
+            let end =
+                stdio_result_read("sess-1", "aborted_streaming", emitted_after, now_between());
+            assert_eq!(
+                record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+                StdioTurnEndOutcome::Deferred,
+                "{change}"
+            );
+            assert_eq!(status_triplet(&db, "nova").1, "prompt", "{change}");
+            apply(&db);
+            let before = status_triplet(&db, "nova");
+            assert_eq!(
+                reconcile_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+                reconciled,
+                "{change}"
+            );
+            let expected = if reconciled {
+                (
+                    ST_LISTENING.into(),
+                    "interrupted".into(),
+                    "aborted_streaming".into(),
+                )
+            } else {
+                before
+            };
+            assert_eq!(status_triplet(&db, "nova"), expected, "{change}");
+        }
     }
 
     #[test]
@@ -5938,7 +6279,10 @@ mod tests {
         let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
         insert_broadcast_from_luna(&db, "sent during the cancelled turn");
         let end = stdio_result("sess-1", "aborted_streaming");
-        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(
+            record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Recorded
+        );
         assert_eq!(status_triplet(&db, "nova").1, "interrupted");
         assert_eq!(delivery_cursor(&db), 0);
         assert_eq!(db.get_unread_messages("nova").len(), 1);
@@ -5969,7 +6313,10 @@ mod tests {
             .unwrap();
         lifecycle::set_status(&db, "kole", ST_ACTIVE, "tool:Bash", Default::default());
         let end = stdio_result("sess-r", "aborted_tools");
-        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(
+            record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Recorded
+        );
         assert_eq!(
             status_triplet(&db, "kole"),
             (
@@ -6043,7 +6390,10 @@ mod tests {
         ];
 
         let end = stdio_result("sess-1", "aborted_streaming");
-        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        assert_eq!(
+            record_stdio_turn_end(&db, "stdio-proc", &end).unwrap(),
+            StdioTurnEndOutcome::Recorded
+        );
         for ((port, woken), expected) in listeners {
             let deadline = Instant::now() + std::time::Duration::from_secs(10);
             while !woken.is_finished() && Instant::now() < deadline {
