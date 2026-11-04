@@ -1949,8 +1949,9 @@ pub(crate) fn stdio_turn_end(line: &[u8], emitted_after: SystemTime) -> Option<S
 /// write transaction checks that the row is still this launch's (process
 /// binding, launch token and an incarnation no newer than the frame), is in
 /// the frame's session and still active or blocked, and that no turn started
-/// since the frame was written. Nothing is delivered: queued messages wait for
-/// the next native prompt.
+/// since the frame was written. Its wakes and subscriptions run once that
+/// transaction commits, as Stop's do. Nothing is delivered: queued messages
+/// wait for the next native prompt.
 ///
 /// The last check is sound because the child wrote the frame after
 /// `emitted_after`, while the next turn's prompt hook can only run once the
@@ -1968,29 +1969,28 @@ pub(crate) fn record_stdio_turn_end(
     end: &StdioTurnEnd,
 ) -> Result<bool> {
     let emitted_after = crate::shared::time::system_time_to_epoch_f64(end.emitted_after);
-    let recorded = db.with_write_scope(|| {
-        let Some(row) = db.get_stdio_owned_instance(process_id)? else {
-            return Ok(None);
-        };
-        if row.created_at > emitted_after
-            || row.session_id.as_deref() != Some(end.session_id.as_str())
-            || !matches!(row.status.as_str(), ST_ACTIVE | ST_BLOCKED)
-            || db.turn_started_since(&row.name, end.emitted_after)?
-        {
-            return Ok(None);
-        }
-        lifecycle::try_set_status(
-            db,
-            &row.name,
-            ST_LISTENING,
-            &end.context,
-            lifecycle::StatusUpdate {
-                detail: &end.detail,
-                ..Default::default()
-            },
-        )?;
-        Ok(Some(row.name))
-    })?;
+    let recorded = lifecycle::try_set_status_where(
+        db,
+        || {
+            let Some(row) = db.get_stdio_owned_instance(process_id)? else {
+                return Ok(None);
+            };
+            if row.created_at > emitted_after
+                || row.session_id.as_deref() != Some(end.session_id.as_str())
+                || !matches!(row.status.as_str(), ST_ACTIVE | ST_BLOCKED)
+                || db.turn_started_since(&row.name, end.emitted_after)?
+            {
+                return Ok(None);
+            }
+            Ok(Some(row.name))
+        },
+        ST_LISTENING,
+        &end.context,
+        lifecycle::StatusUpdate {
+            detail: &end.detail,
+            ..Default::default()
+        },
+    )?;
     let Some(name) = recorded else {
         return Ok(false);
     };
@@ -5973,6 +5973,85 @@ mod tests {
             )
         );
         assert_eq!(status_triplet(&db, "nova").1, "prompt");
+    }
+
+    /// Whoever a turn end wakes finds it: the row's delivery loops see the new
+    /// status and an idle subscriber its notice, because both wakes follow the
+    /// commit, as they do after Stop.
+    #[test]
+    #[serial]
+    fn stdio_turn_end_wakes_listeners_once_it_has_committed() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = stdio_turn_db(ST_ACTIVE, "prompt");
+        // luna ran `hcom events sub --idle nova` and listens.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at, last_event_id)
+                 VALUES ('luna', 'claude', 'listening', '', 1700000000.5, 0)",
+                [],
+            )
+            .unwrap();
+        let filters = std::collections::HashMap::from([
+            ("agent".to_string(), vec!["nova".to_string()]),
+            ("status".to_string(), vec![ST_LISTENING.to_string()]),
+        ]);
+        crate::db::subscriptions::create_filter_subscription(
+            &db,
+            &filters,
+            &[],
+            "luna",
+            true,
+            None,
+        )
+        .unwrap();
+        // Each listener reads what it was woken for as soon as it is woken.
+        let listen = |name: &str, query: &'static str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            db.upsert_notify_endpoint(name, "listen", port).unwrap();
+            let reader = rusqlite::Connection::open(db.path()).unwrap();
+            let woken = std::thread::spawn(move || {
+                listener.accept().unwrap();
+                reader
+                    .query_row(query, [], |row| row.get::<_, String>(0))
+                    .unwrap()
+            });
+            (port, woken)
+        };
+        let listeners = [
+            (
+                listen(
+                    "nova",
+                    "SELECT status || '/' || status_context FROM instances WHERE name = 'nova'",
+                ),
+                "listening/interrupted",
+            ),
+            (
+                listen(
+                    "luna",
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM events
+                     WHERE type = 'message' AND json_extract(data, '$.from') = '[hcom-events]'",
+                ),
+                "1",
+            ),
+        ];
+
+        let end = stdio_result("sess-1", "aborted_streaming");
+        assert!(record_stdio_turn_end(&db, "stdio-proc", &end).unwrap());
+        for ((port, woken), expected) in listeners {
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while !woken.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // A listener nobody woke is released, so the test fails, not hangs.
+            let woke = woken.is_finished();
+            if !woke {
+                let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+            }
+            let seen = woken.join().unwrap();
+            assert!(woke, "no wake for {expected}");
+            assert_eq!(seen, expected, "woken before the turn end committed");
+        }
     }
 
     /// Claude's screen sitting at an empty, settled prompt.
