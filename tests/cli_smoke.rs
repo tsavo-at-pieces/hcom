@@ -2203,19 +2203,47 @@ fn unknown_command_and_tool_suggest_corrections() {
 }
 
 #[test]
-fn send_warns_when_name_disagrees_with_the_shell_identity() {
+fn send_refuses_when_name_disagrees_with_the_shell_identity() {
     let h = Hcom::new();
     let sender = h.start_with_process_id("pid-sender");
     let other = h.start_with_process_id("pid-other");
 
     // pid-sender's shell is bound to `sender`, but it sends under `other` —
-    // exactly the shape of an identity that drifted after a rebind or recovery.
+    // the shape of a stale instruction naming another live agent (a compaction
+    // that kept an older bootstrap). Sent as `other`, the message would come
+    // from somebody else, so it is refused and nothing is recorded.
     let (code, stdout, stderr) =
         h.run_as_process("pid-sender", ["send", "--name", &other, "--", "hi"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("refused") && stderr.contains(&sender) && stderr.contains(&other),
+        "expected a refusal naming both identities, got stderr={stderr}"
+    );
+    let (_, events, _) = h.run(["events", "--type", "message", "--last", "5"]);
+    assert!(
+        !events.contains("hi"),
+        "a refused send must not record a message, got events={events}"
+    );
+
+    // The same shell sending as the instance it is bound to goes through.
+    let (code, stdout, stderr) =
+        h.run_as_process("pid-sender", ["send", "--name", &sender, "--", "hi"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+}
+
+#[test]
+fn send_with_name_from_an_unbound_shell_is_not_refused() {
+    let h = Hcom::new();
+    let _sender = h.start_with_process_id("pid-sender");
+    let other = h.start_with_process_id("pid-other");
+
+    // No HCOM_PROCESS_ID: an operator shell has no binding to contradict, so
+    // --name is taken at its word, as before.
+    let (code, stdout, stderr) = h.run(["send", "--name", &other, "--", "hi"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
-        stderr.contains(&sender) && stderr.contains(&other),
-        "expected a drift warning naming both identities, got stderr={stderr}"
+        !stderr.contains("refused") && !stderr.contains("warning"),
+        "an unbound shell must neither refuse nor warn, got stderr={stderr}"
     );
 }
 
@@ -2253,7 +2281,7 @@ fn send_with_from_skips_the_name_drift_warning() {
 }
 
 #[test]
-fn from_in_message_text_does_not_suppress_the_name_drift_warning() {
+fn from_in_message_text_does_not_lift_the_name_refusal() {
     let h = Hcom::new();
     let sender = h.start_with_process_id("pid-sender");
     let other = h.start_with_process_id("pid-other");
@@ -2262,9 +2290,9 @@ fn from_in_message_text_does_not_suppress_the_name_drift_warning() {
         "pid-sender",
         ["send", "--name", &other, "--", "use", "--from", "x"],
     );
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     assert!(
-        stderr.contains(&sender) && stderr.contains(&other),
+        stderr.contains("refused") && stderr.contains(&sender) && stderr.contains(&other),
         "--from after -- is message text, got stderr={stderr}"
     );
 }

@@ -747,6 +747,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
 
         // Message mode, quiet timeout.
@@ -801,6 +802,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         }
     }
 

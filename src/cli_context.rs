@@ -9,7 +9,9 @@ use crate::claude_actor;
 use crate::db::HcomDb;
 use crate::identity;
 use crate::instance_lifecycle as lifecycle;
-use crate::shared::{CommandContext, HcomError, ST_ACTIVE, ST_INACTIVE, SenderKind};
+use crate::shared::{
+    CommandContext, HcomError, IdentityConflict, ST_ACTIVE, ST_INACTIVE, SenderKind,
+};
 use crate::shared::{MAX_MESSAGES_PER_DELIVERY, SenderIdentity};
 
 /// Commands that should NOT trigger hookless status update.
@@ -64,37 +66,42 @@ pub fn build_ctx_for_command(
     // Claude actor is already the exact acting agent (and ensure_explicit_matches
     // above hard-errors on conflict), so its process binding naming the parent
     // row is not drift.
-    let identity_warning = match (&identity, explicit_name, had_verified_actor) {
-        (Some(resolved), Some(_), false) => drift_warning(db, resolved, process_id),
+    let identity_conflict = match (&identity, explicit_name, had_verified_actor) {
+        (Some(resolved), Some(_), false) => identity_conflict(db, resolved, process_id),
         _ => None,
     };
+    let identity_warning = identity_conflict.as_ref().map(drift_warning);
 
     Ok(CommandContext {
         explicit_name: explicit_name.map(|s| s.to_string()),
         identity,
         go,
         identity_warning,
+        identity_conflict,
     })
 }
 
-/// Warn when an explicit `--name` names a different instance than the one this
+/// Find an explicit `--name` that names a different instance than the one this
 /// shell's process binding points at.
 ///
-/// `--name` is what the agent knows itself to be, so on disagreement the binding
-/// is the stale side (session switch, resume, recovery). Hooks deliver by
-/// binding, so messages to the agent's name silently stop arriving until it
-/// reclaims the name.
+/// Either side can be the stale one. The binding goes stale after a session
+/// switch, resume or recovery; the name goes stale when an agent follows an
+/// older instruction its context kept (a Codex compaction that retained a
+/// bootstrap naming another live agent, 2026-11-04). Hooks deliver by binding,
+/// so a drifted name silently stops messages until the agent reclaims it, and
+/// a send under a drifted name is sent as somebody else. Commands warn through
+/// [`drift_warning`]; an outbound `send` refuses through [`refusal`].
 ///
 /// Read-only: a plain binding lookup, never `resolve_identity`, whose Codex
 /// recovery path can rebind or retire rows.
 ///
 /// Returns `None` when the shell is unbound, the two agree, or the named
 /// instance is a subagent of the bound row (subagents share the parent's shell).
-fn drift_warning(
+fn identity_conflict(
     db: &HcomDb,
     resolved: &SenderIdentity,
     process_id: Option<&str>,
-) -> Option<String> {
+) -> Option<IdentityConflict> {
     if !matches!(resolved.kind, SenderKind::Instance) {
         return None;
     }
@@ -110,11 +117,37 @@ fn drift_warning(
     if parent == Some(bound.as_str()) {
         return None;
     }
-    let name = &resolved.name;
-    Some(format!(
+    Some(IdentityConflict {
+        explicit: resolved.name.clone(),
+        bound,
+    })
+}
+
+/// The warning a command other than `send` prints on an identity conflict.
+fn drift_warning(conflict: &IdentityConflict) -> String {
+    let IdentityConflict {
+        explicit: name,
+        bound,
+    } = conflict;
+    format!(
         "[hcom] warning: --name '{name}' but this shell is bound to '{bound}'. \
          If you are '{name}', run 'hcom start --as {name}'."
-    ))
+    )
+}
+
+/// The error an outbound `send` prints when it refuses an identity conflict:
+/// a message sent under the drifted name would come from somebody else, so
+/// the agent is told both names and how to resolve it instead.
+pub fn refusal(conflict: &IdentityConflict) -> String {
+    let IdentityConflict {
+        explicit: name,
+        bound,
+    } = conflict;
+    format!(
+        "[hcom] refused: --name '{name}' but this shell is bound to '{bound}', so the message \
+         would be sent as another agent. If you are '{bound}', send with --name {bound}; \
+         if you are '{name}', run 'hcom start --as {name}' first."
+    )
 }
 
 /// Check identity gating for a CLI command.
@@ -498,6 +531,103 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_subagent(db: &HcomDb, name: &str, parent: &str) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, parent_name, agent_id)
+                 VALUES (?1, 'active', ?2, 'claude', ?3, ?4)",
+                rusqlite::params![name, now, parent, format!("agent-{name}")],
+            )
+            .unwrap();
+    }
+
+    // ── identity conflict (--name vs the shell's registered binding) ──
+
+    #[test]
+    fn conflict_when_name_contradicts_the_shells_binding() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "luna", "claude");
+        insert_instance(&db, "feri", "claude");
+        insert_process_binding(&db, "proc-luna", "luna");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("feri"),
+            false,
+            Some("proc-luna"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ctx.identity_conflict,
+            Some(IdentityConflict {
+                explicit: "feri".into(),
+                bound: "luna".into()
+            })
+        );
+        let warning = ctx.identity_warning.unwrap();
+        assert!(warning.contains("--name 'feri'") && warning.contains("bound to 'luna'"));
+        let refused = refusal(ctx.identity_conflict.as_ref().unwrap());
+        assert!(refused.contains("--name luna") && refused.contains("hcom start --as feri"));
+    }
+
+    #[test]
+    fn no_conflict_when_name_matches_the_binding_or_the_shell_is_unbound() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "luna", "claude");
+        insert_instance(&db, "feri", "claude");
+        insert_process_binding(&db, "proc-luna", "luna");
+
+        let same = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("luna"),
+            false,
+            Some("proc-luna"),
+            None,
+        )
+        .unwrap();
+        assert!(same.identity_conflict.is_none() && same.identity_warning.is_none());
+
+        let unbound =
+            build_ctx_for_command(&db, Some("send"), Some("feri"), false, None, None).unwrap();
+        assert!(unbound.identity_conflict.is_none());
+
+        let unknown_process = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("feri"),
+            false,
+            Some("proc-nobody"),
+            None,
+        )
+        .unwrap();
+        assert!(unknown_process.identity_conflict.is_none());
+    }
+
+    #[test]
+    fn no_conflict_when_name_is_a_subagent_of_the_bound_instance() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "luna", "claude");
+        insert_subagent(&db, "luna_sub_1", "luna");
+        insert_process_binding(&db, "proc-luna", "luna");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("luna_sub_1"),
+            false,
+            Some("proc-luna"),
+            None,
+        )
+        .unwrap();
+
+        assert!(ctx.identity_conflict.is_none() && ctx.identity_warning.is_none());
+    }
+
     // ── build_ctx_for_command tests ──
 
     #[test]
@@ -575,6 +705,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         assert!(check_identity_gate("list", &ctx, false, false).is_ok());
     }
@@ -586,6 +717,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -597,6 +729,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         assert!(check_identity_gate("send", &ctx, true, false).is_ok());
     }
@@ -608,6 +741,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         let err = check_identity_gate("send", &ctx, false, false).unwrap_err();
         assert!(err.contains("identity not found"));
@@ -625,6 +759,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -636,6 +771,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         let err = check_identity_gate("listen", &ctx, false, true).unwrap_err();
         assert!(err.contains("start --as"));
@@ -657,6 +793,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         // listen is in skip list — should not change status
         set_hookless_command_status(&db, "listen", &ctx);
@@ -681,6 +818,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         // A backgrounded `hcom send` after Stop must not mark it active:
         // no later Stop would return it to listening (#151).
@@ -703,6 +841,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         set_hookless_command_status(&db, "events", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -724,6 +863,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -751,6 +891,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("sub1").unwrap().unwrap();
@@ -808,6 +949,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, true), Ok(false));
     }
@@ -825,6 +967,7 @@ mod tests {
             }),
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
     }
@@ -837,6 +980,7 @@ mod tests {
             identity: None,
             go: false,
             identity_warning: None,
+            identity_conflict: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
     }
@@ -968,11 +1112,15 @@ mod tests {
         insert_process_binding(&db, "pid-1", "voni");
 
         let resolved = identity::resolve_from_name(&db, "riko").unwrap();
-        let warning = drift_warning(&db, &resolved, Some("pid-1")).unwrap();
+        let conflict = identity_conflict(&db, &resolved, Some("pid-1")).unwrap();
+        let warning = drift_warning(&conflict);
         assert!(warning.contains("hcom start --as riko"), "{warning}");
         assert!(
             !warning.contains("  "),
             "the warning is printed to a terminal; it must not carry a run of spaces: {warning:?}"
         );
+        let refused = refusal(&conflict);
+        assert!(refused.contains("--name voni") && refused.contains("hcom start --as riko"));
+        assert!(!refused.contains("  "), "{refused:?}");
     }
 }
