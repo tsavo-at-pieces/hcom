@@ -70,7 +70,7 @@ fn resolve_shell_env_uncached() -> Option<HashMap<String, String>> {
     }
 
     let marker = format!("hcom-shell-env-{}", uuid::Uuid::new_v4());
-    let cmd = format!("printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"");
+    let cmd = format!("printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\"");
     let output = timed_shell_output(&shell, &cmd, &marker)?;
     parse_shell_env_output(&output.stdout, &marker, MARKER_VAR)
 }
@@ -257,27 +257,67 @@ impl Drain {
     }
 }
 
-/// Whether `stdout` holds a complete marker-framed environment: the opening
-/// marker and, after it, the closing marker right after the NUL that
-/// terminates the last `env -0` entry. Text after that close (an EXIT trap, a
-/// logout message) does not matter: the parser skips it. A capture cut inside
-/// the marker variable's own value has the marker bytes after `=`, not after a
-/// NUL, so it is not mistaken for the close.
-fn output_is_complete(stdout: &[u8], marker: &str) -> bool {
+/// The close the command prints after `env -0`: the marker with a suffix the
+/// shell's startup files cannot know. The marker itself is in the shell's
+/// environment before those files run, so a startup diagnostic can echo it;
+/// it cannot produce the close.
+fn close_marker(marker: &str) -> String {
+    format!("{marker}-end")
+}
+
+/// The marker-framed environment in `stdout`, as `(start, end)` of the body:
+/// the close is the first `close_marker` right after a NUL (the terminator of
+/// the last `env -0` entry); the opening is the last marker before it that the
+/// command printed itself: not a startup echo of the exported marker (those
+/// come earlier), not preceded by `=`, and not inside the marker variable's
+/// own `marker_var=marker` entry. Text after the close (an EXIT trap, a
+/// logout message) is outside the frame. The parser and the completeness
+/// check share this.
+fn frame(stdout: &[u8], marker: &str, marker_var: &str) -> Option<(usize, usize)> {
     let m = marker.as_bytes();
-    let Some(first) = find_bytes(stdout, m) else {
-        return false;
-    };
-    let body = &stdout[first + m.len()..];
+    let close = close_marker(marker);
+    let c = close.as_bytes();
     let mut from = 0;
-    while let Some(rel) = find_bytes(&body[from..], m) {
+    let mut close_at = None;
+    while let Some(rel) = find_bytes(&stdout[from..], c) {
         let at = from + rel;
-        if at > 0 && body[at - 1] == 0 {
-            return true;
+        if at > 0 && stdout[at - 1] == 0 {
+            close_at = Some(at);
+            break;
         }
         from = at + 1;
     }
-    false
+    let close_at = close_at?;
+    let head = &stdout[..close_at];
+    let own_entry = format!("{marker_var}={marker}");
+    let own = own_entry.as_bytes();
+    let mut entries = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = find_bytes(&head[from..], own) {
+        let at = from + rel;
+        entries.push(at..at + own.len());
+        from = at + 1;
+    }
+    let mut from = 0;
+    let mut open_at = None;
+    while let Some(rel) = find_bytes(&head[from..], m) {
+        let at = from + rel;
+        let after_equals = at > 0 && head[at - 1] == b'=';
+        let inside_own_entry = entries.iter().any(|span| span.contains(&at));
+        if !after_equals && !inside_own_entry {
+            open_at = Some(at);
+        }
+        from = at + 1;
+    }
+    let open_at = open_at?;
+    Some((open_at + m.len(), close_at))
+}
+
+/// Whether `stdout` holds a complete marker-framed environment (see [`frame`]).
+/// A capture cut anywhere before the close, including inside the marker
+/// variable's own value, is not complete.
+fn output_is_complete(stdout: &[u8], marker: &str) -> bool {
+    frame(stdout, marker, MARKER_VAR).is_some()
 }
 
 fn timed_shell_output(shell: &Path, cmd: &str, marker: &str) -> Option<ShellOutput> {
@@ -521,11 +561,8 @@ fn parse_shell_env_output(
     marker: &str,
     marker_var: &str,
 ) -> Option<HashMap<String, String>> {
-    let marker_bytes = marker.as_bytes();
-    let first = find_bytes(stdout, marker_bytes)?;
-    let after_first = first + marker_bytes.len();
-    let second_rel = rfind_bytes(&stdout[after_first..], marker_bytes)?;
-    let body = &stdout[after_first..after_first + second_rel];
+    let (start, end) = frame(stdout, marker, marker_var)?;
+    let body = &stdout[start..end];
 
     let mut env = HashMap::new();
     for entry in body.split(|b| *b == b'\0') {
@@ -554,15 +591,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,7 +599,7 @@ mod tests {
     #[test]
     fn parse_shell_env_output_extracts_between_markers_and_strips_hcom() {
         let marker = "MARKER";
-        let stdout = b"noiseMARKER\0a=1\0b=two\nlines\0HCOM_PROCESS_ID=pid\0HCOM_SHELL_ENV_MARKER=MARKER\0MARKERtail";
+        let stdout = b"noiseMARKER\0a=1\0b=two\nlines\0HCOM_PROCESS_ID=pid\0HCOM_SHELL_ENV_MARKER=MARKER\0MARKER-endtail";
 
         let env = parse_shell_env_output(stdout, marker, MARKER_VAR).unwrap();
 
@@ -584,7 +612,7 @@ mod tests {
     #[test]
     fn parse_shell_env_output_ignores_marker_value_inside_env_body() {
         let marker = "MARKER";
-        let stdout = b"MARKERHCOM_SHELL_ENV_MARKER=MARKER\0a=1\0MARKER";
+        let stdout = b"MARKERHCOM_SHELL_ENV_MARKER=MARKER\0a=1\0MARKER-end";
 
         let env = parse_shell_env_output(stdout, marker, MARKER_VAR).unwrap();
 
@@ -719,7 +747,7 @@ mod tests {
         let cmd = format!(
             "chunk=x; i=0; while [ \"$i\" -lt 12 ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; \
              i=0; while [ \"$i\" -lt 64 ]; do echo \"$chunk\" >&2; i=$((i + 1)); done; \
-             printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
+             printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\""
         );
 
         let output =
@@ -822,7 +850,7 @@ mod tests {
             ));
         }
         cmd.push_str(&format!(
-            "printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
+            "printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\""
         ));
 
         let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
@@ -876,8 +904,9 @@ mod tests {
     #[test]
     fn resolver_waits_for_a_writer_that_pauses_mid_stream() {
         let marker = "hcom-shell-env-pause-test";
-        let cmd =
-            format!("printf %s \"${MARKER_VAR}\"; env -0; sleep 1; printf %s \"${MARKER_VAR}\"");
+        let cmd = format!(
+            "printf %s \"${MARKER_VAR}\"; env -0; sleep 1; printf %s \"${MARKER_VAR}-end\""
+        );
 
         let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
         let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
@@ -896,7 +925,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let done = dir.path().join("job-done");
         let cmd = format!(
-            "(sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"; exit 0",
+            "(sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\"; exit 0",
             done = done.display()
         );
 
@@ -1035,7 +1064,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let done = dir.path().join("job-done");
         let cmd = format!(
-            "trap 'printf tail' EXIT; (sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"; exit 0",
+            "trap 'printf tail' EXIT; (sleep 5; : > {done}) & printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}-end\"; exit 0",
             done = done.display()
         );
 
@@ -1054,19 +1083,60 @@ mod tests {
     }
 
     #[test]
-    fn output_is_complete_requires_the_closing_marker_after_a_nul() {
+    fn output_is_complete_requires_the_close_after_a_nul() {
         let marker = "hcom-shell-env-m";
-        let complete = format!("{marker}A=1\0{MARKER_VAR}={marker}\0{marker}");
+        let complete = format!("{marker}A=1\0{MARKER_VAR}={marker}\0{marker}-end");
         assert!(output_is_complete(complete.as_bytes(), marker));
         // Trailing shell noise after the close is a complete capture.
         let noisy = format!("{complete}tail\nlogout");
         assert!(output_is_complete(noisy.as_bytes(), marker));
-        // Cut inside the marker variable's value: ends with the marker bytes
-        // after `=`, not after a NUL.
+        // Cut inside the marker variable's value, or before the close.
         let truncated = format!("{marker}A=1\0{MARKER_VAR}={marker}");
         assert!(!output_is_complete(truncated.as_bytes(), marker));
+        let bare = format!("{marker}A=1\0{MARKER_VAR}={marker}\0{marker}");
+        assert!(!output_is_complete(bare.as_bytes(), marker));
         assert!(!output_is_complete(marker.as_bytes(), marker));
         assert!(!output_is_complete(b"", marker));
+    }
+
+    /// The marker is in the login shell's environment before its startup
+    /// files run, so a startup diagnostic can print it. A prefix carrying such
+    /// an echo, the opening and part of the body is not complete until the
+    /// distinct close arrives, and the parser then frames the body from the
+    /// command's own opening, so every entry is kept.
+    #[test]
+    fn frame_ignores_a_startup_echo_of_the_marker_and_waits_for_the_distinct_close() {
+        let marker = "hcom-shell-env-m";
+        let prefix = format!("{marker}\0{marker}A=1\0{MARKER_VAR}={marker}\0");
+        assert!(!output_is_complete(prefix.as_bytes(), marker));
+        let whole = format!("{prefix}B=2\0{marker}-end");
+        assert!(output_is_complete(whole.as_bytes(), marker));
+        let env = parse_shell_env_output(whole.as_bytes(), marker, MARKER_VAR).unwrap();
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("B").map(String::as_str), Some("2"));
+        assert!(!env.contains_key(MARKER_VAR));
+    }
+
+    /// The same shape through the resolver, with the close delivered late by a
+    /// job that holds stdout: the prefix must not be accepted at the exit
+    /// grace, and the entry written just before the close must be in the map.
+    #[cfg(unix)]
+    #[test]
+    fn resolver_waits_for_the_distinct_close_after_a_startup_echo_of_the_marker() {
+        let marker = "hcom-shell-env-echo-test";
+        let cmd = format!(
+            "(sleep 1; printf 'SHELL_ENV_TEST_LATE=2\\0'; printf %s \"${MARKER_VAR}-end\") & \
+             printf '%s\\0' \"${MARKER_VAR}\"; printf %s \"${MARKER_VAR}\"; env -0; exit 0"
+        );
+
+        let output = fake_shell_output(&cmd, marker, MAX_SHELL_OUTPUT).unwrap();
+        let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
+
+        assert!(env.contains_key("PATH"));
+        assert_eq!(
+            env.get("SHELL_ENV_TEST_LATE").map(String::as_str),
+            Some("2")
+        );
     }
 
     #[cfg(unix)]
