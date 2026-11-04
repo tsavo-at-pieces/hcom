@@ -481,6 +481,13 @@ fn route_claude_hook(
         return (0, String::new(), None, timing);
     }
 
+    instance_binding::refresh_paradev_binding_for_root_hook(
+        db,
+        instance_name,
+        ctx.process_id.as_deref(),
+        &session_id,
+    );
+
     if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
         let task_start = Instant::now();
         common::update_tool_status(db, instance_name, "claude", tool_name, &payload.tool_input);
@@ -3825,6 +3832,70 @@ mod tests {
         assert!(should_scan_sessionstart_lineage(
             false, "startup", true, false, false,
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn paradev_binding_backfills_only_the_verified_claude_root_hook() {
+        use crate::hooks::test_helpers::EnvVarGuard;
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_at(&hcom_dir.join("test.db")).unwrap();
+        db.conn().execute(
+            r#"INSERT INTO instances (name, session_id, tool, status, created_at, launch_context)
+             VALUES ('nora', 'sess-nora', 'claude', 'listening', 0, '{"env":{"KEEP":"yes"}}')"#, []
+        ).unwrap();
+        bind_validated_session(&db, "sess-nora", "nora");
+        db.set_process_binding("process-nora", "sess-nora", "nora")
+            .unwrap();
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "process-nora");
+        let terminal = "11111111-1111-4111-8111-111111111111";
+        let workspace = "22222222-2222-4222-8222-222222222222";
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", terminal);
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", workspace);
+        let env = [
+            ("HCOM_PROCESS_ID".into(), "process-nora".into()),
+            ("HCOM_LAUNCHED".into(), "1".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let original = db
+            .get_instance_full("nora")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        let mut inherited = HookPayload::from_claude(serde_json::json!({
+            "session_id":"sess-nora", "agent_id":"child-id", "tool_name":"Bash", "tool_input":{"command":"true"}
+        }));
+        route_claude_hook(&db, &ctx, HOOK_PRE, &mut inherited);
+        assert_eq!(
+            db.get_instance_full("nora")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+
+        let mut root = HookPayload::from_claude(serde_json::json!({
+            "session_id":"sess-nora", "tool_name":"Bash", "tool_input":{"command":"true"}
+        }));
+        route_claude_hook(&db, &ctx, HOOK_PRE, &mut root);
+        let row = db.get_instance_full("nora").unwrap().unwrap();
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_TERMINAL_ID")
+                .as_deref(),
+            Some(terminal)
+        );
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_WORKSPACE_ID")
+                .as_deref(),
+            Some(workspace)
+        );
+        assert_eq!(
+            row.launch_context_value("env", "KEEP").as_deref(),
+            Some("yes")
+        );
     }
 
     #[test]

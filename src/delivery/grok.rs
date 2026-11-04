@@ -2117,6 +2117,7 @@ mod tests {
     /// counted in `requeued`.
     #[cfg(unix)]
     const FAKE_BRIDGE: &str = r#"#!/bin/sh
+[ "${1:-}" = "--warmup" ] && exit 0
 dir=$(dirname "$0")
 run=$(( $(cat "$dir/runs" 2>/dev/null || echo 0) + 1 ))
 echo "$run" > "$dir/runs"
@@ -2194,6 +2195,15 @@ done
         let bridge = dir.path().join("grok");
         std::fs::write(&bridge, FAKE_BRIDGE).unwrap();
         std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // macOS may assess a new executable before its first instruction. Warm
+        // the fixture without side effects before starting the delivery deadline.
+        assert!(
+            std::process::Command::new(&bridge)
+                .arg("--warmup")
+                .status()
+                .unwrap()
+                .success()
+        );
         for flag in flags {
             std::fs::write(dir.path().join(flag), "").unwrap();
         }

@@ -822,6 +822,12 @@ fn resolve_and_update_codex_instance(
     if is_internal_thread(&instance, payload) {
         return None;
     }
+    instance_binding::refresh_paradev_binding_for_root_hook(
+        db,
+        &instance.name,
+        ctx.process_id.as_deref(),
+        payload.session_id.as_deref().unwrap_or(""),
+    );
     update_codex_position(db, ctx, payload, &instance.name);
     Some(instance)
 }
@@ -2207,6 +2213,150 @@ mod tests {
                 "cwd": "/work", "prompt": "Reply without calling a tool",
             }),
         )
+    }
+
+    const PARADEV_TERMINAL: &str = "11111111-1111-4111-8111-111111111111";
+    const PARADEV_WORKSPACE: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    #[serial]
+    fn paradev_binding_backfills_existing_row_on_next_hook_and_is_idempotent() {
+        use crate::hooks::test_helpers::EnvVarGuard;
+        let (_dir, db, ctx) = db_with_listening_codex();
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "proc-1");
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", PARADEV_TERMINAL);
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", PARADEV_WORKSPACE);
+        let original =
+            serde_json::json!({"pane_id":"kept", "custom":{"n":2}, "env":{"KEEP":"yes"}});
+        db.store_launch_context("luna", &original.to_string())
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TEMP TABLE binding_writes (n INTEGER);
+             CREATE TEMP TRIGGER count_binding_write AFTER UPDATE OF launch_context ON instances
+             BEGIN INSERT INTO binding_writes VALUES (1); END;",
+            )
+            .unwrap();
+
+        resolve_and_update_codex_instance(&db, &ctx, &ordinary_prompt()).unwrap();
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let captured: Value = serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(captured["env"]["SUPERSET_TERMINAL_ID"], PARADEV_TERMINAL);
+        assert_eq!(captured["env"]["SUPERSET_WORKSPACE_ID"], PARADEV_WORKSPACE);
+        assert_eq!(captured["env"]["KEEP"], "yes");
+        assert_eq!(captured["pane_id"], original["pane_id"]);
+        assert_eq!(captured["custom"], original["custom"]);
+
+        resolve_and_update_codex_instance(&db, &ctx, &ordinary_prompt()).unwrap();
+        let writes: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM binding_writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writes, 1, "second hook must not rewrite launch_context");
+    }
+
+    #[test]
+    #[serial]
+    fn paradev_binding_skips_child_rows_and_inherited_subagent_hooks() {
+        use crate::hooks::test_helpers::EnvVarGuard;
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "proc-1");
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", PARADEV_TERMINAL);
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", PARADEV_WORKSPACE);
+        for child_row in [false, true] {
+            let (_dir, db, ctx) = db_with_listening_codex();
+            let original = r#"{"env":{"KEEP":"yes"}}"#;
+            db.store_launch_context("luna", original).unwrap();
+            let mut payload = ordinary_prompt();
+            if child_row {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET parent_name='parent' WHERE name='luna'",
+                        [],
+                    )
+                    .unwrap();
+            } else {
+                payload.raw["agent_id"] = serde_json::json!("inherited-child");
+            }
+            resolve_and_update_codex_instance(&db, &ctx, &payload);
+            assert_eq!(
+                db.get_instance_full("luna")
+                    .unwrap()
+                    .unwrap()
+                    .launch_context
+                    .as_deref(),
+                Some(original)
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paradev_binding_skips_missing_or_malformed_own_ids() {
+        use crate::hooks::test_helpers::EnvVarGuard;
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "proc-1");
+        for (terminal, workspace) in [
+            ("", PARADEV_WORKSPACE),
+            (PARADEV_TERMINAL, ""),
+            ("not-a-uuid", PARADEV_WORKSPACE),
+            (PARADEV_TERMINAL, "not-a-uuid"),
+        ] {
+            let (_dir, db, ctx) = db_with_listening_codex();
+            let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", terminal);
+            let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", workspace);
+            let original = r#"{"env":{"KEEP":"yes"}}"#;
+            db.store_launch_context("luna", original).unwrap();
+            resolve_and_update_codex_instance(&db, &ctx, &ordinary_prompt()).unwrap();
+            assert_eq!(
+                db.get_instance_full("luna")
+                    .unwrap()
+                    .unwrap()
+                    .launch_context
+                    .as_deref(),
+                Some(original)
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paradev_binding_replaces_old_ids_only_for_the_verified_process() {
+        use crate::hooks::test_helpers::EnvVarGuard;
+        let (_dir, db, mut ctx) = db_with_listening_codex();
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", PARADEV_TERMINAL);
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", PARADEV_WORKSPACE);
+        let original = r#"{"env":{"SUPERSET_TERMINAL_ID":"old-terminal","SUPERSET_WORKSPACE_ID":"old-workspace","KEEP":"yes"}}"#;
+        db.store_launch_context("luna", original).unwrap();
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "other-process");
+        ctx.process_id = Some("other-process".into());
+        resolve_and_update_codex_instance(&db, &ctx, &ordinary_prompt());
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context
+                .as_deref(),
+            Some(original)
+        );
+
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "proc-1");
+        ctx.process_id = Some("proc-1".into());
+        resolve_and_update_codex_instance(&db, &ctx, &ordinary_prompt()).unwrap();
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_TERMINAL_ID")
+                .as_deref(),
+            Some(PARADEV_TERMINAL)
+        );
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_WORKSPACE_ID")
+                .as_deref(),
+            Some(PARADEV_WORKSPACE)
+        );
+        assert_eq!(
+            row.launch_context_value("env", "KEEP").as_deref(),
+            Some("yes")
+        );
     }
 
     #[test]

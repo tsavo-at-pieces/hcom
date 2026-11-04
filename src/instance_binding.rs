@@ -87,6 +87,92 @@ pub fn persist_terminal_launch_context(
     }
 }
 
+/// Refresh only Paradev IDs for an already verified root hook process.
+///
+/// Callers must route inherited subagent hooks away before calling this. Child
+/// rows are rejected here too: their inherited terminal is provenance, not ownership.
+pub fn refresh_paradev_binding_for_root_hook(
+    db: &HcomDb,
+    instance_name: &str,
+    process_id: Option<&str>,
+    session_id: &str,
+) {
+    let Some(process_id) = process_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if session_id.is_empty() || std::env::var("HCOM_PROCESS_ID").as_deref() != Ok(process_id) {
+        return;
+    }
+    let (Ok(terminal), Ok(workspace)) = (
+        std::env::var("SUPERSET_TERMINAL_ID"),
+        std::env::var("SUPERSET_WORKSPACE_ID"),
+    ) else {
+        return;
+    };
+    if [&terminal, &workspace]
+        .iter()
+        .any(|id| id.len() != 36 || uuid::Uuid::try_parse(id).is_err())
+    {
+        return;
+    }
+
+    let result = db.with_write_scope(|| {
+        let Some(row) = db.get_instance_full(instance_name)? else {
+            return Ok(());
+        };
+        if row
+            .parent_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+            || row.session_id.as_deref() != Some(session_id)
+            || !db
+                .get_process_binding_full(process_id)?
+                .is_some_and(|(bound_session, owner)| {
+                    owner == instance_name && bound_session.as_deref() == Some(session_id)
+                })
+        {
+            return Ok(());
+        }
+        let mut context = match row.launch_context.as_deref().filter(|raw| !raw.is_empty()) {
+            Some(raw) => {
+                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
+                    Ok(context) => context,
+                    Err(_) => return Ok(()),
+                }
+            }
+            None => serde_json::Map::new(),
+        };
+        let Some(env) = context
+            .entry("env")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+        else {
+            return Ok(());
+        };
+        if env.get("SUPERSET_TERMINAL_ID").and_then(|id| id.as_str()) == Some(terminal.as_str())
+            && env.get("SUPERSET_WORKSPACE_ID").and_then(|id| id.as_str())
+                == Some(workspace.as_str())
+        {
+            return Ok(());
+        }
+        env.insert("SUPERSET_TERMINAL_ID".into(), serde_json::json!(terminal));
+        env.insert("SUPERSET_WORKSPACE_ID".into(), serde_json::json!(workspace));
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::to_string(&context)?),
+        );
+        db.update_instance_fields(instance_name, &updates)
+    });
+    if let Err(error) = result {
+        crate::log::log_error(
+            "binding",
+            "refresh_paradev_binding",
+            &format!("instance={instance_name} err={error}"),
+        );
+    }
+}
+
 /// Capture environment context and store it for the instance.
 ///
 /// Captures git branch, terminal program, tty, and relevant env vars.
@@ -107,12 +193,18 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         .filter(|k| launch_context_value_missing(new_ctx.get(**k)))
         .copied()
         .collect();
+    let missing_env: Vec<&str> = ["SUPERSET_TERMINAL_ID", "SUPERSET_WORKSPACE_ID"]
+        .into_iter()
+        .filter(|key| {
+            launch_context_value_missing(new_ctx.get("env").and_then(|env| env.get(*key)))
+        })
+        .collect();
 
     // Read-merge-write under one write lock: a concurrent PTY PID write must
     // not be overwritten with a stale pid_identity (or lose its identity).
     let result = db.with_write_scope(|| {
         let mut ctx = new_ctx;
-        if !missing.is_empty()
+        if (!missing.is_empty() || !missing_env.is_empty())
             && let Some(pos) = db.get_instance_full(instance_name)?
             && let Some(old_json) = &pos.launch_context
             && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
@@ -122,6 +214,15 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
                     && !launch_context_value_missing(Some(val))
                 {
                     ctx.insert(k.to_string(), val.clone());
+                }
+            }
+            if let Some(env) = ctx.get_mut("env").and_then(|env| env.as_object_mut()) {
+                for key in &missing_env {
+                    if let Some(value) = old_ctx.get("env").and_then(|env| env.get(*key))
+                        && !launch_context_value_missing(Some(value))
+                    {
+                        env.insert((*key).to_string(), value.clone());
+                    }
                 }
             }
         }
@@ -183,6 +284,9 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     let env_keys = [
         "TERM_PROGRAM",
         "TERM_SESSION_ID",
+        // Subagents inherit these too; ownership readers must exclude parent_name rows.
+        "SUPERSET_TERMINAL_ID",
+        "SUPERSET_WORKSPACE_ID",
         "WINDOWID",
         "ITERM_SESSION_ID",
         "KITTY_WINDOW_ID",
@@ -1388,6 +1492,88 @@ mod tests {
             Some("proc-1")
         );
 
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_context_records_paradev_binding() {
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "terminal-1");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "workspace-1");
+
+        let ctx = capture_context();
+
+        assert_eq!(ctx["env"]["SUPERSET_TERMINAL_ID"], "terminal-1");
+        assert_eq!(ctx["env"]["SUPERSET_WORKSPACE_ID"], "workspace-1");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_and_store_preserves_paradev_binding_without_hook_env() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "codex",
+                    1.0f64,
+                    r#"{"env":{"SUPERSET_TERMINAL_ID":"terminal-1","SUPERSET_WORKSPACE_ID":"workspace-1","TERM_PROGRAM":"old-terminal"}}"#
+                ],
+            )
+            .unwrap();
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "");
+        let _program = EnvVarGuard::set("TERM_PROGRAM", "");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_TERMINAL_ID")
+                .as_deref(),
+            Some("terminal-1")
+        );
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_WORKSPACE_ID")
+                .as_deref(),
+            Some("workspace-1")
+        );
+        assert_eq!(row.launch_context_value("env", "TERM_PROGRAM"), None);
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_and_store_refreshes_paradev_binding_on_relaunch() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "codex",
+                    1.0f64,
+                    r#"{"env":{"SUPERSET_TERMINAL_ID":"terminal-old","SUPERSET_WORKSPACE_ID":"workspace-old"}}"#
+                ],
+            )
+            .unwrap();
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "terminal-new");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "workspace-new");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_TERMINAL_ID")
+                .as_deref(),
+            Some("terminal-new")
+        );
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_WORKSPACE_ID")
+                .as_deref(),
+            Some("workspace-new")
+        );
         cleanup(path);
     }
 
