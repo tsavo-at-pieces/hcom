@@ -45,6 +45,19 @@ use std::panic;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
+    // A PATH wrapper can select this same native image without sharing its
+    // pathname or bytes. This internal diagnostic is side-effect free: run it
+    // before configuration, database access, logging, or update workers.
+    if std::env::args().nth(1).as_deref() == Some("--native-executable") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "hcom_native_image": 1,
+                "executable": std::env::current_exe()?.canonicalize()?,
+            })
+        );
+        return Ok(());
+    }
     // Hooks of an agent nested under an hcom-launched one must not act as it.
     // Runs first: every later env reader should see only the child's view.
     let nested = std::env::args()
