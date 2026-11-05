@@ -837,7 +837,7 @@ fn warn_if_agent_hcom_differs(runner_dirs: &[String]) {
         .map(std::path::PathBuf::from)
         .chain(inherited.iter().flat_map(std::env::split_paths));
     let message = match first_hcom_in(dirs) {
-        Some(found) if same_binary(&found, &exe) => return,
+        Some(found) if agent_hcom_matches(&found, &exe) => return,
         Some(found) => format!(
             "agents will run {} as `hcom`, not this hcom ({}). Remove the other install or put this one first on PATH.",
             found.display(),
@@ -852,6 +852,84 @@ fn warn_if_agent_hcom_differs(runner_dirs: &[String]) {
         eprintln!("[hcom] warn: {message}");
         crate::log::log_warn("launch", "agent_hcom_mismatch", &message);
     });
+}
+
+fn agent_hcom_matches(found: &Path, exe: &Path) -> bool {
+    if same_binary(found, exe) {
+        return true;
+    }
+    #[cfg(unix)]
+    return wrapper_selects_hcom(found, exe, std::time::Duration::from_secs(1));
+    #[cfg(not(unix))]
+    false
+}
+
+/// Diagnostic only, never an ownership or hook-trust decision. Ask a PATH
+/// wrapper which native image it selects. Unknown/older installs, malformed
+/// output and failed or slow probes keep the existing mismatch warning.
+#[cfg(unix)]
+fn wrapper_selects_hcom(found: &Path, exe: &Path, budget: std::time::Duration) -> bool {
+    use std::io::{Read, Seek};
+    use std::process::{Command, Stdio};
+    let probe = || -> anyhow::Result<bool> {
+        // Native installs already have a definitive path/byte comparison.
+        // Only scripts need this compatibility probe; do not execute an
+        // unrelated native installation just to produce a warning.
+        let mut magic = [0; 2];
+        std::fs::File::open(found)?.read_exact(&mut magic)?;
+        if magic != *b"#!" {
+            return Ok(false);
+        }
+        let root = tempfile::tempdir()?;
+        let mut output = tempfile::tempfile()?;
+        let mut command = Command::new(found.canonicalize()?);
+        command
+            .arg("--native-executable")
+            .env_clear()
+            .env("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HCOM_DIR", root.path().join("room"))
+            .env("TMPDIR", root.path())
+            .env("HCOM_UPDATE_VERIFY", "1")
+            .stdin(Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(Stdio::null());
+        // Managed selectors locate their installation through HOME. No model,
+        // proxy, session, or agent credentials are inherited by the probe.
+        if let Some(home) = std::env::var_os("HOME") {
+            command.env("HOME", home);
+        }
+        crate::sys::process::detach_session(&mut command);
+        let deadline = std::time::Instant::now() + budget;
+        let mut child = command.spawn()?;
+        let status = loop {
+            // Check limits while the leader is still unreaped. Once try_wait
+            // returns an exit status, never signal its possibly reused group.
+            if output.metadata().map_or(true, |m| m.len() > 4096)
+                || std::time::Instant::now() >= deadline
+            {
+                crate::sys::process::kill_child_group(&mut child);
+                let _ = child.wait();
+                return Ok(false);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                // A wait error can mean another reaper already consumed this
+                // child. Its PID/group can no longer safely be signalled.
+                Err(_) => return Ok(false),
+            }
+        };
+        if !status.success() || output.metadata()?.len() > 4096 {
+            return Ok(false);
+        }
+        output.rewind()?;
+        let report: serde_json::Value = serde_json::from_reader(output.take(4097))?;
+        Ok(report["hcom_native_image"].as_u64() == Some(1)
+            && report["executable"].as_str().is_some_and(|path| {
+                Path::new(path).is_absolute() && same_binary(Path::new(path), exe)
+            }))
+    };
+    probe().unwrap_or(false)
 }
 
 /// First `hcom` a shell would run from `dirs`: shells skip non-executable files.
@@ -4398,6 +4476,64 @@ mod tests {
             runner_env.get("RORI_BACKGROUND_AUTH").map(String::as_str),
             Some("auth-token")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn path_wrapper_probe_recognizes_selection_and_keeps_real_mismatches() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let _api = EnvVarGuard::set("OPENAI_API_KEY", "fixture-secret");
+        let _process = EnvVarGuard::set("HCOM_PROCESS_ID", "fixture-parent");
+        let expected = room.join("native-a");
+        let other = room.join("native-b");
+        fs::write(&expected, b"expected image").unwrap();
+        fs::write(&other, b"different image").unwrap();
+        assert!(!agent_hcom_matches(&other, &expected));
+        let wrapper = room.join("hcom");
+        let report = |path: &Path| json!({"hcom_native_image": 1, "executable": path}).to_string();
+        let install = |body: &str| {
+            fs::write(&wrapper, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        install(&format!(
+            "test \"$1\" = --native-executable || exit 8\ntest -z \"${{OPENAI_API_KEY-}}${{HCOM_PROCESS_ID-}}\" || exit 9\nprintf '%s' '{}'",
+            report(&expected)
+        ));
+        assert!(agent_hcom_matches(&wrapper, &expected));
+        install(&format!("printf '%s' '{}'", report(&other)));
+        assert!(!agent_hcom_matches(&wrapper, &expected));
+        for body in [
+            "exit 2",
+            "printf not-json",
+            "printf '{}'",
+            "printf '{\"hcom_native_image\":1,\"executable\":\"native-a\"}'",
+            "printf '{\"hcom_native_image\":2}'",
+        ] {
+            install(body);
+            assert!(!agent_hcom_matches(&wrapper, &expected));
+        }
+        install("/usr/bin/yes x | /usr/bin/head -c 5000");
+        assert!(!agent_hcom_matches(&wrapper, &expected));
+        let pid_file = room.join("probe.pid");
+        install(&format!(
+            "echo $$ > '{}'\nexec /bin/sleep 30",
+            pid_file.display()
+        ));
+        assert!(!wrapper_selects_hcom(
+            &wrapper,
+            &expected,
+            std::time::Duration::from_millis(100)
+        ));
+        // Under host pressure the timeout can fire before the shell writes.
+        if let Ok(pid) = fs::read_to_string(pid_file) {
+            let pid = pid.trim().parse().unwrap();
+            assert!(
+                crate::sys::process::identity(pid).is_none(),
+                "probe child was not reaped"
+            );
+        }
     }
 
     #[test]
