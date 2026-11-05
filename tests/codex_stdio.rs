@@ -28,6 +28,12 @@ if os.environ.get('HCOM_LAUNCHED') != '1':
         if request.get('method') == 'initialize':
             print(json.dumps({'id': request['id'], 'result': {}}), flush=True)
         elif request.get('method') == 'hooks/list':
+            if os.environ.get('FIXTURE_INSPECTIONS'):
+                with open(os.environ['FIXTURE_INSPECTIONS'], 'a') as f: f.write('inspection\n')
+            failure = os.environ.get('FIXTURE_INSPECTION_FAILURE')
+            if failure and os.path.exists(failure):
+                print(json.dumps({'id': request['id'], 'error': {'code': -32603, 'message': 'fixture hook list failure'}}), flush=True)
+                continue
             hooks = [{'key': 'fixture-' + str(i), 'command': c, 'source': 'sessionFlags', 'currentHash': 'fixture-hash'} for i, c in enumerate(commands)]
             print(json.dumps({'id': request['id'], 'result': {'data': [{'hooks': hooks}]}}), flush=True)
     sys.exit(0)
@@ -103,6 +109,276 @@ fn assert_clean(h: &Hcom) {
     assert_eq!(count, 0, "native exit left a registered instance");
     let actor: String = db.query_row("SELECT instance FROM events WHERE json_extract(data, '$.action') = 'batch_launched' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     assert_eq!(actor, "pezu");
+}
+
+/// Each invocation has a fresh room while the tool installation, Codex home,
+/// workspace, and validation cache remain the same. No live tool is launched.
+struct CacheFixture {
+    h: Hcom,
+    cache: std::path::PathBuf,
+    manifest: std::path::PathBuf,
+    native: std::path::PathBuf,
+    setup: std::path::PathBuf,
+    inspections: std::path::PathBuf,
+    failure: std::path::PathBuf,
+}
+
+impl CacheFixture {
+    fn new() -> Self {
+        let h = Hcom::new();
+        fixture(&h);
+        let cache = h.root_path().join("shared-validation-cache");
+        let manifest = h.root_path().join("cache-inputs.json");
+        // The manifest contract requires a native image, rather than allowing a
+        // script to assert that its own digest covers its hidden dependencies.
+        // This disposable image is only fingerprinted; the Python fixture owns
+        // the protocol exchange and never executes it.
+        let native = h.root_path().join("native-image");
+        let native_target = h.root_path().join("native-image-v1");
+        fs::copy("/bin/sh", &native_target).unwrap();
+        std::os::unix::fs::symlink(&native_target, &native).unwrap();
+        let setup = h.root_path().join("launcher-setup");
+        fs::write(&setup, "setup-v1").unwrap();
+        fs::write(
+            &manifest,
+            serde_json::json!({
+                "version": 1,
+                "native_binary": native,
+                "files": [setup],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inspections = h.root_path().join("inspections");
+        let failure = h.root_path().join("inspection-failure");
+        h.set_launch_env("FIXTURE_INSPECTIONS", inspections.to_str().unwrap());
+        h.set_launch_env("FIXTURE_INSPECTION_FAILURE", failure.to_str().unwrap());
+        Self {
+            h,
+            cache,
+            manifest,
+            native,
+            setup,
+            inspections,
+            failure,
+        }
+    }
+
+    fn launch(&self, room: &str, manifest: bool) -> std::process::Output {
+        let room = self.h.root_path().join(room);
+        fs::create_dir_all(room.join(".tmp/flags")).unwrap();
+        fs::write(room.join(".tmp/flags/update_check"), "").unwrap();
+        fs::copy(self.h.hcom_dir.join("env"), room.join("env")).unwrap();
+        // Keep permission setup stable so this tests a change of room alone,
+        // rather than the first launch materializing hcom.rules after preflight.
+        fs::write(
+            room.join("config.toml"),
+            "[preferences]\nauto_approve = false\n",
+        )
+        .unwrap();
+        let mut command = self.h.cmd();
+        command
+            .env("HCOM_DIR", &room)
+            .env("HCOM_CODEX_CACHE_DIR", &self.cache)
+            .env("CODEX_SESSION_ID", format!("session-{}", room.display()))
+            .env("CODEX_THREAD_ID", format!("thread-{}", room.display()))
+            .env("CODEX_TOOL_CALL_ID", format!("call-{}", room.display()))
+            .env("CODEX_SQLITE_HOME", room.join("codex-sqlite"));
+        if manifest {
+            command.env("HCOM_CODEX_CACHE_INPUTS", &self.manifest);
+        }
+        command
+            .args([
+                "codex",
+                "--stdio",
+                "--run-here",
+                "--go",
+                "--name",
+                "pezu",
+                "--",
+                "app-server",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn launch_ok(&self, room: &str, manifest: bool) -> Value {
+        let output = self.launch(room, manifest);
+        assert_eq!(output.status.code(), Some(23), "{output:?}");
+        assert_eq!(output.stderr, b"native diagnostic\n", "{output:?}");
+        let record: Value =
+            serde_json::from_slice(&fs::read(self.h.root_path().join("native.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            record["env"]["HCOM_DIR"],
+            self.h.root_path().join(room).to_str().unwrap()
+        );
+        record
+    }
+
+    fn count(&self) -> usize {
+        fs::read_to_string(&self.inspections)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn entries(&self) -> Vec<std::path::PathBuf> {
+        fn visit(dir: &std::path::Path, entries: &mut Vec<std::path::PathBuf>) {
+            if !dir.exists() {
+                return;
+            }
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, entries);
+                } else if path.extension().is_some_and(|ext| ext == "json") {
+                    entries.push(path);
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(&self.cache, &mut entries);
+        entries
+    }
+}
+
+#[test]
+fn codex_validation_cache_reuses_across_rooms_and_invalidates_inputs() {
+    let mut f = CacheFixture::new();
+    let first = f.launch_ok("room-a", true);
+    assert_eq!(f.count(), 1);
+    let second = f.launch_ok("room-b", true);
+    assert_eq!(f.count(), 1, "a new HCOM_DIR repeated hooks/list");
+    let relocated_manifest = f.h.root_path().join("next-run-cache-inputs.json");
+    fs::copy(&f.manifest, &relocated_manifest).unwrap();
+    f.manifest = relocated_manifest;
+    f.launch_ok("room-relocated-manifest", true);
+    assert_eq!(
+        f.count(),
+        1,
+        "relocating an unchanged launcher manifest repeated hooks/list"
+    );
+    assert_ne!(
+        first["env"]["HCOM_PROCESS_ID"], second["env"]["HCOM_PROCESS_ID"],
+        "sharing validation must not reuse launch identity"
+    );
+    assert!(f.h.root_path().join("room-a/hcom.db").exists());
+    assert!(f.h.root_path().join("room-b/hcom.db").exists());
+    assert!(!f.cache.join("hcom.db").exists());
+    assert_eq!(f.entries().len(), 1);
+
+    fs::write(f.h.codex_home.join("config.toml"), "model = 'fixture'\n").unwrap();
+    f.launch_ok("room-config", true);
+    assert_eq!(f.count(), 2, "Codex config change reused stale validation");
+
+    fs::write(&f.setup, "setup-v2").unwrap();
+    f.launch_ok("room-setup", true);
+    assert_eq!(f.count(), 3, "wrapper setup change reused stale validation");
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.native)
+        .unwrap()
+        .write_all(b"changed native image")
+        .unwrap();
+    f.launch_ok("room-native", true);
+    assert_eq!(
+        f.count(),
+        4,
+        "same-version native change reused stale validation"
+    );
+
+    let new_target = f.h.root_path().join("native-image-v2");
+    fs::copy(&f.native, &new_target).unwrap();
+    fs::remove_file(&f.native).unwrap();
+    std::os::unix::fs::symlink(&new_target, &f.native).unwrap();
+    f.launch_ok("room-retarget", true);
+    assert_eq!(
+        f.count(),
+        5,
+        "same-content native pin retarget reused stale validation"
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(f.h.root_path().join("pipe-tools/codex"))
+        .unwrap()
+        .write_all(b"\n# wrapper implementation changed\n")
+        .unwrap();
+    f.launch_ok("room-wrapper", true);
+    assert_eq!(
+        f.count(),
+        6,
+        "same-version wrapper change reused stale validation"
+    );
+}
+
+#[test]
+fn codex_validation_cache_recovers_corruption_and_never_caches_failure() {
+    let f = CacheFixture::new();
+    f.launch_ok("room-warm", true);
+    let entries = f.entries();
+    assert_eq!(entries.len(), 1);
+    // Syntactically valid JSON must still contain all validated hook entries.
+    fs::write(&entries[0], "[]").unwrap();
+    f.launch_ok("room-empty-cache", true);
+    assert_eq!(f.count(), 2, "invalid cached entries bypassed hooks/list");
+
+    fs::write(&entries[0], "{truncated").unwrap();
+    fs::write(&f.failure, "fail inspection").unwrap();
+    for (room, count) in [("room-failed-a", 3), ("room-failed-b", 4)] {
+        let output = f.launch(room, true);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("fixture hook list failure"),
+            "{output:?}"
+        );
+        assert_eq!(f.count(), count, "failed validation became a cache hit");
+    }
+    fs::remove_file(&f.failure).unwrap();
+    f.launch_ok("room-recovered", true);
+    assert_eq!(f.count(), 5);
+    f.launch_ok("room-reused", true);
+    assert_eq!(f.count(), 5, "recovered validation was not published");
+}
+
+#[test]
+fn codex_validation_cache_requires_complete_wrapper_inputs() {
+    let f = CacheFixture::new();
+    for room in ["room-opaque-a", "room-opaque-b"] {
+        f.launch_ok(room, false);
+    }
+    assert_eq!(f.count(), 2, "opaque wrapper reused unverifiable identity");
+    assert!(f.entries().is_empty());
+
+    fs::write(&f.manifest, "{broken").unwrap();
+    for room in ["room-manifest-a", "room-manifest-b"] {
+        f.launch_ok(room, true);
+    }
+    assert_eq!(f.count(), 4, "invalid manifest bypassed fresh validation");
+    assert!(f.entries().is_empty());
+
+    fs::write(
+        &f.manifest,
+        serde_json::json!({
+            "version": 1,
+            "native_binary": f.native,
+            "files": [f.h.root_path().join("missing-setup-input")],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for room in ["room-missing-input-a", "room-missing-input-b"] {
+        f.launch_ok(room, true);
+    }
+    assert_eq!(
+        f.count(),
+        6,
+        "missing setup input bypassed fresh validation"
+    );
+    assert!(f.entries().is_empty());
 }
 
 #[test]

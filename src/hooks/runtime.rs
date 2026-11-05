@@ -102,7 +102,9 @@ pub struct RuntimeInjection {
 pub struct PerRunAdapter {
     /// Build and validate the injection: publish artifacts, merge caller
     /// values, fetch trust entries. Must not write outside
-    /// `<HCOM_DIR>/integrations/`. An error fails the launch.
+    /// `<HCOM_DIR>/integrations/`, except for Codex's shared user-cache hook
+    /// validation metadata (never session or delivery state). An error fails
+    /// the launch.
     pub prepare: fn(&LaunchCtx) -> Result<RuntimeInjection>,
     /// Remove hcom-owned legacy installs (from older hcom versions) in the dirs
     /// that are effective for this launch only. Delete by ownership (content
