@@ -596,6 +596,7 @@ fn prepare_resume_plan_from_source(
         },
         launch: LaunchParams {
             stdio: false,
+            stdio_program: None,
             tool: launch_tool.as_str().to_string(),
             count: 1,
             args: merged_args,
