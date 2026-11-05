@@ -23,6 +23,8 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use crate::shared::time::now_epoch_f64;
 
 mod claude_actors;
+mod contention;
+pub(crate) use contention::WriteTiming;
 mod events;
 mod instances;
 mod kv;
@@ -177,11 +179,14 @@ impl HcomDb {
     /// The immediate write lock makes read-modify-write sequences atomic
     /// across the separate database connections used by hook processes.
     /// Queries inside `f` must use the provided transaction.
+    #[track_caller]
     pub fn with_immediate_transaction<T>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
+        let mut timing = WriteTiming::new(self, "immediate_transaction");
         let txn = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        timing.acquired();
         let result = f(&txn)?;
         txn.commit()?;
         Ok(result)
@@ -190,8 +195,14 @@ impl HcomDb {
     /// Run `f` atomically on this connection: in its own `BEGIN IMMEDIATE`
     /// transaction when none is open, or in a savepoint nested inside the
     /// caller's transaction. Any error rolls back every write made by `f`.
+    #[track_caller]
     pub fn with_write_scope<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let own_transaction = self.conn.is_autocommit();
+        let mut timing = if own_transaction {
+            Some(WriteTiming::new(self, "write_scope"))
+        } else {
+            None
+        };
         let (begin, commit, rollback) = if own_transaction {
             ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
         } else {
@@ -202,14 +213,22 @@ impl HcomDb {
             )
         };
         self.conn.execute_batch(begin)?;
+        if let Some(timing) = &mut timing {
+            timing.acquired();
+        }
         let result = f().and_then(|value| {
             self.conn.execute_batch(commit)?;
             Ok(value)
         });
-        if result.is_err() {
-            let _ = self.conn.execute_batch(rollback);
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => match self.conn.execute_batch(rollback) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "rollback failed; database state uncertain: {rollback}"
+                ))),
+            },
         }
-        result
     }
 
     /// Access the filesystem path backing this DB handle.

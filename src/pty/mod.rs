@@ -742,16 +742,13 @@ impl Proxy {
                 let db = crate::db::HcomDb::open()?;
                 // Our unreaped child can't have been recycled, so a missing identity
                 // (unobservable on this platform) just means no reuse protection.
-                db.update_instance_pid_with_identity(
+                let context = shared::build_early_launch_context();
+                db.persist_pty_process(
                     instance_name,
                     child_pid,
                     child_identity.as_deref(),
+                    &context,
                 )?;
-
-                // Capture minimal launch context early so kill can close the terminal pane.
-                // The start hook may later overwrite with richer context (git_branch, tty, env).
-                let _ =
-                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
                 Ok(())
             })();
             if let Err(error) = persist_result {
@@ -1775,6 +1772,57 @@ mod tests {
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn pty_persistence_failure_reaps_child_and_rolls_back_pid() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let _process =
+            crate::hooks::test_helpers::EnvVarGuard::remove(["HCOM_PROCESS_ID".to_string()]);
+        let db = crate::db::HcomDb::open().unwrap();
+        db.conn().execute_batch("INSERT INTO instances(name, created_at) VALUES ('nova', 1); CREATE TRIGGER reject_pid BEFORE UPDATE OF pid ON instances BEGIN SELECT RAISE(ABORT, 'pid rejected'); END;").unwrap();
+        let result = super::Proxy::spawn(
+            "/bin/sh",
+            &["-c", "exec /bin/sleep 30"],
+            super::ProxyConfig {
+                instance_name: Some("nova".into()),
+                ..Default::default()
+            },
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(proxy) => {
+                drop(proxy);
+                panic!("failed persistence launched a child")
+            }
+        };
+        assert!(format!("{error:#}").contains("pid rejected"), "{error:#}");
+        let logs = std::fs::read_to_string(crate::paths::log_path()).unwrap();
+        let record: serde_json::Value = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row["event"] == "startup.spawned")
+            .unwrap();
+        let pid: u32 = record["msg"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("child_pid="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            crate::sys::process::identity(pid).is_none(),
+            "failed launch child remains alive"
+        );
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            -1,
+            "child not reaped"
+        );
+        assert!(db.get_instance_full("nova").unwrap().unwrap().pid.is_none());
+    }
 
     #[cfg(unix)]
     #[test]

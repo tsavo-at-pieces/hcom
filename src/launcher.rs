@@ -1384,13 +1384,6 @@ fn finalize_background_launch(
     pid: u32,
     effective_preset: String,
 ) -> Result<()> {
-    instance_binding::persist_terminal_launch_context(
-        ctx.db,
-        ctx.instance_name,
-        ctx.terminal_mode,
-        &effective_preset,
-        Some(ctx.process_id),
-    );
     let updates =
         serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
     let pid_identity = crate::db::observe_pid_identity(pid);
@@ -1398,12 +1391,25 @@ fn finalize_background_launch(
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{e}"))
         .and_then(|identity| {
-            ctx.db.update_instance_pid_with_identity_and_fields(
-                ctx.instance_name,
-                pid,
-                identity.as_deref(),
-                &updates,
-            )
+            ctx.db.with_launch_write(|| {
+                let owner = ctx
+                    .db
+                    .get_stdio_owned_instance(ctx.process_id)?
+                    .context("background launch ownership disappeared")?;
+                instance_binding::persist_terminal_launch_context(
+                    ctx.db,
+                    &owner.name,
+                    ctx.terminal_mode,
+                    &effective_preset,
+                    Some(ctx.process_id),
+                );
+                ctx.db.update_instance_pid_with_identity_and_fields(
+                    &owner.name,
+                    pid,
+                    identity.as_deref(),
+                    &updates,
+                )
+            })
         });
     if let Err(e) = persist_result {
         // Keep the log path as diagnostics even though PID ownership was not
@@ -1411,7 +1417,6 @@ fn finalize_background_launch(
         // unverified PID: it may already have exited and been reused. A runner
         // that was alive but had no observable identity is still our unreaped
         // child, so its PID can't have been recycled yet.
-        let _ = ctx.db.update_instance_fields(ctx.instance_name, &updates);
         let still_ours = match pid_identity.as_ref() {
             Ok(Some(expected)) => crate::sys::process::identity(pid).as_ref() == Some(expected),
             Ok(None) => true,
@@ -1423,7 +1428,10 @@ fn finalize_background_launch(
         crate::log::log_error(
             "launcher",
             "background.persist_pid",
-            &format!("instance={} pid={} err={}", ctx.instance_name, pid, e),
+            &format!(
+                "instance={} pid={} log_file={} err={}",
+                ctx.instance_name, pid, log_file, e
+            ),
         );
         bail!(
             "failed to persist background process for '{}': {}",
@@ -1699,7 +1707,7 @@ fn initialize_launch_instance(
     working_dir: &str,
     initial_event_id: i64,
 ) -> Result<()> {
-    db.with_write_scope(|| {
+    db.with_launch_write(|| {
         if !instance_binding::initialize_instance_in_position_file(
             db,
             instance_name,
@@ -1724,6 +1732,13 @@ fn initialize_launch_instance(
         db.update_instance_fields(
             instance_name,
             &serde_json::Map::from_iter([("last_event_id".to_string(), json!(initial_event_id))]),
+        )?;
+        db.update_instance_fields(
+            instance_name,
+            &serde_json::Map::from_iter([(
+                "launch_args".to_string(),
+                json!(params.persisted_args.as_ref().unwrap_or(&params.args)),
+            )]),
         )?;
         if db.get_instance_full(instance_name)?.is_none() {
             bail!("Failed to initialize instance '{instance_name}'");
@@ -2198,8 +2213,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             continue;
         }
 
-        // Pre-register instance
-        if let Err(e) = (|| -> Result<()> {
+        // Persist the pre-injection snapshot and binding atomically before spawn.
+        params.persisted_args = Some(stored_launch_args.clone());
+        if let Err(e) = db.with_launch_write(|| {
             initialize_launch_instance(
                 db,
                 &params,
@@ -2210,10 +2226,15 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 initial_event_id,
             )?;
             db.set_process_binding(&process_id, "", &instance_name)?;
+            // Publish ownership with the row and args, before SessionStart can
+            // migrate this placeholder while PID persistence waits for a lock.
+            db.conn().execute(
+                "UPDATE instances SET launch_context = json_set(CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END, '$.process_id', ?1) WHERE name = ?2",
+                rusqlite::params![process_id, instance_name],
+            )?;
             Ok(())
-        })() {
+        }) {
             if params.stdio {
-                cleanup_instance(db, &instance_name, &process_id);
                 return Err(e.context("Cannot register stdio launch"));
             }
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
@@ -2244,14 +2265,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     codex_home.as_ref().map(|(path, _)| path.as_path()),
                 );
             }
-            instances::update_instance_position(
-                db,
-                &instance_name,
-                &serde_json::Map::from_iter([(
-                    "launch_args".to_string(),
-                    json!(&stored_launch_args),
-                )]),
-            );
             let result = launch_stdio(
                 db,
                 &params,
@@ -2268,25 +2281,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     tag: &effective_tag,
                 },
             );
-            if result.is_err() {
-                cleanup_instance(db, &instance_name, &process_id);
-            }
-            return result;
+            return result
+                .map_err(|error| cleanup_launch_error(db, &instance_name, &process_id, error));
         }
         let launch_result = (|| -> Result<bool> {
             match normalized.tool() {
                 Tool::Claude if !normalized.is_claude_pty() => {
                     let claude_cmd = build_claude_command(&params.args);
-
-                    // Store launch_args
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
 
                     // Plain `claude` only resolves to NativePrint (background,
                     // direct spawn in print mode) or InteractiveVisible — the
@@ -2375,10 +2376,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
                 _ => {
                     let mut effective_args = params.args.clone();
-                    let mut position = serde_json::Map::from_iter([(
-                        "launch_args".to_string(),
-                        json!(&stored_launch_args),
-                    )]);
+                    let mut position = serde_json::Map::new();
                     match normalized.tool() {
                         Tool::Codex => {
                             // Preserve the announcement before rendering the launch bootstrap.
@@ -2481,11 +2479,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         match launch_result {
             Ok(true) => launched += 1,
             Ok(false) => {
-                cleanup_instance(db, &instance_name, &process_id);
+                if let Err(error) = cleanup_instance(db, &instance_name, &process_id) {
+                    errors.push(json!({"tool": base_tool, "error": format!("launch did not complete; cleanup failed: {error:#}")}));
+                }
             }
             Err(e) => {
-                cleanup_instance(db, &instance_name, &process_id);
-                errors.push(json!({"tool": base_tool, "error": e.to_string()}));
+                let error = cleanup_launch_error(db, &instance_name, &process_id, e);
+                errors.push(json!({"tool": base_tool, "error": format!("{error:#}")}));
             }
         }
     }
@@ -2600,20 +2600,10 @@ fn launch_stdio(
     let mut child_pid = 0;
     let exit_code = crate::sys::process::run_stdio_child(&mut command, stdout_tap, |pid| {
         child_pid = pid;
-        db.store_launch_context(
-            instance_name,
-            &json!({
-                "process_id": process_id, "terminal_preset": "stdio",
-                "terminal_preset_effective": "stdio",
-            })
-            .to_string(),
-        )?;
         let identity = crate::db::observe_pid_identity(pid)?;
-        db.update_instance_pid_with_identity_and_fields(
-            instance_name,
-            pid,
-            identity.as_deref(),
-            &serde_json::Map::new(),
+        db.persist_pty_process(
+            instance_name, pid, identity.as_deref(),
+            &json!({"process_id": process_id, "terminal_preset": "stdio", "terminal_preset_effective": "stdio"}).to_string(),
         )?;
         crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
             process_id,
@@ -3176,9 +3166,25 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
 }
 
 /// Clean up instance and process binding on failure.
-fn cleanup_instance(db: &HcomDb, name: &str, process_id: &str) {
-    db.delete_instance(name).ok();
-    db.delete_process_binding(process_id).ok();
+fn cleanup_instance(db: &HcomDb, _name: &str, process_id: &str) -> Result<()> {
+    db.with_launch_write(|| {
+        if let Some(owner) = db.get_stdio_owned_instance(process_id)? {
+            db.delete_instance(&owner.name)?;
+        }
+        db.delete_process_binding(process_id)
+    })
+}
+
+fn cleanup_launch_error(
+    db: &HcomDb,
+    name: &str,
+    process_id: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match cleanup_instance(db, name, process_id) {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!("launch failed; cleanup failed for {name}/{process_id}; registration may remain: {cleanup:#}")),
+    }
 }
 
 #[cfg(test)]
@@ -4737,6 +4743,239 @@ mod tests {
         let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
         db
+    }
+
+    #[test]
+    #[ignore = "isolated writer-duration diagnostic"]
+    #[serial]
+    fn diagnose_resume_subscription_replay_writer_duration() {
+        use std::time::{Duration, Instant};
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let distinct = std::env::var_os("HCOM_REPLAY_DISTINCT").is_some();
+        {
+            let count = 128usize;
+            let db = HcomDb::open_at(&room.join(format!("replay-{count}.db"))).unwrap();
+            let saved: Vec<_> = (0..count)
+                .map(|i| {
+                    json!({
+                        "id": format!("sub-diagnostic-{i}"), "caller": "luna",
+                        "sql": format!("type = 'status' AND instance = 'never-matches-{}'", if distinct { i } else { 0 }),
+                        "last_id": 0, "once": false,
+                    })
+                })
+                .collect();
+            db.with_write_scope(|| {
+                db.insert_event_row(
+                    "life",
+                    "luna",
+                    &json!({"action": "stopped", "snapshot": {"subscriptions": saved}}),
+                    None,
+                )?;
+                for _ in 0..1000 {
+                    db.insert_event_row("status", "libe", &json!({"status": "listening"}), None)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            let probe = HcomDb::open_at(db.path()).unwrap();
+            probe.conn().busy_timeout(Duration::from_secs(5)).unwrap();
+            let (start_probe, ready) = std::sync::mpsc::channel();
+            let contender = std::thread::spawn(move || {
+                ready.recv().unwrap();
+                let started = Instant::now();
+                let result = probe.kv_set("probe", Some("1"));
+                (started.elapsed(), result)
+            });
+            let params = LaunchParams {
+                prior_session_id: Some("fixture-session".into()),
+                resume_cursor: Some(0),
+                ..Default::default()
+            };
+            let started = Instant::now();
+            db.with_write_scope(|| {
+                start_probe.send(()).unwrap();
+                initialize_launch_instance(&db, &params, "luna", "codex", "", "/fixture", 0)
+            })
+            .unwrap();
+            let elapsed = started.elapsed();
+            let (waited, result) = contender.join().unwrap();
+            eprintln!(
+                "subscriptions={count} distinct={distinct} replay_events=1000 launch_scope_ms={} contender_statement_ms={} contender={result:?}",
+                elapsed.as_millis(),
+                waited.as_millis()
+            );
+        }
+        eprintln!(
+            "{}",
+            std::fs::read_to_string(crate::paths::log_path()).unwrap()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_binding_failure_rolls_back_required_args_and_row() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        db.conn().execute_batch("CREATE TRIGGER reject_binding BEFORE INSERT ON process_bindings BEGIN SELECT RAISE(ABORT, 'binding rejected'); END;").unwrap();
+        let result = db.with_launch_write(|| {
+            initialize_launch_instance(
+                &db,
+                &LaunchParams::default(),
+                "luna",
+                "codex",
+                "",
+                "/fixture",
+                0,
+            )?;
+            db.set_process_binding("proc", "", "luna")
+        });
+        assert!(result.is_err());
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        assert!(db.get_process_binding("proc").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn launch_cleanup_preserves_new_owner_and_follows_canonical_binding() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        for name in ["nova", "luna"] {
+            initialize_launch_instance(
+                &db,
+                &LaunchParams::default(),
+                name,
+                "codex",
+                "",
+                "/fixture",
+                0,
+            )
+            .unwrap();
+        }
+        db.store_launch_context("nova", r#"{"process_id":"new-launch"}"#)
+            .unwrap();
+        db.store_launch_context("luna", r#"{"process_id":"failed-launch"}"#)
+            .unwrap();
+        db.set_process_binding("failed-launch", "", "luna").unwrap();
+        instance_binding::persist_terminal_launch_context(
+            &db,
+            "nova",
+            None,
+            "fixture-terminal",
+            Some("failed-launch"),
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .terminal_preset_effective
+                .as_deref(),
+            Some("fixture-terminal")
+        );
+        instance_binding::persist_terminal_launch_context(
+            &db,
+            "nova",
+            None,
+            "stale-terminal",
+            Some("unbound-old-launch"),
+        );
+        assert!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .launch_context
+                .unwrap()
+                .contains("new-launch")
+        );
+        cleanup_instance(&db, "nova", "failed-launch").unwrap();
+        assert!(db.get_instance_full("nova").unwrap().is_some());
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        db.set_process_binding("stale-launch", "", "nova").unwrap();
+        cleanup_instance(&db, "nova", "stale-launch").unwrap();
+        assert!(db.get_instance_full("nova").unwrap().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn launch_cleanup_does_not_leave_partial_deletion() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        initialize_launch_instance(
+            &db,
+            &LaunchParams::default(),
+            "luna",
+            "codex",
+            "",
+            "/fixture",
+            0,
+        )
+        .unwrap();
+        db.set_process_binding("proc", "", "luna").unwrap();
+        db.store_launch_context("luna", r#"{"process_id":"proc"}"#)
+            .unwrap();
+        db.conn().execute_batch("CREATE TRIGGER reject_cleanup BEFORE DELETE ON process_bindings BEGIN SELECT RAISE(ABORT, 'cleanup rejected'); END;").unwrap();
+        let error = cleanup_launch_error(&db, "luna", "proc", anyhow::anyhow!("spawn failed"));
+        assert!(format!("{error:#}").contains("registration may remain"));
+        assert!(
+            db.get_instance_full("luna").unwrap().is_some(),
+            "rollback must leave both records when cleanup fails"
+        );
+        assert!(db.get_process_binding("proc").unwrap().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_requires_persisted_args_atomically() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        let params = LaunchParams {
+            args: vec!["injected-runtime-arg".into()],
+            persisted_args: Some(vec!["--model".into(), "fixture-model".into()]),
+            ..Default::default()
+        };
+        initialize_launch_instance(&db, &params, "luna", "codex", "", "/fixture", 0).unwrap();
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_args
+                .as_deref(),
+            Some(r#"["--model","fixture-model"]"#)
+        );
+        db.conn().execute_batch("CREATE TRIGGER reject_args BEFORE UPDATE OF launch_args ON instances BEGIN SELECT RAISE(ABORT, 'args rejected'); END;").unwrap();
+        assert!(
+            initialize_launch_instance(&db, &params, "nova", "codex", "", "/fixture", 0).is_err()
+        );
+        assert!(
+            db.get_instance_full("nova").unwrap().is_none(),
+            "failed registration left a partial row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_recovers_after_busy_timeout() {
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open_at(&room.join("hcom.db")).unwrap();
+        let blocker = HcomDb::open_at(db.path()).unwrap();
+        db.conn()
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            blocker.conn().execute_batch("ROLLBACK").unwrap();
+        });
+        let result = initialize_launch_instance(
+            &db,
+            &LaunchParams::default(),
+            "luna",
+            "codex",
+            "",
+            "/fixture",
+            0,
+        );
+        release.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

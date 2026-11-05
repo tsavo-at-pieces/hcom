@@ -174,10 +174,13 @@ impl Proxy {
                 let db = HcomDb::open()?;
                 // The child handle keeps this PID from being reused, so a missing
                 // identity only means no reuse protection for later cleanup.
-                db.update_instance_pid_with_identity(
+                db.persist_pty_process(
                     instance_name,
                     pid,
                     crate::sys::process::identity(pid).as_deref(),
+                    // Full terminal metadata waits until the reader has answered
+                    // ConPTY startup queries (see run()).
+                    &serde_json::json!({"process_id": std::env::var("HCOM_PROCESS_ID").unwrap_or_default()}).to_string(),
                 )?;
 
                 Ok(())
