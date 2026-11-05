@@ -1778,6 +1778,27 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn heartbeats_recover_after_busy_timeout() {
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        for stdio in [false, true] {
+            let db = HcomDb::open_at(&room.join(if stdio { "stdio.db" } else { "tcp.db" })).unwrap();
+            stdio_owned_row(&db, "nova", "proc-a");
+            let blocker = HcomDb::open_at(db.path()).unwrap();
+            db.conn().busy_timeout(std::time::Duration::from_millis(20)).unwrap();
+            blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                blocker.conn().execute_batch("ROLLBACK").unwrap();
+            });
+            let result = if stdio { db.update_stdio_heartbeat("proc-a", 123).map(|_| ()) } else { db.update_heartbeat("nova") };
+            release.join().unwrap();
+            assert!(result.is_ok(), "stdio={stdio}: {result:?}");
+            assert!(db.get_instance_full("nova").unwrap().unwrap().last_stop > 1);
+        }
+    }
+
+    #[test]
     fn stdio_heartbeat_refreshes_only_the_row_its_launch_still_owns() {
         let heartbeat = |db: &HcomDb| -> (i64, i64, String) {
             db.conn

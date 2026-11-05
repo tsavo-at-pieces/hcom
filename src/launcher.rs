@@ -4741,6 +4741,54 @@ mod tests {
 
     #[test]
     #[serial]
+    fn launch_cleanup_does_not_leave_partial_deletion() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        initialize_launch_instance(&db, &LaunchParams::default(), "luna", "codex", "", "/fixture", 0).unwrap();
+        db.set_process_binding("proc", "", "luna").unwrap();
+        db.conn().execute_batch("CREATE TRIGGER reject_cleanup BEFORE DELETE ON process_bindings BEGIN SELECT RAISE(ABORT, 'cleanup rejected'); END;").unwrap();
+        let _ = cleanup_instance(&db, "luna", "proc");
+        assert!(db.get_instance_full("luna").unwrap().is_some(), "rollback must leave both records when cleanup fails");
+        assert!(db.get_process_binding("proc").unwrap().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_requires_persisted_args_atomically() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        let params = LaunchParams {
+            args: vec!["injected-runtime-arg".into()],
+            persisted_args: Some(vec!["--model".into(), "fixture-model".into()]),
+            ..Default::default()
+        };
+        initialize_launch_instance(&db, &params, "luna", "codex", "", "/fixture", 0).unwrap();
+        assert_eq!(db.get_instance_full("luna").unwrap().unwrap().launch_args.as_deref(),
+            Some(r#"["--model","fixture-model"]"#));
+        db.conn().execute_batch("CREATE TRIGGER reject_args BEFORE UPDATE OF launch_args ON instances BEGIN SELECT RAISE(ABORT, 'args rejected'); END;").unwrap();
+        assert!(initialize_launch_instance(&db, &params, "nova", "codex", "", "/fixture", 0).is_err());
+        assert!(db.get_instance_full("nova").unwrap().is_none(), "failed registration left a partial row");
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_recovers_after_busy_timeout() {
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open_at(&room.join("hcom.db")).unwrap();
+        let blocker = HcomDb::open_at(db.path()).unwrap();
+        db.conn().busy_timeout(std::time::Duration::from_millis(20)).unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            blocker.conn().execute_batch("ROLLBACK").unwrap();
+        });
+        let result = initialize_launch_instance(&db, &LaunchParams::default(), "luna", "codex", "", "/fixture", 0);
+        release.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    #[serial]
     fn launch_registration_preserves_resume_backlog_including_zero() {
         // A nested launcher inherits its parent's cursor. It must initialize
         // the resumed identity from the stopped snapshot instead.
