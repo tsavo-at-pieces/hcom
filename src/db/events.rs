@@ -556,10 +556,32 @@ impl HcomDb {
         };
         let data_str = serde_json::to_string(data)?;
 
-        self.conn.execute(
+        let autocommit = self.conn.is_autocommit();
+        let started = std::time::Instant::now();
+        let inserted = self.conn.execute(
             "INSERT INTO events (timestamp, type, instance, data) VALUES (?, ?, ?, ?)",
             params![ts, event_type, instance, data_str],
-        )?;
+        );
+        let elapsed = started.elapsed();
+        // Includes SQLite admission, FTS trigger work and commit/checkpoint.
+        // This does NOT measure ownership; nested inserts are covered by the
+        // outer transaction's timer. Never log event bodies or arguments.
+        if autocommit && elapsed >= std::time::Duration::from_millis(250) {
+            crate::log::log_with_fields(
+                "WARN",
+                "db",
+                "db.event_insert_timing",
+                "slow autocommit event insert",
+                &[
+                    ("pid", &std::process::id().to_string()),
+                    ("db", &self.path().display().to_string()),
+                    ("event_type", event_type),
+                    ("statement_elapsed_ms", &elapsed.as_millis().to_string()),
+                    ("success", if inserted.is_ok() { "true" } else { "false" }),
+                ],
+            );
+        }
+        inserted?;
         Ok(self.conn.last_insert_rowid())
     }
 

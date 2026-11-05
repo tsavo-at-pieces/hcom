@@ -30,6 +30,16 @@ pub fn persist_terminal_launch_context(
     process_id: Option<&str>,
 ) {
     let result = db.with_write_scope(|| {
+        // Late terminal metadata follows an authenticated canonical migration.
+        // It must never overwrite a newer launch's ownership token by name.
+        let owner = match process_id.filter(|id| !id.is_empty()) {
+            Some(id) => db.get_stdio_owned_instance(id)?,
+            None => None,
+        };
+        let instance_name = owner
+            .as_ref()
+            .map(|row| row.name.as_str())
+            .unwrap_or(instance_name);
         let mut ctx = db
             .get_instance_full(instance_name)?
             .and_then(|pos| pos.launch_context)
@@ -39,6 +49,13 @@ pub fn persist_terminal_launch_context(
             .unwrap_or_default();
 
         if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
+            anyhow::ensure!(
+                ctx.get("process_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .is_none_or(|current| current == pid),
+                "terminal metadata belongs to a different launch"
+            );
             ctx.insert("process_id".into(), serde_json::json!(pid));
         }
         if !effective_preset.is_empty() {
@@ -957,6 +974,7 @@ pub fn bind_session_to_process_for_tool(
     expected_tool: &str,
     create_if_unbound: bool,
 ) -> ToolCheckedBind {
+    let mut timing = crate::db::WriteTiming::new(db, "bind_session_to_process_for_tool");
     let transaction = match rusqlite::Transaction::new_unchecked(
         db.conn(),
         rusqlite::TransactionBehavior::Immediate,
@@ -972,6 +990,7 @@ pub fn bind_session_to_process_for_tool(
         }
     };
 
+    timing.acquired();
     let owner_matches = |kind: &str, name: &str, tool: Option<&str>| {
         if tool == Some(expected_tool) {
             return true;

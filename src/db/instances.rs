@@ -352,6 +352,34 @@ impl HcomDb {
         })
     }
 
+    /// Persist a spawned child's ownership and early context as one launch write.
+    pub(crate) fn persist_pty_process(
+        &self,
+        name: &str,
+        pid: u32,
+        identity: Option<&str>,
+        context: &str,
+    ) -> Result<()> {
+        self.with_launch_write(|| {
+            let context_value: serde_json::Value = serde_json::from_str(context)?;
+            let owner = if let Some(process_id) = context_value
+                .get("process_id")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+            {
+                // SessionStart may have renamed a placeholder while admission
+                // waited. The exact launch token follows that migration.
+                self.get_stdio_owned_instance(process_id)?
+            } else {
+                // Ad-hoc PTY callers may have a named row without a launch token.
+                self.get_instance_full(name)?
+            }
+            .ok_or_else(|| anyhow::anyhow!("owned launch registration disappeared for {name}"))?;
+            self.update_instance_pid_with_identity(&owner.name, pid, identity)?;
+            self.store_launch_context(&owner.name, context)
+        })
+    }
+
     /// Stored process incarnation for an instance PID.
     pub fn get_instance_pid_identity(&self, name: &str) -> Result<Option<String>> {
         Ok(self
@@ -1190,11 +1218,13 @@ impl HcomDb {
     pub fn update_heartbeat(&self, name: &str) -> Result<()> {
         let now = now_epoch_i64();
 
-        self.conn.execute(
-            "UPDATE instances SET last_stop = ?, tcp_mode = 1 WHERE name = ?",
-            params![now, name],
-        )?;
-        Ok(())
+        self.with_heartbeat_write(|| {
+            self.conn.execute(
+                "UPDATE instances SET last_stop = ?, tcp_mode = 1 WHERE name = ?",
+                params![now, name],
+            )?;
+            Ok(())
+        })
     }
 
     /// The row a foreground pipe client's launch still owns: the process
@@ -1220,16 +1250,18 @@ impl HcomDb {
     /// [`Self::update_heartbeat`], this claims no TCP listener and never
     /// touches status. Returns whether a row was refreshed.
     pub fn update_stdio_heartbeat(&self, process_id: &str, now: i64) -> Result<bool> {
-        let changed = self.conn.execute(
-            "UPDATE instances SET last_stop = ?2
+        self.with_heartbeat_write(|| {
+            let changed = self.conn.execute(
+                "UPDATE instances SET last_stop = ?2
              WHERE status != ?3
                AND name = (SELECT instance_name FROM process_bindings WHERE process_id = ?1)
                AND created_at <= (SELECT updated_at FROM process_bindings WHERE process_id = ?1)
                AND CASE WHEN json_valid(launch_context)
                    THEN json_extract(launch_context, '$.process_id') = ?1 ELSE 0 END",
-            params![process_id, now, ST_INACTIVE],
-        )?;
-        Ok(changed > 0)
+                params![process_id, now, ST_INACTIVE],
+            )?;
+            Ok(changed > 0)
+        })
     }
 
     /// Update instance position with tcp_mode flag
@@ -1779,19 +1811,102 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn pty_persistence_follows_rebind_during_contention_and_refuses_takeover() {
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open_at(&room.join("hcom.db")).unwrap();
+        stdio_owned_row(&db, "nova", "proc-a");
+        let blocker = HcomDb::open_at(db.path()).unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        stdio_owned_row(&blocker, "luna", "proc-a");
+        blocker.delete_instance("nova").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            blocker.conn().execute_batch("COMMIT").unwrap();
+        });
+        let result =
+            db.persist_pty_process("nova", 4242, Some("fixture"), r#"{"process_id":"proc-a"}"#);
+        release.join().unwrap();
+        result.unwrap();
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().pid,
+            Some(4242)
+        );
+        db.conn().execute_batch(r#"UPDATE instances SET launch_context = '{"process_id":"new-launch"}', pid = 4343 WHERE name = 'luna'"#).unwrap();
+        assert!(
+            db.persist_pty_process("luna", 4444, None, r#"{"process_id":"proc-a"}"#)
+                .is_err()
+        );
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().pid,
+            Some(4343)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pty_persistence_retries_and_rolls_back_context_failure() {
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open_at(&room.join("hcom.db")).unwrap();
+        stdio_owned_row(&db, "nova", "proc-a");
+        let blocker = HcomDb::open_at(db.path()).unwrap();
+        db.conn()
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            blocker.conn().execute_batch("ROLLBACK").unwrap();
+        });
+        let result = db.persist_pty_process(
+            "nova",
+            4242,
+            Some("fixture-identity"),
+            r#"{"pane_id":"fixture"}"#,
+        );
+        release.join().unwrap();
+        result.unwrap();
+        assert_eq!(
+            db.get_instance_full("nova").unwrap().unwrap().pid,
+            Some(4242)
+        );
+        db.conn().execute_batch("CREATE TRIGGER reject_context BEFORE UPDATE OF launch_context ON instances WHEN json_extract(NEW.launch_context, '$.new_field') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'context rejected'); END;").unwrap();
+        assert!(
+            db.persist_pty_process("nova", 4343, Some("other-identity"), r#"{"new_field":"x"}"#)
+                .is_err()
+        );
+        assert_eq!(
+            db.get_instance_full("nova").unwrap().unwrap().pid,
+            Some(4242)
+        );
+        assert_eq!(
+            db.get_instance_pid_identity("nova").unwrap().as_deref(),
+            Some("fixture-identity")
+        );
+        assert!(db.persist_pty_process("missing", 4444, None, "{}").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn heartbeats_recover_after_busy_timeout() {
         let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         for stdio in [false, true] {
-            let db = HcomDb::open_at(&room.join(if stdio { "stdio.db" } else { "tcp.db" })).unwrap();
+            let db =
+                HcomDb::open_at(&room.join(if stdio { "stdio.db" } else { "tcp.db" })).unwrap();
             stdio_owned_row(&db, "nova", "proc-a");
             let blocker = HcomDb::open_at(db.path()).unwrap();
-            db.conn().busy_timeout(std::time::Duration::from_millis(20)).unwrap();
+            db.conn()
+                .busy_timeout(std::time::Duration::from_millis(20))
+                .unwrap();
             blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
             let release = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 blocker.conn().execute_batch("ROLLBACK").unwrap();
             });
-            let result = if stdio { db.update_stdio_heartbeat("proc-a", 123).map(|_| ()) } else { db.update_heartbeat("nova") };
+            let result = if stdio {
+                db.update_stdio_heartbeat("proc-a", 123).map(|_| ())
+            } else {
+                db.update_heartbeat("nova")
+            };
             release.join().unwrap();
             assert!(result.is_ok(), "stdio={stdio}: {result:?}");
             assert!(db.get_instance_full("nova").unwrap().unwrap().last_stop > 1);

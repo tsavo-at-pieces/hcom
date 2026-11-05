@@ -15,7 +15,6 @@ use crate::db::HcomDb;
 use crate::identity;
 use crate::identity::get_display_name;
 use crate::instance_lifecycle::set_status;
-use crate::instances;
 use crate::notify::NotifyServer;
 use crate::shared::{CommandContext, ST_INACTIVE, ST_LISTENING};
 
@@ -54,7 +53,11 @@ fn update_heartbeat(db: &HcomDb, instance_name: &str) {
 
     let mut updates = serde_json::Map::new();
     updates.insert("last_stop".into(), serde_json::json!(now));
-    instances::update_instance_position(db, instance_name, &updates);
+    if let Err(error) =
+        db.with_heartbeat_write(|| db.update_instance_fields(instance_name, &updates))
+    {
+        crate::log::log_warn("listen", "heartbeat.failed", &format!("{error:#}"));
+    }
 }
 
 /// Format messages as text for model consumption.
