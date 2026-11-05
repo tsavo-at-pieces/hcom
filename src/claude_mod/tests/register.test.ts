@@ -183,6 +183,191 @@ test('polls keep observing until a finished wake is reported', async () => {
   h.finishPrompt()
 })
 
+test('a completed wake retries a BUSY outcome report before releasing observe mode', async () => {
+  const h = harness()
+  const calls = [] as string[][]
+  let reports = 0
+  let polls = 0
+  h.api.process.run = async (argv: string[]) => {
+    calls.push(argv)
+    if (argv.includes('--event')) {
+      reports++
+      return reports === 1
+        ? { exitCode: 75, stdout: '{"busy":true}' }
+        : { exitCode: 0, stdout: '{}' }
+    }
+    polls++
+    return { exitCode: 0, stdout: JSON.stringify({ wake: polls === 1, wake_id: 'wake-1' }) }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await h.tick()
+  h.finishPrompt()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  for (let i = 0; i < 20; i++) await h.tick()
+  expect(reports).toBe(1)
+  expect(calls.filter(c => !c.includes('--event')).slice(1).every(c => c.includes('--observe'))).toBe(true)
+  expect(h.prompts.length).toBe(1)
+  await h.tick()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  expect(reports).toBe(2)
+  const outcomes = calls.filter(c => c.includes('--event'))
+  expect(outcomes.every(c => c.includes('submitted') && c[c.indexOf('--wake-id') + 1] === 'wake-1')).toBe(true)
+  await h.tick()
+  expect(calls.at(-1)!.includes('--observe')).toBe(false)
+  expect(h.prompts.length).toBe(1)
+})
+
+test('a dropped wake retains and retries its exact failure outcome', async () => {
+  const h = harness()
+  const reports = [] as string[][]
+  const polls = [] as string[][]
+  h.api.prompt.submit = () => Promise.resolve({ drop: 'submission denied' }) as any
+  h.api.process.run = async (argv: string[]) => {
+    if (argv.includes('--event')) {
+      reports.push(argv)
+      if (reports.length === 1) throw new Error('report process timed out')
+      return { exitCode: 0, stdout: '{}' }
+    }
+    polls.push(argv)
+    return { exitCode: 0, stdout: JSON.stringify({ wake: polls.length === 1, wake_id: 'wake-2' }) }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await h.tick()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  for (let i = 0; i < 20; i++) await h.tick()
+  expect(reports.length).toBe(1)
+  expect(polls.slice(1).every(c => c.includes('--observe'))).toBe(true)
+  await h.tick()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  expect(reports.length).toBe(2)
+  expect(reports[1]).toEqual(reports[0])
+  expect(reports[1].includes('submission-failed')).toBe(true)
+  expect(reports[1][reports[1].indexOf('--wake-id') + 1]).toBe('wake-2')
+  await h.tick()
+  expect(polls.at(-1)!.includes('--observe')).toBe(false)
+})
+
+test('outcome retries continue while an observe poll is still running', async () => {
+  const h = harness()
+  let reports = 0
+  let polls = 0
+  let finishPoll: Function
+  h.api.process.run = (argv: string[]) => {
+    if (argv.includes('--event')) {
+      reports++
+      return Promise.resolve({ exitCode: reports === 1 ? 75 : 0, stdout: '{}' }) as any
+    }
+    polls++
+    if (polls === 1) return Promise.resolve({ exitCode: 0, stdout: '{"wake":true,"wake_id":"wake-3"}' }) as any
+    return new Promise(resolve => { finishPoll = resolve }) as any
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await h.tick()
+  const pending = h.tick()
+  h.finishPrompt()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  for (let i = 0; i < 21; i++) await h.tick()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  expect(reports).toBe(2)
+  expect(polls).toBe(2)
+  expect(h.prompts.length).toBe(1)
+  finishPoll!({ exitCode: 0, stdout: '{"wake":false}' })
+  await pending
+})
+
+test('an unresolved menu submission is never retried or reported as completed', async () => {
+  const h = harness()
+  const calls = [] as string[][]
+  h.api.process.run = async (argv: string[]) => {
+    calls.push(argv)
+    return { exitCode: 0, stdout: '{"wake":true,"wake_id":"menu-wake"}' }
+  }
+  await h.handlers['session.start'](h.api, interactive, next)
+  await h.tick()
+  h.advance(35 * 60 * 1000)
+  for (let i = 0; i < 100; i++) await h.tick()
+  expect(h.prompts.length).toBe(1)
+  expect(calls.slice(1).every(c => c.includes('--observe') && !c.includes('--event'))).toBe(true)
+})
+
+test('a completion from before module reload cannot release a newer submission', async () => {
+  const old = harness()
+  const oldReports = [] as string[][]
+  old.api.process.run = async (argv: string[]) => {
+    if (argv.includes('--event')) oldReports.push(argv)
+    return { exitCode: 0, stdout: '{"wake":true,"wake_id":"old-wake"}' }
+  }
+  await old.handlers['session.start'](old.api, interactive, next)
+  await old.tick()
+  const current = harness()
+  const calls = [] as string[][]
+  current.api.process.run = async (argv: string[]) => {
+    calls.push(argv)
+    return { exitCode: 0, stdout: '{"wake":true,"wake_id":"new-wake"}' }
+  }
+  await current.handlers['session.start'](current.api, interactive, next)
+  await current.tick()
+  old.finishPrompt()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  await current.tick()
+  expect(oldReports.length).toBe(0)
+  expect(current.prompts.length).toBe(1)
+  expect(calls.at(-1)!.includes('--observe')).toBe(true)
+})
+
+test('an in-flight report from before reload cannot release a newer submission', async () => {
+  const old = harness()
+  let finishReport: Function
+  old.api.process.run = (argv: string[]) => {
+    if (argv.includes('--event')) return new Promise(resolve => { finishReport = resolve }) as any
+    return Promise.resolve({ exitCode: 0, stdout: '{"wake":true,"wake_id":"old-wake"}' }) as any
+  }
+  await old.handlers['session.start'](old.api, interactive, next)
+  await old.tick()
+  old.finishPrompt()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  const current = harness()
+  const calls = [] as string[][]
+  current.api.process.run = async (argv: string[]) => {
+    calls.push(argv)
+    return { exitCode: 0, stdout: '{"wake":true,"wake_id":"new-wake"}' }
+  }
+  await current.handlers['session.start'](current.api, interactive, next)
+  await current.tick()
+  finishReport!({ exitCode: 0, stdout: '{}' })
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  await current.tick()
+  expect(current.prompts.length).toBe(1)
+  expect(calls.at(-1)!.includes('--observe')).toBe(true)
+})
+
+test('an old in-flight poll cannot submit or release a newer probe after reload', async () => {
+  const old = harness()
+  let finishOld: Function
+  old.api.process.run = () => new Promise(resolve => { finishOld = resolve }) as any
+  await old.handlers['session.start'](old.api, interactive, next)
+  const pendingOld = old.tick()
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  const current = harness()
+  let finishCurrent: Function
+  let polls = 0
+  current.api.process.run = () => {
+    polls++
+    return new Promise(resolve => { finishCurrent = resolve }) as any
+  }
+  await current.handlers['session.start'](current.api, interactive, next)
+  const pendingCurrent = current.tick()
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  finishOld!({ exitCode: 0, stdout: '{"wake":true,"wake_id":"old-wake"}' })
+  await pendingOld
+  expect(old.prompts.length).toBe(0)
+  await current.tick()
+  expect(polls).toBe(1)
+  finishCurrent!({ exitCode: 0, stdout: '{"wake":true,"wake_id":"new-wake"}' })
+  await pendingCurrent
+  expect(current.prompts.length).toBe(1)
+})
+
 test('a failed poll backs off instead of respawning every tick', async () => {
   const h = harness()
   let polls = 0
