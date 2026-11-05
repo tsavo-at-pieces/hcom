@@ -582,7 +582,7 @@ exit 0
     );
     // All output fits even the smallest macOS source pipe; a blocked first
     // copy must not prevent the child from reaching its exit precondition.
-    assert!(expected.len() <= libc::PIPE_BUF as usize);
+    assert!(expected.len() <= libc::PIPE_BUF);
     // The client pipe starts full, so hcom waits while the child exits.
     let (mut client, sink, filler) = full_client_pipe();
     let mut child = {
