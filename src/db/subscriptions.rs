@@ -501,6 +501,7 @@ pub(crate) fn restore_stopped_subscriptions(db: &HcomDb, name: &str) -> Result<u
     let mut replay = ReplayState {
         predicates: ReplayPredicates::new(&db.conn),
         reactions: Vec::new(),
+        rows: None,
     };
     for (event_id, event_type, instance, data) in events {
         let data: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
@@ -782,6 +783,85 @@ impl<'conn> ReplayPredicates<'conn> {
 struct ReplayState<'conn> {
     predicates: ReplayPredicates<'conn>,
     reactions: Vec<OnHitReaction>,
+    rows: Option<ReplayRows>,
+}
+
+// Reuse parsed rows only while this connection owns the replay transaction and
+// no write (including a trigger, cursor update or request-watch transition) has
+// happened. Other connections cannot write during that transaction. Overflow
+// falls back to fresh reads; these bounds cover retained rows/text, not the
+// allocator overhead of parsed JSON or compiled predicates.
+const REPLAY_ROW_LIMIT: usize = 1024;
+const REPLAY_ROW_BYTES: usize = 1024 * 1024;
+
+struct SubscriptionRow {
+    key: String,
+    value: String,
+    sub: serde_json::Value,
+}
+
+struct ReplayRows {
+    changes: u64,
+    rows: std::sync::Arc<Vec<SubscriptionRow>>,
+}
+
+fn subscription_rows(
+    db: &HcomDb,
+    replay: Option<&mut ReplayState<'_>>,
+) -> std::sync::Arc<Vec<SubscriptionRow>> {
+    let changes = db.conn.total_changes();
+    let in_transaction = !db.conn.is_autocommit();
+    if in_transaction
+        && let Some(cached) = replay.as_ref().and_then(|state| state.rows.as_ref())
+        && cached.changes == changes
+    {
+        return std::sync::Arc::clone(&cached.rows);
+    }
+    let mut bytes = 0usize;
+    let mut cacheable = true;
+    let loaded = (|| -> rusqlite::Result<Vec<SubscriptionRow>> {
+        let mut stmt = db.conn.prepare_cached(
+            "SELECT key, value FROM kv
+         WHERE key LIKE 'events_sub:%'
+           AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1
+           AND COALESCE(json_extract(value, '$.delivery_only'), 'false') != 'true'",
+        )?;
+        let iter = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut rows = Vec::new();
+        for row in iter {
+            match row {
+                Ok((key, value)) => {
+                    bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+                    if let Ok(sub) = serde_json::from_str(&value) {
+                        rows.push(SubscriptionRow { key, value, sub });
+                    }
+                }
+                Err(_) => cacheable = false,
+            }
+        }
+        Ok(rows)
+    })();
+    let rows = match loaded {
+        Ok(rows) => rows,
+        Err(_) => {
+            cacheable = false;
+            Vec::new()
+        }
+    };
+    let rows = std::sync::Arc::new(rows);
+    if let Some(replay) = replay {
+        replay.rows = (cacheable
+            && in_transaction
+            && rows.len() <= REPLAY_ROW_LIMIT
+            && bytes <= REPLAY_ROW_BYTES)
+            .then(|| ReplayRows {
+                changes,
+                rows: std::sync::Arc::clone(&rows),
+            });
+    }
+    rows
 }
 
 /// Fire subscriptions matching one logged event, optionally limited to `only`
@@ -796,34 +876,17 @@ fn fire_matching_subscriptions<'conn>(
     only: Option<&HashSet<String>>,
     mut replay: Option<&mut ReplayState<'conn>>,
 ) {
-    let rows: Vec<(String, String)> = match db.conn.prepare_cached(
-        "SELECT key, value FROM kv
-         WHERE key LIKE 'events_sub:%'
-           AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1
-           AND COALESCE(json_extract(value, '$.delivery_only'), 'false') != 'true'",
-    ) {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()
-            .map(|iter| iter.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default(),
-        Err(_) => return,
-    };
+    let rows = subscription_rows(db, replay.as_deref_mut());
 
     if rows.is_empty() {
         return;
     }
 
-    for (key, value) in &rows {
+    for SubscriptionRow { key, value, sub } in rows.iter() {
         if only.is_some_and(|keys| !keys.contains(key)) {
             continue;
         }
-        let mut sub: serde_json::Value = match serde_json::from_str(value) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let mut sub = std::borrow::Cow::Borrowed(sub);
         if subscription_is_delivery_only(&sub) {
             continue;
         }
@@ -842,7 +905,7 @@ fn fire_matching_subscriptions<'conn>(
             ) {
                 crate::log::log_error("db", "collision_sql_upgrade", &format!("{e}"));
             }
-            sub["sql"] = json!(sql);
+            sub.to_mut()["sql"] = json!(sql);
         }
         let sub_id = sub
             .get("id")
@@ -955,7 +1018,7 @@ fn fire_matching_subscriptions<'conn>(
                     )
                     .unwrap_or(0);
                 if waterline < request_id {
-                    let mut sub_mut = sub.clone();
+                    let mut sub_mut = sub.as_ref().clone();
                     sub_mut["last_id"] = serde_json::json!(event_id);
                     kv_store_sub(db, key, &sub_mut);
                     continue;
@@ -988,7 +1051,7 @@ fn fire_matching_subscriptions<'conn>(
                     super::reqwatch_policy::ReqwatchNotifyDecision::Defer {
                         set_grace_if_absent,
                     } => {
-                        let mut sub_mut = sub.clone();
+                        let mut sub_mut = sub.as_ref().clone();
                         sub_mut["last_id"] = serde_json::json!(event_id);
                         if set_grace_if_absent {
                             sub_mut["idle_grace_until"] =
@@ -1056,7 +1119,7 @@ fn fire_matching_subscriptions<'conn>(
                 );
             }
         } else {
-            let mut sub_mut = sub.clone();
+            let mut sub_mut = sub.as_ref().clone();
             sub_mut["last_id"] = serde_json::json!(event_id);
             match serde_json::to_string(&sub_mut) {
                 Ok(json) => {
@@ -3143,6 +3206,103 @@ mod tests {
     }
 
     #[test]
+    fn replay_rows_invalidate_on_writes_and_never_survive_autocommit_or_overflow() {
+        let (db, db_path) = setup_full_test_db();
+        let mut replay = ReplayState {
+            predicates: ReplayPredicates::new(&db.conn),
+            reactions: Vec::new(),
+            rows: None,
+        };
+        let sub = json!({"id": "a", "caller": "mula", "sql": "0", "last_id": 0});
+        kv_store_sub(&db, "events_sub:a", &sub);
+        db.with_write_scope(|| {
+            let original = subscription_rows(&db, Some(&mut replay));
+            let reused = subscription_rows(&db, Some(&mut replay));
+            assert!(std::sync::Arc::ptr_eq(&original, &reused));
+            db.conn.execute_batch(
+                "CREATE TRIGGER rewrite_subscription AFTER INSERT ON kv
+                WHEN NEW.key = 'fixture-change'
+                BEGIN UPDATE kv SET value = json_set(value, '$.sql', '1')
+                WHERE key = 'events_sub:a'; END;",
+            )?;
+            db.kv_set("fixture-change", Some("1"))?;
+            let changed = subscription_rows(&db, Some(&mut replay));
+            assert!(!std::sync::Arc::ptr_eq(&original, &changed));
+            assert_eq!(changed[0].sub["sql"], "1");
+            db.kv_set("events_sub:a", None)?;
+            assert!(subscription_rows(&db, Some(&mut replay)).is_empty());
+            Ok(())
+        })
+        .unwrap();
+        // Another connection may write between autocommit reads.
+        subscription_rows(&db, Some(&mut replay));
+        assert!(replay.rows.is_none());
+        db.with_write_scope(|| {
+            for i in 0..=REPLAY_ROW_LIMIT {
+                kv_store_sub(&db, &format!("events_sub:{i}"), &sub);
+            }
+            assert_eq!(
+                subscription_rows(&db, Some(&mut replay)).len(),
+                REPLAY_ROW_LIMIT + 1
+            );
+            assert!(replay.rows.is_none());
+            db.kv_delete_prefix("events_sub:")?;
+            let oversized = json!({"padding": "x".repeat(REPLAY_ROW_BYTES)});
+            kv_store_sub(&db, "events_sub:large", &oversized);
+            assert_eq!(subscription_rows(&db, Some(&mut replay)).len(), 1);
+            assert!(replay.rows.is_none());
+            // A failed row read must not memoize a transient/partial result.
+            db.kv_delete_prefix("events_sub:")?;
+            db.kv_set("events_sub:invalid", Some("not JSON"))?;
+            subscription_rows(&db, Some(&mut replay));
+            assert!(replay.rows.is_none());
+            Ok(())
+        })
+        .unwrap();
+        drop(replay);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn replay_observes_filter_rewrites_from_notification_triggers() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute_batch(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 1.0), ('libe', 1.0)",
+            )
+            .unwrap();
+        for (id, sql, once) in [
+            ("a", "type = 'status' AND status_val = 'listening'", false),
+            ("b", "0", true),
+        ] {
+            kv_store_sub(
+                &db,
+                &format!("events_sub:{id}"),
+                &json!({"id": id, "caller": "mula", "sql": sql, "last_id": 0, "once": once}),
+            );
+        }
+        stop_for_resume(&db, "mula");
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        let first_hit = db.get_last_event_id();
+        db.log_status_event("libe", "active", "", None, None)
+            .unwrap();
+        db.conn.execute_batch("INSERT INTO instances (name, created_at) VALUES ('mula', 2.0);
+            CREATE TRIGGER rewrite_filter AFTER INSERT ON kv
+            WHEN NEW.key = 'events_sub:a' AND json_extract(NEW.value, '$.last_id') > 0
+            BEGIN UPDATE kv SET value = json_set(value, '$.sql', 'type = ''status'' AND status_val = ''active''')
+            WHERE key = 'events_sub:b'; END;").unwrap();
+        db.with_write_scope(|| restore_stopped_subscriptions(&db, "mula"))
+            .unwrap();
+        assert_eq!(notices_to(&db, "mula"), 2);
+        assert!(db.kv_get("events_sub:b").unwrap().is_none());
+        let sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get("events_sub:a").unwrap().unwrap()).unwrap();
+        assert_eq!(sub["last_id"], first_hit);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn replay_parameterized_predicates_keep_bindings_once_and_cursors() {
         let (db, db_path) = setup_full_test_db();
         db.conn.execute_batch("INSERT INTO instances (name, created_at) VALUES ('mula', 1.0), ('libe', 1.0), ('nabe', 1.0)").unwrap();
@@ -3171,7 +3331,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        restore_stopped_subscriptions(&db, "mula").unwrap();
+        db.with_write_scope(|| restore_stopped_subscriptions(&db, "mula"))
+            .unwrap();
         assert_eq!(
             notices_to(&db, "mula"),
             3,
@@ -3258,7 +3419,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        restore_stopped_subscriptions(&db, "mula").unwrap();
+        db.with_write_scope(|| restore_stopped_subscriptions(&db, "mula"))
+            .unwrap();
         assert_eq!(
             notices_to(&db, "mula"),
             1,
@@ -3408,7 +3570,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        restore_stopped_subscriptions(&db, "gora").unwrap();
+        db.with_write_scope(|| restore_stopped_subscriptions(&db, "gora"))
+            .unwrap();
 
         assert!(
             db.kv_get(&sub_key).unwrap().is_some(),
@@ -3455,7 +3618,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        restore_stopped_subscriptions(&db, "mula").unwrap();
+        db.with_write_scope(|| restore_stopped_subscriptions(&db, "mula"))
+            .unwrap();
 
         let notified: i64 = db
             .conn
@@ -3516,7 +3680,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        restore_stopped_subscriptions(&db, "gora").unwrap();
+        db.with_write_scope(|| restore_stopped_subscriptions(&db, "gora"))
+            .unwrap();
 
         assert_eq!(
             count_reqwatch_without_reply_notifications(&db, "gora"),

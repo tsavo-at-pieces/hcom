@@ -2,6 +2,75 @@
 
 Tracking: [hcom #21](https://github.com/tsavo-at-pieces/hcom/issues/21).
 
+## Follow-up: bounded row reuse and release qualification
+
+The follow-up reuses parsed subscription rows during one ordered replay, only
+while a transaction is open and SQLite's connection-local `total_changes` has
+not changed. A write from a cursor update, once deletion, notification, trigger,
+SQL upgrade or request-watch transition invalidates the rows before the next
+event. Predicate results are never cached. The transaction prevents another
+connection from changing the snapshot; autocommit reads never retain rows.
+Reactions still wait until the historical batch is drained.
+
+Retention is limited to 1,024 rows and 1 MiB of key/value text. Overflow and
+failed/partial SQL reads fall back to fresh loading. Parsed JSON adds allocation
+overhead: this is not a total-memory cap. The existing predicate limits remain
+256 statements / 256 KiB of SQL text, so distinct overflow still prepares SQL.
+Existing resume tests now also exercise transaction-scoped reuse. New tests cover
+trigger-driven filter changes, deletion, autocommit, both retention limits and
+failed reads. Nonmatching events reuse the rows; successful writes refresh them.
+
+Claude's health decision now scans pending messages at most once, lazily. It
+previously repeated the same scan in up to four match guards while a poll/report
+could own the write lock. Priority and status text are unchanged.
+
+Read-only filesystem timing inspection found completed live write scopes held
+for up to 5,900 ms at `claude_mod::finish_wake`, 2,843 ms at
+`record_report_for_wake`, and 3,040 ms at `persist_observed_child_title`.
+These identify completed scopes, not the holder of the original incident or an
+FTS/checkpoint cause. New `body_ms` and `finish_ms` fields separate callback work
+from transaction completion (commit/rollback and guard teardown); neither is a
+direct fsync measurement. Empty phase fields mean that boundary was not reached.
+Logging remains outside SQLite and includes no message bodies or arguments.
+
+Single observations on the Studio, using 1,000 events and a competing writer:
+
+| Profile / subscriptions | Before | Follow-up | Competing writer |
+| --- | ---: | ---: | --- |
+| Debug / 128 distinct | 1,064 ms | 421 ms | succeeded in both |
+| Release / 128 distinct | 233 ms | 103 ms | succeeded in both |
+| Release / 128 identical | not rerun | 83 ms | succeeded |
+| Release / 512 identical | not rerun | 273 ms | succeeded |
+| Release / 512 distinct (predicate overflow) | not rerun | 3,627 ms | succeeded |
+
+These isolated unit diagnostics disable synchronous writes, as does the unit
+suite. They measure replay work and admission under that setup, not durable
+commit latency or a loaded production SLO. Host load changed between observations;
+the deterministic reuse/invalidation tests establish the mechanism. The first
+release diagnostic completed replay successfully but then failed because it
+unconditionally read a nonexistent slow-write log; the diagnostic now tolerates
+fast runs and accepts `HCOM_REPLAY_SUBSCRIPTIONS` for overflow measurements.
+
+Validation: full Rust suite 3,012 passed / 22 ignored; pinned real Codex lifecycle
+3 passed, real Claude lifecycle 2 passed, real Claude stdio 2 passed, and local
+relay roundtrip 1 passed. These use local mock providers without model requests.
+All-target Clippy with warnings denied and plugin type/delivery checks passed.
+MSRV was explicitly skipped by its script because Rust 1.89 is not installed;
+checks/builds used the pinned Rust 1.99.0. Windows/Linux and `dist generate --check`
+were not executed on this macOS host (`dist` is absent).
+
+The existing 15-second launch / eight-second heartbeat admission limits and
+ownership checks are unchanged. Arbitrarily expensive SQL, larger uncached
+replays, slow storage or other long writers can still exhaust a bounded budget;
+failure must remain clean. A live-room reset, checkpoint/vacuum, schema/FTS
+change, daemon restart or forced session migration is not required by this fix.
+
+## Historical containment implementation (PR #22)
+
+The sections below record the original isolated containment investigation and
+its historical measurements. Its no-deployment/no-live-query statements refer
+to that original work, not subsequent rollout or read-only timing inspection.
+
 This patch makes launch persistence atomic, retries short-lived SQLite BUSY, and
 avoids repeated predicate compilation during resume replay. It is not proof that
 the live rem incident is fixed. No live rem database was opened,

@@ -1103,6 +1103,7 @@ pub fn bind_session_to_process_for_tool(
         }
     }
 
+    timing.body_finished();
     if let Err(error) = transaction.commit() {
         crate::log::log_error(
             "binding",

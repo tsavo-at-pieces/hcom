@@ -187,7 +187,9 @@ impl HcomDb {
         let mut timing = WriteTiming::new(self, "immediate_transaction");
         let txn = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         timing.acquired();
-        let result = f(&txn)?;
+        let result = f(&txn);
+        timing.body_finished();
+        let result = result?;
         txn.commit()?;
         Ok(result)
     }
@@ -216,7 +218,11 @@ impl HcomDb {
         if let Some(timing) = &mut timing {
             timing.acquired();
         }
-        let result = f().and_then(|value| {
+        let result = f();
+        if let Some(timing) = &mut timing {
+            timing.body_finished();
+        }
+        let result = result.and_then(|value| {
             self.conn.execute_batch(commit)?;
             Ok(value)
         });

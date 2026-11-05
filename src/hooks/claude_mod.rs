@@ -235,6 +235,11 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
     }
     let session = row.session_id.as_deref().unwrap_or("");
     let current = state(db, session, process)?;
+    // A quiet agent may have a large unread history belonging to other agents.
+    // Evaluate it at most once in this health decision, and only if a branch
+    // needs it. Callers can hold the poll's write transaction here.
+    let pending = std::cell::OnceCell::new();
+    let has_pending = || *pending.get_or_init(|| db.has_pending(name));
     let (context, detail) = match current.as_ref() {
         // Error first: a mod that fails every cycle never refreshes checked_at.
         Some(s) if s.error.is_some() => (
@@ -284,15 +289,15 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
                 opt_out(name)
             ),
         ),
-        Some(s) if db.has_pending(name) && s.outcome_unidentified => (
+        Some(s) if has_pending() && s.outcome_unidentified => (
             "tui:mod-outdated",
             "Loaded Claude mod reported an outcome without a wake ID; reload the mod to enable delivery recovery; messages remain queued".into(),
         ),
-        Some(s) if db.has_pending(name) && s.completed_at.is_some() => (
+        Some(s) if has_pending() && s.completed_at.is_some() => (
             "tui:mod-retrying",
             "Claude completed the wake without a delivery acknowledgement; retrying while idle; messages remain queued".into(),
         ),
-        Some(s) if db.has_pending(name) && s.attempted_cursor == Some(db.get_cursor(name)) => {
+        Some(s) if has_pending() && s.attempted_cursor == Some(db.get_cursor(name)) => {
             if s.attempted_at.is_some_and(|at| now_epoch_f64() - at > 10.0) {
                 (
                     "tui:mod-unacknowledged",
@@ -308,7 +313,7 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
                 )
             }
         }
-        Some(_) if db.has_pending(name) => (
+        Some(_) if has_pending() => (
             "tui:mod-waiting",
             "waiting for the mod to submit a wake".into(),
         ),

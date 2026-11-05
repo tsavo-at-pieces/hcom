@@ -4753,7 +4753,9 @@ mod tests {
         let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let distinct = std::env::var_os("HCOM_REPLAY_DISTINCT").is_some();
         {
-            let count = 128usize;
+            let count = std::env::var("HCOM_REPLAY_SUBSCRIPTIONS")
+                .map(|value| value.parse::<usize>().unwrap())
+                .unwrap_or(128);
             let db = HcomDb::open_at(&room.join(format!("replay-{count}.db"))).unwrap();
             let saved: Vec<_> = (0..count)
                 .map(|i| {
@@ -4805,10 +4807,10 @@ mod tests {
                 waited.as_millis()
             );
         }
-        eprintln!(
-            "{}",
-            std::fs::read_to_string(crate::paths::log_path()).unwrap()
-        );
+        // Fast release runs need not cross the slow-write log threshold.
+        if let Ok(log) = std::fs::read_to_string(crate::paths::log_path()) {
+            eprintln!("{log}");
+        }
     }
 
     #[test]
