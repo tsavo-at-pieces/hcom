@@ -275,6 +275,7 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
         "gated approval menu ready for Enter",
         Duration::from_secs(40),
         || {
+            let previously_ready = std::mem::take(&mut menu_was_ready);
             let (code, stdout, stderr) = h.run(["term", &name, "--json"]);
             if code != 0 {
                 return Err(format!("approval screen unavailable: {stderr}"));
@@ -293,7 +294,7 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
             let ready = text.contains("Doyouwanttoproceed?")
                 && text.contains("❯1.Yes")
                 && text.contains("gatedcommand");
-            let stable = ready && menu_was_ready;
+            let stable = ready && previously_ready;
             menu_was_ready = ready;
             Ok(stable.then_some(()))
         },
