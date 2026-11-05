@@ -267,8 +267,42 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
         "gated command ran while still blocked on approval"
     );
 
-    // Approve. Claude's permission prompt defaults to "1. Yes", so a bare Enter
-    // accepts it; this runs the command once and releases the held message.
+    // PermissionRequest runs before Claude renders its approval menu. The
+    // blocked event alone is not a keyboard target: an early Enter is lost.
+    // Observe the actual gated menu on two successive screen queries first.
+    let mut menu_was_ready = false;
+    h.eventually(
+        "gated approval menu ready for Enter",
+        Duration::from_secs(40),
+        || {
+            let (code, stdout, stderr) = h.run(["term", &name, "--json"]);
+            if code != 0 {
+                return Err(format!("approval screen unavailable: {stderr}"));
+            }
+            let screen: Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+            let text: String = screen["lines"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let ready = text.contains("Doyouwanttoproceed?")
+                && text.contains("❯1.Yes")
+                && text.contains("gatedcommand");
+            let stable = ready && menu_was_ready;
+            menu_was_ready = ready;
+            Ok(stable.then_some(()))
+        },
+    );
+    assert!(
+        !approval_result.exists(),
+        "gated command ran before the approval keystroke"
+    );
+    // One Enter accepts the selected Yes and releases the held message.
     let (approve_code, approve_stdout, approve_stderr) =
         h.run(["term", "inject", &name, "", "--enter"]);
     assert_eq!(

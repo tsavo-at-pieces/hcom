@@ -1321,7 +1321,7 @@ fn process_snapshot() -> String {
             "-Command",
             "Get-CimInstance Win32_Process \
              | Where-Object { $_.Name -match '^(hcom|claude|codex|node|powershell|pwsh|cmd|conhost|OpenConsole)\\.exe$' } \
-             | Select-Object ProcessId,ParentProcessId,Name,CommandLine \
+             | Select-Object ProcessId,ParentProcessId,Name \
              | Format-Table -AutoSize | Out-String -Width 400",
         ]);
         command
@@ -1329,7 +1329,9 @@ fn process_snapshot() -> String {
     #[cfg(not(windows))]
     let mut command = {
         let mut command = Command::new("ps");
-        command.args(["-eo", "pid,ppid,etime,args"]);
+        // Other agents' arguments can contain private prompts or credentials.
+        // Image names and parent relationships suffice for this host snapshot.
+        command.args(["-eo", "pid,ppid,etime,comm"]);
         command
     };
 

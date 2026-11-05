@@ -839,7 +839,7 @@ fn warn_if_agent_hcom_differs(runner_dirs: &[String]) {
     let message = match first_hcom_in(dirs) {
         Some(found) if agent_hcom_matches(&found, &exe) => return,
         Some(found) => format!(
-            "agents will run {} as `hcom`, not this hcom ({}). Remove the other install or put this one first on PATH.",
+            "agents resolve {} as `hcom`; it could not be confirmed to select this executable ({}). Check that entry's selected native image and PATH order.",
             found.display(),
             exe.display()
         ),
