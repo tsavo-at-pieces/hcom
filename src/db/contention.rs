@@ -14,6 +14,13 @@ fn transient_busy(error: &rusqlite::Error) -> bool {
             rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_BUSY_RECOVERY | rusqlite::ffi::SQLITE_BUSY_TIMEOUT))
 }
 
+fn admission_expired(operation: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some(format!("{operation} write admission budget expired")),
+    )
+}
+
 impl HcomDb {
     #[track_caller]
     pub(crate) fn with_launch_write<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -45,6 +52,9 @@ impl HcomDb {
         let mut backoff = Duration::from_millis(10);
         let admitted = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err(admission_expired(operation));
+            }
             // SQLite waiting counts against the same monotonic budget. Short
             // slices let us recheck it; the policy extends total admission time
             // without changing the room's settings or any other connection.
@@ -54,7 +64,10 @@ impl HcomDb {
                 &self.conn,
                 rusqlite::TransactionBehavior::Immediate,
             ) {
-                Ok(transaction) => break Ok(transaction),
+                Ok(transaction) => {
+                    timing.acquired();
+                    break Ok(transaction);
+                }
                 Err(error) if transient_busy(&error) && Instant::now() < deadline => {
                     std::thread::sleep(
                         backoff.min(deadline.saturating_duration_since(Instant::now())),
@@ -77,7 +90,19 @@ impl HcomDb {
                     .with_context(|| format!("{operation} write admission exhausted or failed"));
             }
         };
-        timing.acquired();
+        // SQLite can return success after the last wait slice or scheduler
+        // delay has crossed the deadline. Do not admit a callback then.
+        if Instant::now() >= deadline {
+            let error = admission_expired(operation);
+            let rollback = self.conn.execute_batch("ROLLBACK");
+            restored?;
+            return match rollback {
+                Ok(()) => Err(error.into()),
+                Err(rollback) => Err(anyhow::Error::from(error).context(format!(
+                    "late admission rollback failed; database state uncertain: {rollback}"
+                ))),
+            };
+        }
         let result = restored
             .map_err(anyhow::Error::from)
             .and_then(|()| f())
@@ -177,6 +202,35 @@ mod tests {
             assert_eq!(transient_busy(&error), expected, "{code}");
         }
         assert!(!transient_busy(&rusqlite::Error::InvalidQuery));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn expired_admission_never_runs_callback_on_an_unlocked_database() {
+        let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open_at(&room.join("hcom.db")).unwrap();
+        db.conn().busy_timeout(Duration::from_secs(30)).unwrap();
+        let mut called = false;
+        let result = db.with_busy_write("test", Duration::ZERO, || {
+            called = true;
+            Ok(())
+        });
+        assert!(!called, "expired admission executed its callback");
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert!(db.conn.is_autocommit());
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            30000
+        );
     }
 
     #[test]

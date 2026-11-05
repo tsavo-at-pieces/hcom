@@ -99,6 +99,8 @@ reuse; this patch deliberately retains fresh state reads and transaction scope.
   LOCKED, BUSY_SNAPSHOT, constraints and I/O failures are not.
 - Only `BEGIN IMMEDIATE` admission is retried. A callback executes once after
   admission. Nested transactions use savepoints without independent retries.
+  Expiry is checked before every attempt and after acquisition; late acquisition
+  rolls back without invoking the callback and restores the original timeout.
   **These are admission budgets, not complete-operation deadlines.** A writer
   holding the lock longer than the budget can still cause a clean failure.
 - PID/context persistence follows the exact launch token through canonical
@@ -148,7 +150,7 @@ Focused final commands and results (each Rust filter uses
 | Filter | Passed |
 | --- | ---: |
 | `launch_` | 189 |
-| `db::contention::tests` | 4 |
+| `db::contention::tests` | 5 (deadline follow-up) |
 | `db::instances::tests` | 22 |
 | `db::subscriptions::tests` | 51 |
 | `hooks::claude_mod::tests` | 28 |
@@ -193,9 +195,24 @@ path retained.
 
 Base: `723550bf63f934cc9d2def0f7d8831248306388c` (fetched main with PR17–20).
 Tests-first commit: `13291ca`; containment/ownership commit: `4cff51b`.
-Both signatures verified `G`. The final replay source blob tested throughout the
-final checks is `af4c95fd72c0386875f05993fd863d7e9d10ad79`.
-`tested-source-blobs.json` records every source blob; the final commit was checked
-against it. Only this document changed after those checks. Read-only native
-review found no remaining source blockers. Root review and any publication or
-rollout remain separate; nothing has been pushed or deployed.
+Replay optimization/documentation commit: `997e875`. These signatures verified
+`G`. Its full focused matrix and measurements use replay source blob
+`af4c95fd72c0386875f05993fd863d7e9d10ad79`, retained in the deadline follow-up.
+`matrix-source-blobs.json` captures that matrix's source tree.
+
+Root review requested a strict deadline-edge correction. Its deterministic
+zero-budget/unlocked-database regression first failed because the callback ran.
+The correction checks expiry both before an attempt and after acquisition,
+rolls back late acquisition, and restores the original timeout. The follow-up
+runs the five contention tests and nine `launcher::tests::launch_` sanity tests, formatter
+and `cargo clippy --locked --bin hcom --tests -- -D warnings`. The initial Clippy
+run found only a single-element loop in the ignored measurement; it was replaced
+by a scope with the same constant without another performance trial.
+
+`tested-source-blobs.json` captures the follow-up source tree and is verified
+against its signed commit. The replay implementation and other runtime files
+are unchanged from the full matrix; the runtime follow-up changes only
+`src/db/contention.rs`. Read-only native review found no replay/ownership blockers.
+Root review and any publication or rollout remain separate; nothing has been
+pushed or deployed. Keep issue #21 open for production attribution and long-hold
+follow-up.

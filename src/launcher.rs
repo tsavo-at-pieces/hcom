@@ -4752,7 +4752,8 @@ mod tests {
         use std::time::{Duration, Instant};
         let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let distinct = std::env::var_os("HCOM_REPLAY_DISTINCT").is_some();
-        for count in [128usize] {
+        {
+            let count = 128usize;
             let db = HcomDb::open_at(&room.join(format!("replay-{count}.db"))).unwrap();
             let saved: Vec<_> = (0..count)
                 .map(|i| {
