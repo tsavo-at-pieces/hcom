@@ -19,6 +19,9 @@ overhead: this is not a total-memory cap. The existing predicate limits remain
 Existing resume tests now also exercise transaction-scoped reuse. New tests cover
 trigger-driven filter changes, deletion, autocommit, both retention limits and
 failed reads. Nonmatching events reuse the rows; successful writes refresh them.
+Live matching and uncached overflow still parse one eligible row at a time.
+Only an admitted replay cache retains parsed eligible rows. Rows that become
+eligible later remain available as raw values and are parsed when needed.
 
 Claude's health decision now scans pending messages at most once, lazily. It
 previously repeated the same scan in up to four match guards while a poll/report
@@ -51,7 +54,7 @@ release diagnostic completed replay successfully but then failed because it
 unconditionally read a nonexistent slow-write log; the diagnostic now tolerates
 fast runs and accepts `HCOM_REPLAY_SUBSCRIPTIONS` for overflow measurements.
 
-Validation: full Rust suite 3,012 passed / 22 ignored; pinned real Codex lifecycle
+Initial follow-up validation: full Rust suite 3,012 passed / 22 ignored; pinned real Codex lifecycle
 3 passed, real Claude lifecycle 2 passed, real Claude stdio 2 passed, and local
 relay roundtrip 1 passed. These use local mock providers without model requests.
 All-target Clippy with warnings denied and plugin type/delivery checks passed.

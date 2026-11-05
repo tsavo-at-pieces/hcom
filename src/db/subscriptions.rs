@@ -797,7 +797,7 @@ const REPLAY_ROW_BYTES: usize = 1024 * 1024;
 struct SubscriptionRow {
     key: String,
     value: String,
-    sub: serde_json::Value,
+    sub: Option<serde_json::Value>,
 }
 
 struct ReplayRows {
@@ -807,6 +807,7 @@ struct ReplayRows {
 
 fn subscription_rows(
     db: &HcomDb,
+    only: Option<&HashSet<String>>,
     replay: Option<&mut ReplayState<'_>>,
 ) -> std::sync::Arc<Vec<SubscriptionRow>> {
     let changes = db.conn.total_changes();
@@ -834,32 +835,45 @@ fn subscription_rows(
             match row {
                 Ok((key, value)) => {
                     bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
-                    if let Ok(sub) = serde_json::from_str(&value) {
-                        rows.push(SubscriptionRow { key, value, sub });
-                    }
+                    rows.push(SubscriptionRow {
+                        key,
+                        value,
+                        sub: None,
+                    });
                 }
                 Err(_) => cacheable = false,
             }
         }
         Ok(rows)
     })();
-    let rows = match loaded {
+    let mut rows = match loaded {
         Ok(rows) => rows,
         Err(_) => {
             cacheable = false;
             Vec::new()
         }
     };
+    let retain = replay.is_some()
+        && cacheable
+        && in_transaction
+        && rows.len() <= REPLAY_ROW_LIMIT
+        && bytes <= REPLAY_ROW_BYTES;
+    if retain {
+        // Live calls and overflow keep the original one-row-at-a-time parsing.
+        // A saved cursor may make a row eligible later in this replay; leave it
+        // unparsed now and evaluate it from its raw value when that happens.
+        for row in &mut rows {
+            if only.is_none_or(|keys| keys.contains(&row.key)) {
+                row.sub = serde_json::from_str(&row.value).ok();
+            }
+        }
+    }
     let rows = std::sync::Arc::new(rows);
     if let Some(replay) = replay {
-        replay.rows = (cacheable
-            && in_transaction
-            && rows.len() <= REPLAY_ROW_LIMIT
-            && bytes <= REPLAY_ROW_BYTES)
-            .then(|| ReplayRows {
-                changes,
-                rows: std::sync::Arc::clone(&rows),
-            });
+        replay.rows = retain.then(|| ReplayRows {
+            changes,
+            rows: std::sync::Arc::clone(&rows),
+        });
     }
     rows
 }
@@ -876,7 +890,7 @@ fn fire_matching_subscriptions<'conn>(
     only: Option<&HashSet<String>>,
     mut replay: Option<&mut ReplayState<'conn>>,
 ) {
-    let rows = subscription_rows(db, replay.as_deref_mut());
+    let rows = subscription_rows(db, only, replay.as_deref_mut());
 
     if rows.is_empty() {
         return;
@@ -886,7 +900,13 @@ fn fire_matching_subscriptions<'conn>(
         if only.is_some_and(|keys| !keys.contains(key)) {
             continue;
         }
-        let mut sub = std::borrow::Cow::Borrowed(sub);
+        let mut sub = match sub {
+            Some(sub) => std::borrow::Cow::Borrowed(sub),
+            None => match serde_json::from_str::<serde_json::Value>(value) {
+                Ok(sub) => std::borrow::Cow::Owned(sub),
+                Err(_) => continue,
+            },
+        };
         if subscription_is_delivery_only(&sub) {
             continue;
         }
@@ -3206,6 +3226,76 @@ mod tests {
     }
 
     #[test]
+    fn replay_only_parses_admitted_eligible_rows_and_can_match_later_eligible_rows() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute_batch("INSERT INTO instances (name, created_at) VALUES ('mula', 1.0)")
+            .unwrap();
+        let data = json!({"status": "active"});
+        let event_id = db.insert_event_row("status", "libe", &data, None).unwrap();
+        kv_store_sub(
+            &db,
+            "events_sub:a",
+            &json!({"id": "a", "caller": "mula", "sql": "0"}),
+        );
+        kv_store_sub(
+            &db,
+            "events_sub:b",
+            &json!({"id": "b", "caller": "mula", "sql": "type = 'status' AND status_val = 'active'"}),
+        );
+        assert!(
+            subscription_rows(&db, None, None)
+                .iter()
+                .all(|row| row.sub.is_none())
+        );
+        let mut replay = ReplayState {
+            predicates: ReplayPredicates::new(&db.conn),
+            reactions: Vec::new(),
+            rows: None,
+        };
+        let eligible = HashSet::from(["events_sub:a".to_string()]);
+        db.with_write_scope(|| {
+            let rows = subscription_rows(&db, Some(&eligible), Some(&mut replay));
+            assert!(
+                rows.iter()
+                    .find(|row| row.key == "events_sub:a")
+                    .unwrap()
+                    .sub
+                    .is_some()
+            );
+            assert!(
+                rows.iter()
+                    .find(|row| row.key == "events_sub:b")
+                    .unwrap()
+                    .sub
+                    .is_none()
+            );
+            // Growing eligibility must not reuse a filtered-out row set. The
+            // raw row remains available without retaining its parsed form.
+            let later = subscription_rows(&db, None, Some(&mut replay));
+            assert!(std::sync::Arc::ptr_eq(&rows, &later));
+            assert_eq!(later.len(), 2);
+            fire_matching_subscriptions(
+                &db,
+                event_id,
+                "status",
+                "libe",
+                &data,
+                None,
+                Some(&mut replay),
+            );
+            assert_eq!(notices_to(&db, "mula"), 1);
+            let updated: serde_json::Value =
+                serde_json::from_str(&db.kv_get("events_sub:b")?.unwrap()).unwrap();
+            assert_eq!(updated["last_id"], event_id);
+            Ok(())
+        })
+        .unwrap();
+        drop(replay);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn replay_rows_invalidate_on_writes_and_never_survive_autocommit_or_overflow() {
         let (db, db_path) = setup_full_test_db();
         let mut replay = ReplayState {
@@ -3216,8 +3306,8 @@ mod tests {
         let sub = json!({"id": "a", "caller": "mula", "sql": "0", "last_id": 0});
         kv_store_sub(&db, "events_sub:a", &sub);
         db.with_write_scope(|| {
-            let original = subscription_rows(&db, Some(&mut replay));
-            let reused = subscription_rows(&db, Some(&mut replay));
+            let original = subscription_rows(&db, None, Some(&mut replay));
+            let reused = subscription_rows(&db, None, Some(&mut replay));
             assert!(std::sync::Arc::ptr_eq(&original, &reused));
             db.conn.execute_batch(
                 "CREATE TRIGGER rewrite_subscription AFTER INSERT ON kv
@@ -3226,35 +3316,40 @@ mod tests {
                 WHERE key = 'events_sub:a'; END;",
             )?;
             db.kv_set("fixture-change", Some("1"))?;
-            let changed = subscription_rows(&db, Some(&mut replay));
+            let changed = subscription_rows(&db, None, Some(&mut replay));
             assert!(!std::sync::Arc::ptr_eq(&original, &changed));
-            assert_eq!(changed[0].sub["sql"], "1");
+            assert_eq!(changed[0].sub.as_ref().unwrap()["sql"], "1");
             db.kv_set("events_sub:a", None)?;
-            assert!(subscription_rows(&db, Some(&mut replay)).is_empty());
+            assert!(subscription_rows(&db, None, Some(&mut replay)).is_empty());
             Ok(())
         })
         .unwrap();
         // Another connection may write between autocommit reads.
-        subscription_rows(&db, Some(&mut replay));
+        subscription_rows(&db, None, Some(&mut replay));
         assert!(replay.rows.is_none());
         db.with_write_scope(|| {
             for i in 0..=REPLAY_ROW_LIMIT {
                 kv_store_sub(&db, &format!("events_sub:{i}"), &sub);
             }
             assert_eq!(
-                subscription_rows(&db, Some(&mut replay)).len(),
+                subscription_rows(&db, None, Some(&mut replay)).len(),
                 REPLAY_ROW_LIMIT + 1
             );
             assert!(replay.rows.is_none());
+            assert!(
+                subscription_rows(&db, None, Some(&mut replay))
+                    .iter()
+                    .all(|row| row.sub.is_none())
+            );
             db.kv_delete_prefix("events_sub:")?;
             let oversized = json!({"padding": "x".repeat(REPLAY_ROW_BYTES)});
             kv_store_sub(&db, "events_sub:large", &oversized);
-            assert_eq!(subscription_rows(&db, Some(&mut replay)).len(), 1);
+            assert_eq!(subscription_rows(&db, None, Some(&mut replay)).len(), 1);
             assert!(replay.rows.is_none());
             // A failed row read must not memoize a transient/partial result.
             db.kv_delete_prefix("events_sub:")?;
             db.kv_set("events_sub:invalid", Some("not JSON"))?;
-            subscription_rows(&db, Some(&mut replay));
+            subscription_rows(&db, None, Some(&mut replay));
             assert!(replay.rows.is_none());
             Ok(())
         })
