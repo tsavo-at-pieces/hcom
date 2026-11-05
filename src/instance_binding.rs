@@ -29,7 +29,31 @@ pub fn persist_terminal_launch_context(
     effective_preset: &str,
     process_id: Option<&str>,
 ) {
-    let result = db.with_write_scope(|| {
+    if let Err(e) = try_persist_terminal_launch_context(
+        db,
+        instance_name,
+        requested_preset,
+        effective_preset,
+        process_id,
+    ) {
+        crate::log::log_error(
+            "binding",
+            "persist_terminal_launch_context",
+            &format!("instance={instance_name} err={e}"),
+        );
+    }
+}
+
+/// Required bookkeeping callers must propagate this result so the enclosing
+/// launch transaction rolls back PID/context together on any failure.
+pub(crate) fn try_persist_terminal_launch_context(
+    db: &HcomDb,
+    instance_name: &str,
+    requested_preset: Option<&str>,
+    effective_preset: &str,
+    process_id: Option<&str>,
+) -> anyhow::Result<()> {
+    db.with_write_scope(|| {
         // Late terminal metadata follows an authenticated canonical migration.
         // It must never overwrite a newer launch's ownership token by name.
         let owner = match process_id.filter(|id| !id.is_empty()) {
@@ -94,14 +118,7 @@ pub fn persist_terminal_launch_context(
             serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
         );
         db.update_instance_fields(instance_name, &updates)
-    });
-    if let Err(e) = result {
-        crate::log::log_error(
-            "binding",
-            "persist_terminal_launch_context",
-            &format!("instance={instance_name} err={e}"),
-        );
-    }
+    })
 }
 
 /// Refresh only Paradev IDs for an already verified root hook process.
@@ -1103,6 +1120,7 @@ pub fn bind_session_to_process_for_tool(
         }
     }
 
+    timing.body_finished();
     if let Err(error) = transaction.commit() {
         crate::log::log_error(
             "binding",

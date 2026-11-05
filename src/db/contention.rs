@@ -103,13 +103,12 @@ impl HcomDb {
                 ))),
             };
         }
-        let result = restored
-            .map_err(anyhow::Error::from)
-            .and_then(|()| f())
-            .and_then(|value| {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(value)
-            });
+        let result = restored.map_err(anyhow::Error::from).and_then(|()| f());
+        timing.body_finished();
+        let result = result.and_then(|value| {
+            self.conn.execute_batch("COMMIT")?;
+            Ok(value)
+        });
         match result {
             Ok(value) => Ok(value),
             Err(error) => match self.conn.execute_batch("ROLLBACK") {
@@ -131,6 +130,7 @@ pub(crate) struct WriteTiming<'a> {
     caller: &'static std::panic::Location<'static>,
     started: Instant,
     acquired: Option<Instant>,
+    body_finished: Option<Instant>,
 }
 
 impl<'a> WriteTiming<'a> {
@@ -142,11 +142,16 @@ impl<'a> WriteTiming<'a> {
             caller: std::panic::Location::caller(),
             started: Instant::now(),
             acquired: None,
+            body_finished: None,
         }
     }
 
     pub(crate) fn acquired(&mut self) {
         self.acquired = Some(Instant::now());
+    }
+
+    pub(crate) fn body_finished(&mut self) {
+        self.body_finished = Some(Instant::now());
     }
 }
 
@@ -161,6 +166,11 @@ impl Drop for WriteTiming<'_> {
             .unwrap_or(finished)
             .duration_since(self.started);
         let held = self.acquired.map(|start| finished.duration_since(start));
+        let body = self
+            .acquired
+            .zip(self.body_finished)
+            .map(|(start, end)| end.duration_since(start));
+        let finish = self.body_finished.map(|end| finished.duration_since(end));
         let released = self.db.conn.is_autocommit();
         crate::log::log_with_fields(
             "WARN",
@@ -178,6 +188,16 @@ impl Drop for WriteTiming<'_> {
                     &held.map(|d| d.as_millis().to_string()).unwrap_or_default(),
                 ),
                 ("released", if released { "true" } else { "false" }),
+                (
+                    "body_ms",
+                    &body.map(|d| d.as_millis().to_string()).unwrap_or_default(),
+                ),
+                (
+                    "finish_ms",
+                    &finish
+                        .map(|d| d.as_millis().to_string())
+                        .unwrap_or_default(),
+                ),
             ],
         );
     }
@@ -329,6 +349,9 @@ mod tests {
             row[key].as_str().unwrap().parse::<u128>().unwrap()
         };
         assert!(ms(holder, "held_ms") >= 300);
+        assert!(ms(holder, "body_ms") >= 300);
+        assert!(ms(holder, "body_ms") <= ms(holder, "held_ms"));
+        assert!(ms(holder, "finish_ms") <= ms(holder, "held_ms"));
         assert!(ms(waiter, "wait_ms") >= 250);
         assert_eq!(holder["released"], "true");
         assert_eq!(waiter["released"], "true");

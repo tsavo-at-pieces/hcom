@@ -1375,6 +1375,36 @@ struct BackgroundLaunchCtx<'a> {
     handles: &'a mut Vec<serde_json::Value>,
 }
 
+fn persist_background_registration(
+    ctx: &BackgroundLaunchCtx<'_>,
+    log_file: &str,
+    pid: u32,
+    pid_identity: Option<&str>,
+    effective_preset: &str,
+) -> Result<()> {
+    let updates =
+        serde_json::Map::from_iter([("background_log_file".to_string(), json!(log_file))]);
+    ctx.db.with_launch_write(|| {
+        let owner = ctx
+            .db
+            .get_stdio_owned_instance(ctx.process_id)?
+            .context("background launch ownership disappeared")?;
+        instance_binding::try_persist_terminal_launch_context(
+            ctx.db,
+            &owner.name,
+            ctx.terminal_mode,
+            effective_preset,
+            Some(ctx.process_id),
+        )?;
+        ctx.db.update_instance_pid_with_identity_and_fields(
+            &owner.name,
+            pid,
+            pid_identity,
+            &updates,
+        )
+    })
+}
+
 /// Shared bookkeeping after a successful background launch for gemini/codex/opencode.
 /// Persists the launch context, updates position, records the PID, and appends
 /// log_file / handle entries. Per-tool differences (args, prompt) stay in the caller.
@@ -1384,32 +1414,18 @@ fn finalize_background_launch(
     pid: u32,
     effective_preset: String,
 ) -> Result<()> {
-    let updates =
-        serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
     let pid_identity = crate::db::observe_pid_identity(pid);
     let persist_result = pid_identity
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{e}"))
         .and_then(|identity| {
-            ctx.db.with_launch_write(|| {
-                let owner = ctx
-                    .db
-                    .get_stdio_owned_instance(ctx.process_id)?
-                    .context("background launch ownership disappeared")?;
-                instance_binding::persist_terminal_launch_context(
-                    ctx.db,
-                    &owner.name,
-                    ctx.terminal_mode,
-                    &effective_preset,
-                    Some(ctx.process_id),
-                );
-                ctx.db.update_instance_pid_with_identity_and_fields(
-                    &owner.name,
-                    pid,
-                    identity.as_deref(),
-                    &updates,
-                )
-            })
+            persist_background_registration(
+                ctx,
+                &log_file,
+                pid,
+                identity.as_deref(),
+                &effective_preset,
+            )
         });
     if let Err(e) = persist_result {
         // Keep the log path as diagnostics even though PID ownership was not
@@ -4753,7 +4769,9 @@ mod tests {
         let (_dir, room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let distinct = std::env::var_os("HCOM_REPLAY_DISTINCT").is_some();
         {
-            let count = 128usize;
+            let count = std::env::var("HCOM_REPLAY_SUBSCRIPTIONS")
+                .map(|value| value.parse::<usize>().unwrap())
+                .unwrap_or(128);
             let db = HcomDb::open_at(&room.join(format!("replay-{count}.db"))).unwrap();
             let saved: Vec<_> = (0..count)
                 .map(|i| {
@@ -4805,10 +4823,10 @@ mod tests {
                 waited.as_millis()
             );
         }
-        eprintln!(
-            "{}",
-            std::fs::read_to_string(crate::paths::log_path()).unwrap()
-        );
+        // Fast release runs need not cross the slow-write log threshold.
+        if let Ok(log) = std::fs::read_to_string(crate::paths::log_path()) {
+            eprintln!("{log}");
+        }
     }
 
     #[test]
@@ -4892,6 +4910,73 @@ mod tests {
         db.set_process_binding("stale-launch", "", "nova").unwrap();
         cleanup_instance(&db, "nova", "stale-launch").unwrap();
         assert!(db.get_instance_full("nova").unwrap().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn background_launch_context_failure_rolls_back_required_bookkeeping() {
+        let (_dir, _room, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        initialize_launch_instance(
+            &db,
+            &LaunchParams::default(),
+            "luna",
+            "codex",
+            "",
+            "/fixture",
+            0,
+        )
+        .unwrap();
+        db.set_process_binding("proc", "", "luna").unwrap();
+        db.store_launch_context("luna", r#"{"process_id":"proc"}"#)
+            .unwrap();
+        let mut log_files = Vec::new();
+        let mut handles = Vec::new();
+        let ctx = BackgroundLaunchCtx {
+            db: &db,
+            tool: "codex",
+            instance_name: "luna",
+            process_id: "proc",
+            terminal_mode: Some("kitty"),
+            tag: "",
+            working_dir: "/fixture",
+            log_files: &mut log_files,
+            handles: &mut handles,
+        };
+        for column in ["terminal_preset_effective", "pid"] {
+            db.conn()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER reject_terminal_context BEFORE UPDATE OF {column} ON instances
+                BEGIN SELECT RAISE(ABORT, 'context rejected'); END;"
+                ))
+                .unwrap();
+            let result = persist_background_registration(
+                &ctx,
+                "/fixture/launch.log",
+                4242,
+                Some("fixture-identity"),
+                "kitty",
+            );
+            assert!(
+                result.is_err(),
+                "{column} failure must fail required bookkeeping"
+            );
+            assert!(format!("{:#}", result.unwrap_err()).contains("context rejected"));
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            assert!(row.pid.is_none());
+            assert!(row.background_log_file.is_empty());
+            assert_eq!(
+                row.launch_context.as_deref(),
+                Some(r#"{"process_id":"proc"}"#)
+            );
+            assert_eq!(
+                db.get_process_binding("proc").unwrap().as_deref(),
+                Some("luna")
+            );
+            db.conn()
+                .execute_batch("DROP TRIGGER reject_terminal_context")
+                .unwrap();
+        }
     }
 
     #[test]
