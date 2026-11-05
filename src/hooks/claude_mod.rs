@@ -67,6 +67,15 @@ struct ModState {
     attempted_cursor: Option<i64>,
     #[serde(default)]
     attempted_at: Option<f64>,
+    // Fences completion reports from older submissions/reloaded modules.
+    #[serde(default)]
+    wake_id: Option<String>,
+    // Completion is not acknowledgement. It only proves Claude no longer has
+    // this submission queued, so a failed hook ack can be retried safely.
+    #[serde(default)]
+    completed_at: Option<f64>,
+    #[serde(default)]
+    outcome_unidentified: bool,
     /// First load for this session; the first cycle may wait up to WAIT.
     #[serde(default)]
     started_at: f64,
@@ -275,12 +284,20 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
                 opt_out(name)
             ),
         ),
+        Some(s) if db.has_pending(name) && s.outcome_unidentified => (
+            "tui:mod-outdated",
+            "Loaded Claude mod reported an outcome without a wake ID; reload the mod to enable delivery recovery; messages remain queued".into(),
+        ),
+        Some(s) if db.has_pending(name) && s.completed_at.is_some() => (
+            "tui:mod-retrying",
+            "Claude completed the wake without a delivery acknowledgement; retrying while idle; messages remain queued".into(),
+        ),
         Some(s) if db.has_pending(name) && s.attempted_cursor == Some(db.get_cursor(name)) => {
             if s.attempted_at.is_some_and(|at| now_epoch_f64() - at > 10.0) {
                 (
                     "tui:mod-unacknowledged",
                     format!(
-                        "Claude has not acknowledged the mod wake (a menu may be open); {}",
+                        "Claude mod is polling; its wake is awaiting delivery acknowledgement (Claude may still be holding the prompt, for example behind a menu); {}",
                         opt_out(name)
                     ),
                 )
@@ -418,14 +435,28 @@ fn poll(args: &[String]) -> Result<serde_json::Value> {
         } else {
             event
         };
-        record_report(&db, session, process, event, detail)?;
+        let wake_id = args
+            .windows(2)
+            .find(|pair| pair[0] == "--wake-id")
+            .map(|pair| pair[1].as_str());
+        record_report_for_wake(&db, session, process, event, detail, wake_id)?;
         if let Some(name) = validated_owner(&db, session, process)? {
             crate::notify::wake(&db, &name, &[crate::notify::WakeKind::Plugin]);
         }
         return Ok(serde_json::json!({"wake": false}));
     }
 
-    let Some(current) = load(&db, session, process)? else {
+    let observe = args.iter().any(|arg| arg == "--observe");
+    poll_cycle(&mut db, session, process, observe)
+}
+
+fn poll_cycle(
+    db: &mut HcomDb,
+    session: &str,
+    process: &str,
+    observe: bool,
+) -> Result<serde_json::Value> {
+    let Some(current) = load(db, session, process)? else {
         return Ok(serde_json::json!({"wake": false}));
     };
     let name = &current.name;
@@ -433,8 +464,7 @@ fn poll(args: &[String]) -> Result<serde_json::Value> {
 
     let notify = crate::notify::NotifyServer::new()?;
     db.upsert_notify_endpoint(name, "plugin", notify.port())?;
-    let observe = args.iter().any(|arg| arg == "--observe");
-    if observe || !wake_due(&db, name, &current) {
+    if observe || !wake_due(db, name, &current) {
         notify.wait(WAIT);
     }
     db.reconnect_if_stale();
@@ -443,18 +473,30 @@ fn poll(args: &[String]) -> Result<serde_json::Value> {
         rusqlite::params![name, notify.port()],
     )?;
     // Last step: a claimed wake is only committed with the healthy cycle.
-    let wake = finish(&db, session, process, !observe)?;
-    Ok(serde_json::json!({"wake": wake}))
+    let wake_id = finish_wake(db, session, process, !observe)?;
+    Ok(serde_json::json!({"wake": wake_id.is_some(), "wake_id": wake_id}))
 }
 
 /// Records a mod report. Reports never count as a successful cycle, so they
 /// neither refresh liveness nor clear an error.
+#[cfg(test)]
 fn record_report(
     db: &HcomDb,
     session: &str,
     process: &str,
     event: &str,
     detail: &str,
+) -> Result<()> {
+    record_report_for_wake(db, session, process, event, detail, None)
+}
+
+fn record_report_for_wake(
+    db: &HcomDb,
+    session: &str,
+    process: &str,
+    event: &str,
+    detail: &str,
+    wake_id: Option<&str>,
 ) -> Result<()> {
     if event == "poll-busy" {
         mark_busy(db.path(), session, process);
@@ -464,6 +506,36 @@ fn record_report(
             log(&format!("claude.mod_{event}"), session, process, "", detail);
             return Ok(());
         };
+        if matches!(event, "submitted" | "submission-failed")
+            && (wake_id.is_some() || current.wake_id.is_some())
+            && wake_id != current.wake_id.as_deref()
+        {
+            // Old loaded JS cannot identify which wake completed. Surface the
+            // protocol mismatch without allowing it to release a newer claim.
+            if wake_id.is_none() {
+                current.outcome_unidentified = true;
+                db.kv_set(
+                    &key(session, process),
+                    Some(&serde_json::to_string(&current)?),
+                )?;
+            }
+            log(
+                "claude.mod_stale_wake",
+                session,
+                process,
+                &current.name,
+                "outcome belongs to another wake",
+            );
+            return report_health(db, process, &current.name);
+        }
+        if event == "submitted" && wake_id.is_some() && current.attempted_cursor.is_some() {
+            current.completed_at.get_or_insert_with(now_epoch_f64);
+            current.outcome_unidentified = false;
+            db.kv_set(
+                &key(session, process),
+                Some(&serde_json::to_string(&current)?),
+            )?;
+        }
         // Claude holds a submitted wake until the session is idle. When a turn
         // delivered the batch first (load() just saw the cursor move), the
         // hook blocks the late wake as having nothing pending: no failure.
@@ -480,6 +552,9 @@ fn record_report(
         if event == "submission-failed" || (event == "poll-failed" && !current.submission_failed) {
             current.error = Some(detail.chars().take(1000).collect());
             current.submission_failed = event == "submission-failed";
+            if wake_id.is_some() {
+                current.outcome_unidentified = false;
+            }
             db.kv_set(
                 &key(session, process),
                 Some(&serde_json::to_string(&current)?),
@@ -514,6 +589,9 @@ fn load(db: &HcomDb, session: &str, process: &str) -> Result<Option<ModState>> {
                 submission_failed: false,
                 attempted_cursor: None,
                 attempted_at: None,
+                wake_id: None,
+                completed_at: None,
+                outcome_unidentified: false,
                 started_at: now_epoch_f64(),
             });
         if current
@@ -529,6 +607,9 @@ fn load(db: &HcomDb, session: &str, process: &str) -> Result<Option<ModState>> {
             );
             current.attempted_cursor = None;
             current.attempted_at = None;
+            current.wake_id = None;
+            current.completed_at = None;
+            current.outcome_unidentified = false;
             // Hook progress proves Claude accepts prompts again; the error
             // itself stays until a full poll cycle succeeds.
             current.submission_failed = false;
@@ -543,13 +624,18 @@ fn load(db: &HcomDb, session: &str, process: &str) -> Result<Option<ModState>> {
 
 /// Completes a poll cycle atomically: claims a due wake, marks the mod healthy,
 /// and clears a poll error. Any failure rolls all of it back.
+#[cfg(test)]
 fn finish(db: &HcomDb, session: &str, process: &str, claim: bool) -> Result<bool> {
+    Ok(finish_wake(db, session, process, claim)?.is_some())
+}
+
+fn finish_wake(db: &HcomDb, session: &str, process: &str, claim: bool) -> Result<Option<String>> {
     db.with_write_scope(|| {
         // /resume, /clear, stop, or reset can happen while the listener waits.
         let state_key = key(session, process);
         let Some(mut current) = load(db, session, process)? else {
             db.kv_set(&state_key, None)?;
-            return Ok(false);
+            return Ok(None);
         };
         let name = current.name.clone();
         if current.checked_at == 0.0 {
@@ -569,6 +655,9 @@ fn finish(db: &HcomDb, session: &str, process: &str, claim: bool) -> Result<bool
         if wake {
             current.attempted_cursor = Some(db.get_cursor(&name));
             current.attempted_at = Some(now_epoch_f64());
+            current.wake_id = Some(uuid::Uuid::new_v4().to_string());
+            current.completed_at = None;
+            current.outcome_unidentified = false;
             log(
                 "claude.mod_wake_requested",
                 session,
@@ -579,7 +668,7 @@ fn finish(db: &HcomDb, session: &str, process: &str, claim: bool) -> Result<bool
         }
         db.kv_set(&state_key, Some(&serde_json::to_string(&current)?))?;
         report_health(db, process, &name)?;
-        Ok(wake)
+        Ok(if wake { current.wake_id } else { None })
     })
 }
 
@@ -587,7 +676,10 @@ fn wake_due(db: &HcomDb, name: &str, current: &ModState) -> bool {
     !current.submission_failed
         && db.is_idle(name)
         && db.has_pending(name)
-        && current.attempted_cursor != Some(db.get_cursor(name))
+        && (current.attempted_cursor != Some(db.get_cursor(name))
+            || current
+                .completed_at
+                .is_some_and(|at| now_epoch_f64() - at >= WAIT.as_secs_f64()))
 }
 
 fn validated_owner(db: &HcomDb, session: &str, process: &str) -> Result<Option<String>> {
@@ -608,6 +700,298 @@ fn validated_owner(db: &HcomDb, session: &str, process: &str) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_submission_recovers_after_hook_ack_is_locked() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        db.conn().execute(
+            "INSERT INTO events (type,timestamp,instance,data) VALUES ('message','2026-01-01T00:00:00Z','luna','{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')", [],
+        ).unwrap();
+        assert!(finish(&db, "session-1", "process-1", true).unwrap());
+        let prepared = crate::hooks::common::prepare_pending_messages(&db, "nova").unwrap();
+        // The hook already flushed context, but cannot commit its ack.
+        let writer = HcomDb::open_raw(db.path()).unwrap();
+        db.conn().busy_timeout(Duration::ZERO).unwrap();
+        writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        crate::hooks::common::commit_delivery_ack(&db, &prepared.ack);
+        assert_eq!(db.get_cursor("nova"), 0);
+        writer.conn().execute_batch("ROLLBACK").unwrap();
+        let wake_id = state(&db, "session-1", "process-1")
+            .unwrap()
+            .unwrap()
+            .wake_id
+            .unwrap();
+        // A new message arrives after the failed batch was prepared.
+        queue_message(&db);
+        record_report_for_wake(
+            &db,
+            "session-1",
+            "process-1",
+            "submitted",
+            "completed",
+            Some(&wake_id),
+        )
+        .unwrap();
+        assert!(
+            !finish(&db, "session-1", "process-1", true).unwrap(),
+            "retry must be bounded"
+        );
+        let mut current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        current.completed_at = Some(now_epoch_f64() - 11.0);
+        db.kv_set(
+            &key("session-1", "process-1"),
+            Some(&serde_json::to_string(&current).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            finish(&db, "session-1", "process-1", true).unwrap(),
+            "a completed submission with a failed hook ack must not suppress wakes forever"
+        );
+        assert_eq!(
+            db.get_cursor("nova"),
+            0,
+            "submission is never a delivery ack"
+        );
+        crate::hooks::common::commit_delivery_ack(&db, &prepared.ack);
+        assert!(
+            db.has_pending("nova"),
+            "the earlier batch ack cannot consume the later message"
+        );
+        db.set_status("nova", "listening", "").unwrap();
+        assert!(finish(&db, "session-1", "process-1", true).unwrap());
+        let later = crate::hooks::common::prepare_pending_messages(&db, "nova").unwrap();
+        assert!(later.ack.last_event_id > prepared.ack.last_event_id);
+        crate::hooks::common::commit_delivery_ack(&db, &later.ack);
+        assert!(!db.has_pending("nova"));
+    }
+
+    fn queue_message(db: &HcomDb) {
+        db.conn().execute(
+            "INSERT INTO events (type,timestamp,instance,data) VALUES ('message','2026-01-01T00:00:00Z','luna','{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')", [],
+        ).unwrap();
+    }
+
+    fn save_state(db: &HcomDb, current: &ModState) {
+        db.kv_set(
+            &key("session-1", "process-1"),
+            Some(&serde_json::to_string(current).unwrap()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn completion_reports_are_fenced_idempotent_and_never_acknowledge() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        queue_message(&db);
+        let first = finish_wake(&db, "session-1", "process-1", true)
+            .unwrap()
+            .unwrap();
+        // Old loaded JS, another session and another claim cannot release it.
+        for token in [None, Some("stale-token")] {
+            for event in ["submitted", "submission-failed"] {
+                record_report_for_wake(&db, "session-1", "process-1", event, "old", token).unwrap();
+            }
+        }
+        record_report_for_wake(
+            &db,
+            "session-2",
+            "process-1",
+            "submitted",
+            "old session",
+            Some(&first),
+        )
+        .unwrap();
+        let before = state(&db, "session-1", "process-1").unwrap().unwrap();
+        assert_eq!(before.completed_at, None);
+        assert!(!before.submission_failed);
+        assert!(before.outcome_unidentified);
+        let legacy_health = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(legacy_health.status_context, "tui:mod-outdated");
+        assert!(legacy_health.status_detail.contains("without a wake ID"));
+        assert!(!legacy_health.status_detail.contains("menu"));
+        let writer = HcomDb::open_raw(db.path()).unwrap();
+        db.conn().busy_timeout(Duration::ZERO).unwrap();
+        writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(is_busy(
+            &record_report_for_wake(
+                &db,
+                "session-1",
+                "process-1",
+                "submitted",
+                "completed",
+                Some(&first)
+            )
+            .unwrap_err()
+        ));
+        writer.conn().execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            state(&db, "session-1", "process-1")
+                .unwrap()
+                .unwrap()
+                .completed_at,
+            None
+        );
+        record_report_for_wake(
+            &db,
+            "session-1",
+            "process-1",
+            "submitted",
+            "completed",
+            Some(&first),
+        )
+        .unwrap();
+        let mut completed = state(&db, "session-1", "process-1").unwrap().unwrap();
+        assert!(completed.completed_at.is_some());
+        assert!(!completed.outcome_unidentified);
+        assert_eq!(
+            completed.checked_at, before.checked_at,
+            "reports are not healthy polls"
+        );
+        assert_eq!(db.get_cursor("nova"), 0);
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "tui:mod-retrying"
+        );
+        completed.completed_at = Some(now_epoch_f64() - 11.0);
+        save_state(&db, &completed);
+        // A late legacy callback cannot poison the next identified outcome.
+        record_report_for_wake(&db, "session-1", "process-1", "submitted", "legacy", None).unwrap();
+        // Report committed but reply was lost: resending must not defer retry.
+        record_report_for_wake(
+            &db,
+            "session-1",
+            "process-1",
+            "submitted",
+            "completed",
+            Some(&first),
+        )
+        .unwrap();
+        assert_eq!(
+            state(&db, "session-1", "process-1")
+                .unwrap()
+                .unwrap()
+                .completed_at,
+            completed.completed_at
+        );
+        db.set_status("nova", "active", "tool").unwrap();
+        assert!(!finish(&db, "session-1", "process-1", true).unwrap());
+        db.set_status("nova", "listening", "").unwrap();
+        let second = finish_wake(&db, "session-1", "process-1", true)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        for event in ["submitted", "submission-failed"] {
+            record_report_for_wake(&db, "session-1", "process-1", event, "late", Some(&first))
+                .unwrap();
+        }
+        let current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        assert_eq!(current.wake_id.as_deref(), Some(second.as_str()));
+        assert!(!current.outcome_unidentified);
+        assert_eq!(current.completed_at, None);
+        assert!(!current.submission_failed);
+        assert!(!finish(&db, "session-1", "process-1", true).unwrap());
+        // Hook progress followed by a later report must not resurrect a claim.
+        db.advance_instance_cursor("nova", 1).unwrap();
+        record_report_for_wake(
+            &db,
+            "session-1",
+            "process-1",
+            "submitted",
+            "late",
+            Some(&second),
+        )
+        .unwrap();
+        let current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        assert_eq!(current.wake_id, None);
+        assert_eq!(current.completed_at, None);
+    }
+
+    #[test]
+    fn pending_menu_and_stopped_poller_have_distinct_health_without_expiring_claims() {
+        let (_dir, db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        queue_message(&db);
+        assert!(finish(&db, "session-1", "process-1", true).unwrap());
+        let mut current = state(&db, "session-1", "process-1").unwrap().unwrap();
+        current.attempted_at = Some(now_epoch_f64() - 35.0 * 60.0);
+        save_state(&db, &current);
+        assert!(!finish(&db, "session-1", "process-1", true).unwrap());
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "tui:mod-unacknowledged"
+        );
+        current.checked_at = now_epoch_f64() - HEALTH_TIMEOUT - 1.0;
+        save_state(&db, &current);
+        // A stale registered endpoint is not evidence of a live poller.
+        db.upsert_notify_endpoint("nova", "plugin", 9).unwrap();
+        report_health(&db, "process-1", "nova").unwrap();
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.status_context, "tui:mod-unavailable");
+        assert!(!row.status_detail.contains("menu"));
+        assert_eq!(db.get_cursor("nova"), 0);
+    }
+
+    #[test]
+    fn respawn_rebinds_stale_endpoint_after_locked_startup() {
+        let (dir, mut db) = database();
+        db.mark_claude_session_validated("session-1", "nova")
+            .unwrap();
+        db.upsert_notify_endpoint("nova", "plugin", 9).unwrap();
+        let writer = HcomDb::open_raw(db.path()).unwrap();
+        db.conn().busy_timeout(Duration::ZERO).unwrap();
+        writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(is_busy(
+            &poll_cycle(&mut db, "session-1", "process-1", false).unwrap_err()
+        ));
+        assert_eq!(db.get_notify_endpoint_port("nova", "plugin"), Some(9));
+        writer.conn().execute_batch("ROLLBACK").unwrap();
+        for _ in 0..2 {
+            // New connection/process lifecycle, same durable session and stale endpoint.
+            db.upsert_notify_endpoint("nova", "plugin", 9).unwrap();
+            let path = dir.path().join("hcom.db");
+            let child = std::thread::spawn(move || {
+                let mut db = HcomDb::open_raw(&path).unwrap();
+                poll_cycle(&mut db, "session-1", "process-1", false).unwrap()
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let socket = loop {
+                if let Some(port) = db.get_notify_endpoint_port("nova", "plugin")
+                    && port != 9
+                    && let Ok(socket) =
+                        std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                {
+                    break socket;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "respawn did not bind a live wake listener"
+                );
+                std::thread::yield_now();
+            };
+            drop(socket);
+            assert_eq!(child.join().unwrap()["wake"], false);
+            assert_eq!(db.get_notify_endpoint_port("nova", "plugin"), None);
+            assert!(
+                state(&db, "session-1", "process-1")
+                    .unwrap()
+                    .unwrap()
+                    .checked_at
+                    > 0.0
+            );
+            assert_eq!(db.get_cursor("nova"), 0);
+        }
+    }
 
     #[test]
     fn sqlite_contention_is_a_transient_poll_result() {
@@ -1060,12 +1444,18 @@ mod tests {
         ).unwrap();
         finish(&db, "session-1", "process-1", false).unwrap();
         assert!(finish(&db, "session-1", "process-1", true).unwrap());
-        record_report(
+        let wake_id = state(&db, "session-1", "process-1")
+            .unwrap()
+            .unwrap()
+            .wake_id
+            .unwrap();
+        record_report_for_wake(
             &db,
             "session-1",
             "process-1",
             "submission-failed",
             "wake dropped",
+            Some(&wake_id),
         )
         .unwrap();
         assert!(
@@ -1226,6 +1616,9 @@ mod tests {
             submission_failed: false,
             attempted_cursor: None,
             attempted_at: None,
+            wake_id: None,
+            completed_at: None,
+            outcome_unidentified: false,
             started_at: 0.0,
         };
         assert!(!wake_due(&db, "nova", &current));
