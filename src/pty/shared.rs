@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,139 @@ use crate::tool::Tool;
 
 use super::PtyTarget;
 use super::screen::ScreenTracker;
+
+/// Independent of the displayed title mode: custom tab titles can hide OSC.
+pub(super) struct ChildTitleObservation {
+    mailbox: Arc<(Mutex<ChildTitleMailbox>, Condvar)>,
+    writer: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct ChildTitleMailbox {
+    latest: Option<(String, String)>,
+    closed: bool,
+}
+
+const CHILD_TITLE_RETRY: Duration = Duration::from_secs(3);
+
+impl ChildTitleObservation {
+    pub(super) fn new(process_id: Option<String>) -> Self {
+        // Resolve the path before spawning: no DB open, schema check or write
+        // may run on the PTY poll/reader thread, including the first attempt.
+        let path = crate::paths::db_path();
+        Self::with_persist(process_id, move |process, title| {
+            if let Some(directory) = path.parent() {
+                crate::paths::ensure_private_directory(directory)?;
+            }
+            let db = HcomDb::open_at(&path)?;
+            crate::instance_binding::persist_observed_child_title(&db, process, Some(title))
+        })
+    }
+
+    fn with_persist(
+        process_id: Option<String>,
+        mut persist: impl FnMut(&str, &str) -> Result<bool> + Send + 'static,
+    ) -> Self {
+        let mailbox = Arc::new((Mutex::new(ChildTitleMailbox::default()), Condvar::new()));
+        let Some(process_id) = process_id.filter(|id| !id.is_empty()) else {
+            return Self {
+                mailbox,
+                writer: None,
+            };
+        };
+        let pending = Arc::clone(&mailbox);
+        let writer = std::thread::Builder::new()
+            .name("hcom-child-title".into())
+            .spawn(move || {
+                let (lock, wake) = &*pending;
+                let mut attempted = None;
+                let mut attempted_at: Option<Instant> = None;
+                loop {
+                    let observation = {
+                        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+                        loop {
+                            let changed = state.latest != attempted;
+                            if state.closed && !changed {
+                                return;
+                            }
+                            let retry_in = attempted_at
+                                .map(|at| CHILD_TITLE_RETRY.saturating_sub(at.elapsed()));
+                            if (changed || retry_in.is_some_and(|delay| delay.is_zero()))
+                                && let Some(observation) = &state.latest
+                            {
+                                break observation.clone();
+                            }
+                            state = match retry_in {
+                                Some(delay) => {
+                                    wake.wait_timeout(state, delay)
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .0
+                                }
+                                None => wake.wait(state).unwrap_or_else(|error| error.into_inner()),
+                            };
+                        }
+                    };
+                    // Only the worker performs I/O. While it is blocked, new
+                    // observations replace one pending value rather than queue.
+                    if let Err(error) = persist(&process_id, &observation.1) {
+                        log_error("pty", "observe_child_title", &error.to_string());
+                    }
+                    attempted = Some(observation);
+                    attempted_at = Some(Instant::now());
+                    // Retry even an accepted value: a process binding can
+                    // change without another OSC or display-name update.
+                }
+            });
+        let writer = match writer {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                log_error("pty", "observe_child_title_start", &error.to_string());
+                None
+            }
+        };
+        Self { mailbox, writer }
+    }
+
+    pub(super) fn observe(&mut self, display_name: &str, title: Option<&str>) {
+        let Some(title) = title.filter(|_| self.writer.is_some()) else {
+            return;
+        };
+        let (lock, wake) = &*self.mailbox;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if state
+            .latest
+            .as_ref()
+            .is_none_or(|(name, previous)| name != display_name || previous != title)
+        {
+            state.latest = Some((display_name.to_string(), title.to_string()));
+            wake.notify_one();
+        }
+    }
+
+    fn close(&self) {
+        let (lock, wake) = &*self.mailbox;
+        lock.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed = true;
+        wake.notify_one();
+    }
+
+    #[cfg(test)]
+    fn finish(mut self) {
+        self.close();
+        if let Some(writer) = self.writer.take() {
+            writer.join().unwrap();
+        }
+    }
+}
+
+impl Drop for ChildTitleObservation {
+    fn drop(&mut self) {
+        // Do not join a potentially blocked DB writer from terminal teardown.
+        // It drains the latest pending observation, then exits on its own.
+        self.close();
+    }
+}
 
 /// User-activity cooldown applied uniformly across tools (0.5s). Dim detection
 /// enables this for Claude.
@@ -1318,6 +1451,167 @@ fn advance_pending_utf8(mut pending: u8, data: &[u8]) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    fn wait_for_observed_title(db: &HcomDb, name: &str, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let context = db
+                .get_instance_full(name)
+                .unwrap()
+                .and_then(|row| row.launch_context)
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            if context
+                .as_ref()
+                .and_then(|ctx| ctx["observed_child_title"].as_str())
+                == Some(expected)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "title was not persisted: {context:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn observed_title_performance_ineligible_retries_once_per_window_or_change() {
+        let (attempts, received) = mpsc::channel();
+        let mut observation = ChildTitleObservation::with_persist(
+            Some("title-process".into()),
+            move |process, title| {
+                assert_eq!(process, "title-process");
+                attempts.send(title.to_string()).unwrap();
+                Ok(false)
+            },
+        );
+        observation.observe("luna", Some("first"));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "first"
+        );
+        for _ in 0..100 {
+            observation.observe("luna", Some("first"));
+        }
+        assert!(received.recv_timeout(Duration::from_millis(150)).is_err());
+        observation.observe("new-owner", Some("first"));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "first"
+        );
+        observation.observe("new-owner", Some("latest"));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "latest"
+        );
+        // Binding may become eligible without another OSC or display-name change.
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(4)).unwrap(),
+            "latest"
+        );
+        observation.finish();
+    }
+
+    #[test]
+    fn observed_title_performance_pending_burst_coalesces_to_last_title() {
+        let (attempts, received) = mpsc::channel();
+        let (resume, blocked) = mpsc::channel();
+        let mut first = true;
+        let mut observation =
+            ChildTitleObservation::with_persist(Some("title-process".into()), move |_, title| {
+                attempts.send(title.to_string()).unwrap();
+                if first {
+                    first = false;
+                    blocked.recv().unwrap();
+                }
+                Ok(true)
+            });
+        observation.observe("luna", Some("already in flight"));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "already in flight"
+        );
+        let started = Instant::now();
+        for i in 0..100 {
+            observation.observe("luna", Some(&format!("pending #{i}")));
+        }
+        assert!(started.elapsed() < Duration::from_millis(100));
+        resume.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "pending #99"
+        );
+        assert!(received.recv_timeout(Duration::from_millis(150)).is_err());
+        observation.finish();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn observed_title_performance_locked_database_does_not_block_observe() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn().execute(
+            "INSERT INTO instances (name, tool, session_id, status, created_at) VALUES ('luna', 'codex', 'title-session', 'listening', 1)", [],
+        ).unwrap();
+        db.set_process_binding("title-process", "title-session", "luna")
+            .unwrap();
+        let mut observation = ChildTitleObservation::new(Some("title-process".into()));
+        db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        observation.observe("review-luna", Some("#1852 issue review"));
+        let elapsed = started.elapsed();
+        db.conn().execute_batch("ROLLBACK").unwrap();
+        observation.finish();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "observe blocked for {elapsed:?}"
+        );
+        wait_for_observed_title(&db, "luna", "#1852 issue review");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn observed_title_retries_unbound_launch_and_follows_rebind_and_clear() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut observation = ChildTitleObservation::new(Some("title-process".into()));
+        observation.observe("review-luna", Some("#1852 issue review"));
+        for (name, session) in [("luna", "luna-session"), ("nova", "nova-session")] {
+            db.conn().execute(
+                "INSERT INTO instances (name, tool, session_id, status, created_at) VALUES (?1, 'codex', ?2, 'listening', 1)",
+                rusqlite::params![name, session],
+            ).unwrap();
+            db.set_process_binding("title-process", session, name)
+                .unwrap();
+            observation.observe(&format!("review-{name}"), Some("#1852 issue review"));
+            wait_for_observed_title(&db, name, "#1852 issue review");
+            let row = db.get_instance_full(name).unwrap().unwrap();
+            let context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(context["observed_child_title"], "#1852 issue review");
+        }
+        observation.observe("review-nova", Some(""));
+        wait_for_observed_title(&db, "nova", "");
+        let original = db
+            .get_instance_full("nova")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        let context: serde_json::Value =
+            serde_json::from_str(original.as_deref().unwrap()).unwrap();
+        assert_eq!(context["observed_child_title"], "");
+        observation.observe("review-nova", None);
+        observation.observe("review-nova", Some(""));
+        observation.finish();
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn intentional_kill_is_not_a_launch_failure_even_after_row_deletion() {

@@ -87,6 +87,171 @@ pub fn persist_terminal_launch_context(
     }
 }
 
+/// Refresh only Paradev IDs for an already verified root hook process.
+///
+/// Callers must route inherited subagent hooks away before calling this. Child
+/// rows are rejected here too: their inherited terminal is provenance, not ownership.
+pub fn refresh_paradev_binding_for_root_hook(
+    db: &HcomDb,
+    instance_name: &str,
+    process_id: Option<&str>,
+    session_id: &str,
+) {
+    let Some(process_id) = process_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if session_id.is_empty() || std::env::var("HCOM_PROCESS_ID").as_deref() != Ok(process_id) {
+        return;
+    }
+    let (Ok(terminal), Ok(workspace)) = (
+        std::env::var("SUPERSET_TERMINAL_ID"),
+        std::env::var("SUPERSET_WORKSPACE_ID"),
+    ) else {
+        return;
+    };
+    if [&terminal, &workspace]
+        .iter()
+        .any(|id| id.len() != 36 || uuid::Uuid::try_parse(id).is_err())
+    {
+        return;
+    }
+
+    let result = db.with_write_scope(|| {
+        let Some(row) = db.get_instance_full(instance_name)? else {
+            return Ok(());
+        };
+        if row
+            .parent_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+            || row.session_id.as_deref() != Some(session_id)
+            || !db
+                .get_process_binding_full(process_id)?
+                .is_some_and(|(bound_session, owner)| {
+                    owner == instance_name && bound_session.as_deref() == Some(session_id)
+                })
+        {
+            return Ok(());
+        }
+        let mut context = match row.launch_context.as_deref().filter(|raw| !raw.is_empty()) {
+            Some(raw) => {
+                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
+                    Ok(context) => context,
+                    Err(_) => return Ok(()),
+                }
+            }
+            None => serde_json::Map::new(),
+        };
+        let Some(env) = context
+            .entry("env")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+        else {
+            return Ok(());
+        };
+        if env.get("SUPERSET_TERMINAL_ID").and_then(|id| id.as_str()) == Some(terminal.as_str())
+            && env.get("SUPERSET_WORKSPACE_ID").and_then(|id| id.as_str())
+                == Some(workspace.as_str())
+        {
+            return Ok(());
+        }
+        env.insert("SUPERSET_TERMINAL_ID".into(), serde_json::json!(terminal));
+        env.insert("SUPERSET_WORKSPACE_ID".into(), serde_json::json!(workspace));
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::to_string(&context)?),
+        );
+        db.update_instance_fields(instance_name, &updates)
+    });
+    if let Err(error) = result {
+        crate::log::log_error(
+            "binding",
+            "refresh_paradev_binding",
+            &format!("instance={instance_name} err={error}"),
+        );
+    }
+}
+
+/// Persist a wrapped tool's observed title for its current top-level owner.
+/// Returns whether the observation was accepted (including an unchanged title).
+pub fn persist_observed_child_title(
+    db: &HcomDb,
+    process_id: &str,
+    title: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some(title) = title.filter(|_| !process_id.is_empty()) else {
+        return Ok(false);
+    };
+    let title = crate::pty::screen::sanitize_child_title(title);
+    let Some((_, context)) = observed_child_title_owner(db, process_id)? else {
+        return Ok(false);
+    };
+    if context
+        .get("observed_child_title")
+        .and_then(|value| value.as_str())
+        == Some(title.as_str())
+    {
+        return Ok(true);
+    }
+    db.with_write_scope(|| {
+        // The binding, row or context may have changed while acquiring the
+        // write lock. Read them again before deciding which row to update.
+        let Some((name, mut context)) = observed_child_title_owner(db, process_id)? else {
+            return Ok(false);
+        };
+        if context
+            .get("observed_child_title")
+            .and_then(|value| value.as_str())
+            == Some(title.as_str())
+        {
+            return Ok(true);
+        }
+        context.insert("observed_child_title".into(), serde_json::json!(title));
+        context.insert(
+            "observed_child_title_at".into(),
+            serde_json::json!(now_epoch_f64()),
+        );
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::to_string(&context)?),
+        );
+        db.update_instance_fields(&name, &updates)?;
+        Ok(true)
+    })
+}
+
+fn observed_child_title_owner(
+    db: &HcomDb,
+    process_id: &str,
+) -> anyhow::Result<Option<(String, serde_json::Map<String, serde_json::Value>)>> {
+    let Some((Some(session), name)) = db.get_process_binding_full(process_id)? else {
+        return Ok(None);
+    };
+    let Some(row) = db.get_instance_full(&name)? else {
+        return Ok(None);
+    };
+    if session.is_empty()
+        || row.session_id.as_deref() != Some(session.as_str())
+        || crate::instances::is_subagent_instance(&row)
+        || crate::instances::is_remote_instance(&row)
+        || row.status == "stopped"
+    {
+        return Ok(None);
+    }
+    let context = match row.launch_context.as_deref().filter(|raw| !raw.is_empty()) {
+        Some(raw) => {
+            match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
+                Ok(context) => context,
+                Err(_) => return Ok(None),
+            }
+        }
+        None => serde_json::Map::new(),
+    };
+    Ok(Some((name, context)))
+}
+
 /// Capture environment context and store it for the instance.
 ///
 /// Captures git branch, terminal program, tty, and relevant env vars.
@@ -101,27 +266,45 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         "process_id",
         "terminal_preset_effective",
         "pid_identity",
+        "observed_child_title",
+        "observed_child_title_at",
     ];
     let missing: Vec<&str> = preserve_keys
         .iter()
         .filter(|k| launch_context_value_missing(new_ctx.get(**k)))
         .copied()
         .collect();
+    let missing_env: Vec<&str> = ["SUPERSET_TERMINAL_ID", "SUPERSET_WORKSPACE_ID"]
+        .into_iter()
+        .filter(|key| {
+            launch_context_value_missing(new_ctx.get("env").and_then(|env| env.get(*key)))
+        })
+        .collect();
 
     // Read-merge-write under one write lock: a concurrent PTY PID write must
     // not be overwritten with a stale pid_identity (or lose its identity).
     let result = db.with_write_scope(|| {
         let mut ctx = new_ctx;
-        if !missing.is_empty()
+        if (!missing.is_empty() || !missing_env.is_empty())
             && let Some(pos) = db.get_instance_full(instance_name)?
             && let Some(old_json) = &pos.launch_context
             && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
         {
             for k in &missing {
                 if let Some(val) = old_ctx.get(*k)
-                    && !launch_context_value_missing(Some(val))
+                    && (!launch_context_value_missing(Some(val))
+                        || (*k == "observed_child_title" && val.as_str() == Some("")))
                 {
                     ctx.insert(k.to_string(), val.clone());
+                }
+            }
+            if let Some(env) = ctx.get_mut("env").and_then(|env| env.as_object_mut()) {
+                for key in &missing_env {
+                    if let Some(value) = old_ctx.get("env").and_then(|env| env.get(*key))
+                        && !launch_context_value_missing(Some(value))
+                    {
+                        env.insert((*key).to_string(), value.clone());
+                    }
                 }
             }
         }
@@ -183,6 +366,9 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     let env_keys = [
         "TERM_PROGRAM",
         "TERM_SESSION_ID",
+        // Subagents inherit these too; ownership readers must exclude parent_name rows.
+        "SUPERSET_TERMINAL_ID",
+        "SUPERSET_WORKSPACE_ID",
         "WINDOWID",
         "ITERM_SESSION_ID",
         "KITTY_WINDOW_ID",
@@ -1332,6 +1518,268 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
+    fn observed_title_db() -> (HcomDb, PathBuf) {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                r#"INSERT INTO instances
+               (name, tool, session_id, status, status_context, created_at, tag, launch_context)
+               VALUES ('luna', 'codex', 'title-session', 'active', 'tool:exec_command', 1, 'review',
+                       '{"env":{"KEEP":"yes"},"custom":[1,2]}')"#,
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("title-process", "title-session", "luna")
+            .unwrap();
+        (db, path)
+    }
+
+    fn observed_title_identity(db: &HcomDb) -> Vec<rusqlite::types::Value> {
+        let mut statement = db
+            .conn()
+            .prepare("SELECT * FROM instances WHERE name='luna'")
+            .unwrap();
+        let columns: Vec<usize> = statement
+            .column_names()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| (*name != "launch_context").then_some(i))
+            .collect();
+        statement
+            .query_row([], |row| columns.iter().map(|i| row.get(*i)).collect())
+            .unwrap()
+    }
+
+    #[test]
+    fn observed_title_persists_sanitized_change_without_identity_or_status_mutation() {
+        let (db, path) = observed_title_db();
+        let identity = observed_title_identity(&db);
+        assert!(
+            persist_observed_child_title(
+                &db,
+                "title-process",
+                Some("  #1852\nreview\u{0007}\u{202e}  ")
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["observed_child_title"], "#1852 review");
+        assert!(context["observed_child_title_at"].as_f64().unwrap() > 0.0);
+        assert_eq!(context["env"]["KEEP"], "yes");
+        assert_eq!(context["custom"], serde_json::json!([1, 2]));
+        assert_eq!(observed_title_identity(&db), identity);
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_unchanged_has_no_database_write_or_timestamp_refresh() {
+        let (db, path) = observed_title_db();
+        assert!(persist_observed_child_title(&db, "title-process", Some("same title")).unwrap());
+        let original = db
+            .get_instance_full("luna")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        let changes = db.conn().total_changes();
+        assert!(
+            persist_observed_child_title(&db, "title-process", Some("  same   title ")).unwrap()
+        );
+        assert_eq!(db.conn().total_changes(), changes);
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_performance_ineligible_never_takes_write_lock() {
+        let (db, path) = observed_title_db();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status='stopped' WHERE name='luna'",
+                [],
+            )
+            .unwrap();
+        let blocker = HcomDb::open_at(&path).unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        db.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+        for process in ["title-process", "not-bound"] {
+            assert!(!persist_observed_child_title(&db, process, Some("#1852 review")).unwrap());
+        }
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_performance_unchanged_never_takes_write_lock() {
+        let (db, path) = observed_title_db();
+        assert!(persist_observed_child_title(&db, "title-process", Some("same title")).unwrap());
+        let blocker = HcomDb::open_at(&path).unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        db.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert!(persist_observed_child_title(&db, "title-process", Some("same title")).unwrap());
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_tracks_ref_to_no_ref_and_explicit_clear() {
+        let (db, path) = observed_title_db();
+        for title in ["#1852 issue review", "ready for next task", ""] {
+            assert!(persist_observed_child_title(&db, "title-process", Some(title)).unwrap());
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(context["observed_child_title"], title);
+            assert!(context.get("observed_child_title_at").is_some());
+        }
+        let original = db
+            .get_instance_full("luna")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        assert!(!persist_observed_child_title(&db, "title-process", None).unwrap());
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn observed_title_skips_child_stopped_and_stale_process_rows() {
+        for rejection in ["child", "stopped", "stale", "missing"] {
+            let (db, path) = observed_title_db();
+            match rejection {
+                "child" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET parent_name='parent' WHERE name='luna'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "stopped" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET status='stopped' WHERE name='luna'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "stale" => {
+                    db.set_process_binding("title-process", "older-session", "luna")
+                        .unwrap();
+                }
+                "missing" => {
+                    db.delete_process_binding("title-process").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let original = db
+                .get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context;
+            let changes = db.conn().total_changes();
+            assert!(
+                !persist_observed_child_title(&db, "title-process", Some("#1852 stale")).unwrap()
+            );
+            assert_eq!(db.conn().total_changes(), changes, "{rejection}");
+            assert_eq!(
+                db.get_instance_full("luna")
+                    .unwrap()
+                    .unwrap()
+                    .launch_context,
+                original
+            );
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn observed_title_uses_current_process_owner_and_caps_long_titles() {
+        let (db, path) = observed_title_db();
+        let original = db
+            .get_instance_full("luna")
+            .unwrap()
+            .unwrap()
+            .launch_context;
+        db.conn().execute("INSERT INTO instances (name, tool, session_id, status, created_at) VALUES ('nova', 'codex', 'new-session', 'listening', 1)", []).unwrap();
+        db.set_process_binding("title-process", "new-session", "nova")
+            .unwrap();
+        assert!(
+            persist_observed_child_title(&db, "title-process", Some(&"a".repeat(500))).unwrap()
+        );
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            context["observed_child_title"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            160
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .launch_context,
+            original
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn observed_title_pair_survives_context_recapture_even_when_cleared() {
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "");
+        for title in ["#1852 issue review", ""] {
+            let (db, path) = observed_title_db();
+            let context =
+                serde_json::json!({"observed_child_title":title,"observed_child_title_at":12.5});
+            db.conn()
+                .execute(
+                    "UPDATE instances SET launch_context=?1 WHERE name='luna'",
+                    [context.to_string()],
+                )
+                .unwrap();
+            capture_and_store_launch_context(&db, "luna");
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let actual: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(actual["observed_child_title"], title);
+            assert_eq!(actual["observed_child_title_at"], 12.5);
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn observed_title_old_row_without_observation_reads_without_writing() {
+        let (db, path) = observed_title_db();
+        let changes = db.conn().total_changes();
+        assert!(!persist_observed_child_title(&db, "title-process", None).unwrap());
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert!(context.get("observed_child_title").is_none());
+        assert!(context.get("observed_child_title_at").is_none());
+        assert_eq!(db.conn().total_changes(), changes);
+        cleanup(path);
+    }
+
     #[test]
     fn auto_subscribe_eligibility_follows_released_specs() {
         assert!(auto_subscribe_eligible("pi"));
@@ -1388,6 +1836,88 @@ mod tests {
             Some("proc-1")
         );
 
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_context_records_paradev_binding() {
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "terminal-1");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "workspace-1");
+
+        let ctx = capture_context();
+
+        assert_eq!(ctx["env"]["SUPERSET_TERMINAL_ID"], "terminal-1");
+        assert_eq!(ctx["env"]["SUPERSET_WORKSPACE_ID"], "workspace-1");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_and_store_preserves_paradev_binding_without_hook_env() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "codex",
+                    1.0f64,
+                    r#"{"env":{"SUPERSET_TERMINAL_ID":"terminal-1","SUPERSET_WORKSPACE_ID":"workspace-1","TERM_PROGRAM":"old-terminal"}}"#
+                ],
+            )
+            .unwrap();
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "");
+        let _program = EnvVarGuard::set("TERM_PROGRAM", "");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_TERMINAL_ID")
+                .as_deref(),
+            Some("terminal-1")
+        );
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_WORKSPACE_ID")
+                .as_deref(),
+            Some("workspace-1")
+        );
+        assert_eq!(row.launch_context_value("env", "TERM_PROGRAM"), None);
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_and_store_refreshes_paradev_binding_on_relaunch() {
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "codex",
+                    1.0f64,
+                    r#"{"env":{"SUPERSET_TERMINAL_ID":"terminal-old","SUPERSET_WORKSPACE_ID":"workspace-old"}}"#
+                ],
+            )
+            .unwrap();
+        let _terminal = EnvVarGuard::set("SUPERSET_TERMINAL_ID", "terminal-new");
+        let _workspace = EnvVarGuard::set("SUPERSET_WORKSPACE_ID", "workspace-new");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_TERMINAL_ID")
+                .as_deref(),
+            Some("terminal-new")
+        );
+        assert_eq!(
+            row.launch_context_value("env", "SUPERSET_WORKSPACE_ID")
+                .as_deref(),
+            Some("workspace-new")
+        );
         cleanup(path);
     }
 

@@ -132,7 +132,7 @@ const MAX_CHILD_TITLE_CHARS: usize = 160;
 /// C0/C1 codepoints, collapse whitespace runs to a single space, trim the ends,
 /// and bound the result to [`MAX_CHILD_TITLE_CHARS`]. Mirrors codex's own
 /// `sanitize_terminal_title` so passthrough matches what the tool would render.
-fn sanitize_child_title(title: &str) -> String {
+pub(crate) fn sanitize_child_title(title: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
     for ch in title.chars() {

@@ -852,6 +852,8 @@ impl Proxy {
         let title_mode = shared::session_title_mode();
         let title_enabled = title_mode != crate::shared::TitleMode::Off;
         let mut last_written_child = String::new();
+        let mut child_title_observation =
+            shared::ChildTitleObservation::new(crate::config::Config::get().process_id);
 
         // Track incomplete UTF-8 sequences to defer title writes.
         // When PTY output ends with partial multi-byte character, writing our title OSC
@@ -1414,6 +1416,16 @@ impl Proxy {
                         Err(error) => bail!("read title notification failed: {error}"),
                     }
                 }
+            }
+
+            if let Some(title) = self.screen.child_title() {
+                let name = self
+                    .current_name
+                    .read()
+                    .ok()
+                    .map(|name| name.clone())
+                    .unwrap_or_default();
+                child_title_observation.observe(&name, Some(title));
             }
 
             // Check for title changes (delivery thread updates shared Arcs).
