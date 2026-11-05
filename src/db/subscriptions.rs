@@ -498,7 +498,10 @@ pub(crate) fn restore_stopped_subscriptions(db: &HcomDb, name: &str) -> Result<u
     // An on-hit reaction logs a new event whose live processing would move
     // restored cursors past historical events not yet replayed. Hold
     // reactions until the historical batch is drained.
-    let mut reactions = Vec::new();
+    let mut replay = ReplayState {
+        predicates: ReplayPredicates::new(&db.conn),
+        reactions: Vec::new(),
+    };
     for (event_id, event_type, instance, data) in events {
         let data: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
         if is_system_feedback(&event_type, &instance, &data) {
@@ -517,9 +520,11 @@ pub(crate) fn restore_stopped_subscriptions(db: &HcomDb, name: &str) -> Result<u
             &instance,
             &data,
             Some(&eligible),
-            Some(&mut reactions),
+            Some(&mut replay),
         );
     }
+    let reactions = std::mem::take(&mut replay.reactions);
+    drop(replay); // release all reset statements before reactions recurse
     for reaction in reactions {
         reaction.send(db);
     }
@@ -734,17 +739,62 @@ impl OnHitReaction {
     }
 }
 
+// Bound both retained statement count and SQL text. The cache lives for one
+// historical replay only; it never caches mutable subscription records/results.
+const REPLAY_PREDICATE_LIMIT: usize = 256;
+const REPLAY_PREDICATE_SQL_BYTES: usize = 256 * 1024;
+
+struct ReplayPredicates<'conn> {
+    conn: &'conn rusqlite::Connection,
+    statements: HashMap<String, rusqlite::Statement<'conn>>,
+    sql_bytes: usize,
+}
+
+impl<'conn> ReplayPredicates<'conn> {
+    fn new(conn: &'conn rusqlite::Connection) -> Self {
+        Self {
+            conn,
+            statements: HashMap::new(),
+            sql_bytes: 0,
+        }
+    }
+
+    fn matches(&mut self, query: &str, params: impl rusqlite::Params) -> bool {
+        if let Some(statement) = self.statements.get_mut(query) {
+            return statement.query_row(params, |_| Ok(())).is_ok();
+        }
+        let Ok(mut statement) = self.conn.prepare(query) else {
+            return false;
+        };
+        let matched = statement.query_row(params, |_| Ok(())).is_ok();
+        // Retain admitted entries rather than evicting on every overflow miss:
+        // a replay cycling through >limit predicates would otherwise thrash.
+        if self.statements.len() < REPLAY_PREDICATE_LIMIT
+            && query.len() <= REPLAY_PREDICATE_SQL_BYTES.saturating_sub(self.sql_bytes)
+        {
+            self.sql_bytes += query.len();
+            self.statements.insert(query.to_string(), statement);
+        }
+        matched
+    }
+}
+
+struct ReplayState<'conn> {
+    predicates: ReplayPredicates<'conn>,
+    reactions: Vec<OnHitReaction>,
+}
+
 /// Fire subscriptions matching one logged event, optionally limited to `only`
 /// (subscription keys). Advances cursors and removes `--once` hits. On-hit
-/// reactions are sent now, or queued in `defer_reactions` when given.
-fn fire_matching_subscriptions(
-    db: &HcomDb,
+/// reactions are sent now, or queued in `replay` when given.
+fn fire_matching_subscriptions<'conn>(
+    db: &'conn HcomDb,
     event_id: i64,
     event_type: &str,
     instance: &str,
     data: &serde_json::Value,
     only: Option<&HashSet<String>>,
-    mut defer_reactions: Option<&mut Vec<OnHitReaction>>,
+    mut replay: Option<&mut ReplayState<'conn>>,
 ) {
     let rows: Vec<(String, String)> = match db.conn.prepare_cached(
         "SELECT key, value FROM kv
@@ -853,9 +903,13 @@ fn fire_matching_subscriptions(
                 .unwrap_or_default();
 
             let matched = if stored_params.is_empty() {
-                db.conn
-                    .query_row(&filter_query, params![event_id], |_| Ok(()))
-                    .is_ok()
+                match replay.as_deref_mut() {
+                    Some(replay) => replay.predicates.matches(&filter_query, params![event_id]),
+                    None => db
+                        .conn
+                        .query_row(&filter_query, params![event_id], |_| Ok(()))
+                        .is_ok(),
+                }
             } else {
                 let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(event_id)];
                 for p in &stored_params {
@@ -863,9 +917,13 @@ fn fire_matching_subscriptions(
                 }
                 let refs: Vec<&dyn rusqlite::types::ToSql> =
                     all_params.iter().map(|p| p.as_ref()).collect();
-                db.conn
-                    .query_row(&filter_query, refs.as_slice(), |_| Ok(()))
-                    .is_ok()
+                match replay.as_deref_mut() {
+                    Some(replay) => replay.predicates.matches(&filter_query, refs.as_slice()),
+                    None => db
+                        .conn
+                        .query_row(&filter_query, refs.as_slice(), |_| Ok(()))
+                        .is_ok(),
+                }
             };
 
             if !matched {
@@ -983,8 +1041,8 @@ fn fire_matching_subscriptions(
                 text: on_hit_text.to_string(),
                 chain,
             };
-            match defer_reactions.as_deref_mut() {
-                Some(queue) => queue.push(reaction),
+            match replay.as_deref_mut() {
+                Some(replay) => replay.reactions.push(reaction),
                 None => reaction.send(db),
             }
         }
@@ -3050,6 +3108,80 @@ mod tests {
             db.finalize_instance_stop(name, created_at, None, None, &event)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn replay_predicate_reuse_is_bounded_and_rebinds_after_errors() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut cache = ReplayPredicates::new(&conn);
+        for pass in 0..2 {
+            for i in 0..=REPLAY_PREDICATE_LIMIT {
+                let query = format!("SELECT 1 WHERE ?1 = ?2 AND {i} = {i}");
+                let values = params![i as i64, (i + pass) as i64];
+                let expected = conn.query_row(&query, values, |_| Ok(())).is_ok();
+                assert_eq!(
+                    cache.matches(&query, params![i as i64, (i + pass) as i64]),
+                    expected
+                );
+            }
+            assert_eq!(cache.statements.len(), REPLAY_PREDICATE_LIMIT);
+        }
+        assert!(
+            cache.statements["SELECT 1 WHERE ?1 = ?2 AND 0 = 0"]
+                .get_status(rusqlite::StatementStatus::Run)
+                >= 2
+        );
+        let mut cache = ReplayPredicates::new(&conn);
+        assert!(!cache.matches("invalid SQL", []));
+        assert!(!cache.matches("SELECT ?1 WHERE ?2", params![1]));
+        assert!(cache.matches("SELECT ?1 WHERE ?2", params![2, true]));
+        assert!(!cache.matches("SELECT ?1 WHERE ?2", params![3, false]));
+        let oversized = format!("SELECT 1 /*{}*/", "x".repeat(REPLAY_PREDICATE_SQL_BYTES));
+        assert!(cache.matches(&oversized, []));
+        assert!(!cache.statements.contains_key(&oversized));
+        assert!(cache.sql_bytes <= REPLAY_PREDICATE_SQL_BYTES);
+    }
+
+    #[test]
+    fn replay_parameterized_predicates_keep_bindings_once_and_cursors() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn.execute_batch("INSERT INTO instances (name, created_at) VALUES ('mula', 1.0), ('libe', 1.0), ('nabe', 1.0)").unwrap();
+        for (id, watched, once) in [("a", "libe", false), ("b", "nabe", true)] {
+            let sub = json!({"id": id, "caller": "mula", "once": once,
+                "sql": "type = 'status' AND instance = ? AND status_val = ?",
+                "params": [watched, "listening"], "last_id": 0});
+            db.kv_set(&format!("events_sub:{id}"), Some(&sub.to_string()))
+                .unwrap();
+        }
+        stop_for_resume(&db, "mula");
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        db.log_status_event("nabe", "listening", "", None, None)
+            .unwrap();
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        let last_libe = db.get_last_event_id();
+        db.log_status_event("nabe", "listening", "", None, None)
+            .unwrap();
+        db.log_status_event("libe", "active", "", None, None)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 2.0)",
+                [],
+            )
+            .unwrap();
+        restore_stopped_subscriptions(&db, "mula").unwrap();
+        assert_eq!(
+            notices_to(&db, "mula"),
+            3,
+            "two libe hits and only the first nabe hit"
+        );
+        assert!(db.kv_get("events_sub:b").unwrap().is_none());
+        let sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get("events_sub:a").unwrap().unwrap()).unwrap();
+        assert_eq!(sub["last_id"], last_libe);
+        cleanup_test_db(db_path);
     }
 
     #[test]
