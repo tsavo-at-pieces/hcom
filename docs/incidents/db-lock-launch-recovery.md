@@ -27,6 +27,15 @@ Claude's health decision now scans pending messages at most once, lazily. It
 previously repeated the same scan in up to four match guards while a poll/report
 could own the write lock. Priority and status text are unchanged.
 
+Cross-review with PR #22 also found that background bookkeeping called a
+best-effort terminal metadata helper inside its required transaction. A rejected
+terminal preset write could be logged and swallowed while PID/log-path writes
+still committed. The background path now propagates the fallible helper result;
+the existing caller failure path stops the verified owned runner. A selective
+terminal-field rejection reproduced success before the fix and fails cleanly
+after it. The regression verifies complete rollback for both terminal-context
+and PID rejection. Optional terminal metadata callers retain best-effort logging.
+
 Read-only filesystem timing inspection found completed live write scopes held
 for up to 5,900 ms at `claude_mod::finish_wake`, 2,843 ms at
 `record_report_for_wake`, and 3,040 ms at `persist_observed_child_title`.
