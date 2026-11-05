@@ -1099,11 +1099,16 @@ struct StalledTurn {
 
 impl StalledTurn {
     fn start(h: &Hcom) -> Self {
-        Self::start_with(h, WHOLE_TURN_CLAUDE, &[])
+        Self::start_with(
+            h,
+            WHOLE_TURN_CLAUDE,
+            &[],
+            "2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e",
+        )
     }
 
     /// [`Self::start`] with another stand-in and its own settings.
-    fn start_with(h: &Hcom, script: &str, settings: &[(&str, &str)]) -> Self {
+    fn start_with(h: &Hcom, script: &str, settings: &[(&str, &str)], sid: &str) -> Self {
         use std::os::fd::AsFd;
 
         let copy = h.root_path().join("native-stdout");
@@ -1134,7 +1139,7 @@ impl StalledTurn {
             ])
             .stdin(Stdio::piped())
             .stdout(sink)
-            .stderr(Stdio::null())
+            .stderr(fs::File::create(h.root_path().join("native-stderr")).unwrap())
             .spawn()
             .unwrap();
         let stdin = hcom.stdin.take().unwrap();
@@ -1147,9 +1152,7 @@ impl StalledTurn {
             copy,
             next_written,
         };
-        turn.read_through(
-            b"\"hook_response\",\"session_id\":\"2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e\"}\n",
-        );
+        turn.read_through(format!("\"hook_response\",\"session_id\":\"{sid}\"}}\n").as_bytes());
         // From here the client takes nothing: its pipe is full, so the copy
         // blocks on its first read of the turn, before the prompt hook commits.
         turn.filled = {
@@ -1170,12 +1173,22 @@ impl StalledTurn {
         );
         // Only preconditions: a loaded host may take long to run the hooks.
         h.eventually("the prompt hook", Duration::from_secs(300), || {
+            let stderr = fs::read_to_string(h.root_path().join("native-stderr")).unwrap();
+            assert!(
+                !stderr.contains("Traceback"),
+                "Claude stand-in failed before the prompt hook: {stderr}"
+            );
             Ok(only_status(h)
                 .is_some_and(|row| row.1 == "prompt")
                 .then_some(()))
         });
         turn.send(serde_json::json!({"type": "control_request", "request_id": "stop-1", "request": {"subtype": "interrupt"}}));
         h.eventually("the turn's last frame", Duration::from_secs(300), || {
+            let stderr = fs::read_to_string(h.root_path().join("native-stderr")).unwrap();
+            assert!(
+                !stderr.contains("Traceback"),
+                "Claude stand-in failed before its last frame: {stderr}"
+            );
             Ok(wrote.exists().then_some(()))
         });
         turn
@@ -1311,8 +1324,9 @@ fn claude_stdio_turn_read_whole_behind_a_stalled_client_keeps_a_prompt_sent_befo
 /// buffer in one call whenever the pipe has room. Hooks and stdin are served
 /// while frames wait. As with [`WHOLE_TURN_CLAUDE`], the client takes nothing
 /// from before the turn's prompt hook to its last frame: one frame of
-/// exactly 64 KiB, which hcom's copy takes in one read and is then blocked
-/// on, leaves the pipe empty for the turn's frames. `FAKE_TAIL` says how
+/// at most PIPE_BUF bytes, written atomically into the empty pipe, blocks
+/// hcom's copy on the full client pipe. Once it has taken that frame, the
+/// native pipe is empty for the turn's frames. `FAKE_TAIL` says how
 /// those leave the pipe:
 /// - `refused_after_idle`: after the idle frame, status frames the size of a
 ///   `running` frame until the pipe refuses one, which is dropped, so that
@@ -1329,7 +1343,8 @@ import fcntl, json, os, select, struct, subprocess, sys, termios, threading, tim
 if sys.argv[1:2] == ["--version"]:
     print("2.1.309 (Claude Code)")
     sys.exit(0)
-SID = "2e7c4a9b-1d3f-4b6a-8c5e-7f9a0b1c2d3e"
+# Keep the whole cancelled turn (490 bytes) within even a 512-byte pipe.
+SID = "s"
 TAIL = os.environ["FAKE_TAIL"]
 LINUX = sys.platform.startswith("linux")
 OUT = 1
@@ -1416,9 +1431,12 @@ hook("sessionstart", {"session_id": SID, "transcript_path": cwd + "/transcript.j
 emit({"type": "system", "subtype": "hook_response", "session_id": SID})
 stdin = sys.stdin.buffer
 stdin.readline()
-emit(sized(65536))
+# A nonblocking write larger than PIPE_BUF may be partial. If the copy
+# then blocks on the client, queued padding cannot finish before the hook.
+# This frame fits atomically even when macOS cannot grow its 512-byte pipe.
+emit(sized(os.fpathconf(OUT, "PC_PIPE_BUF")))
 with lock:
-    assert not out, "the pipe did not take 64 KiB at once"
+    assert not out, "the empty pipe did not take the atomic padding frame"
 while in_pipe():
     time.sleep(0.01)
 running = state("running")
@@ -1448,11 +1466,16 @@ if TAIL == "exact":
     with lock:
         assert not out and in_pipe() == capacity, "the turn's frames did not fill the pipe"
 if TAIL == "refused_after_idle":
+    with lock:
+        assert not out, "the cancelled turn must fit before the next running frame waits"
     while emit_if_taken(sized(len(frame(running)))):
         pass
 open(os.environ["FAKE_WROTE"], "w").close()
 if stdin.readline():
     emit(state("running"))
+    if TAIL != "exact":
+        with lock:
+            assert out, "the next running frame must wait for pipe room"
     hook("userpromptsubmit", {"session_id": SID, "hook_event_name": "UserPromptSubmit", "prompt": "two"})
     flushed()
     emit(init)
@@ -1472,9 +1495,9 @@ flushed()
 #[test]
 fn claude_stdio_turn_read_whole_to_the_pipe_capacity_settles_once_drained() {
     let h = Hcom::new();
-    let mut turn = StalledTurn::start_with(&h, BUN_CLAUDE, &[("FAKE_TAIL", "exact")]);
+    let mut turn = StalledTurn::start_with(&h, BUN_CLAUDE, &[("FAKE_TAIL", "exact")], "s");
     assert_eq!(only_status(&h).unwrap().1, "prompt");
-    turn.read_through(WHOLE_TURN_IDLE);
+    turn.read_through(b"\"state\":\"idle\",\"session_id\":\"s\"}\n");
     let interrupted = Some((
         "listening".to_string(),
         "interrupted".to_string(),
@@ -1519,7 +1542,7 @@ fn claude_stdio_turn_end_that_waited_for_room_keeps_a_prompt_sent_before_the_dra
 
 fn stalled_turn_keeps_the_next_prompt(tail: &str) {
     let h = Hcom::new();
-    let mut turn = StalledTurn::start_with(&h, BUN_CLAUDE, &[("FAKE_TAIL", tail)]);
+    let mut turn = StalledTurn::start_with(&h, BUN_CLAUDE, &[("FAKE_TAIL", tail)], "s");
     turn.send(serde_json::json!({"type": "user", "message": {"role": "user", "content": "two"}}));
     // Only preconditions: a loaded host may take long to run the hook.
     h.eventually("the next prompt hook", Duration::from_secs(300), || {
@@ -1530,7 +1553,7 @@ fn stalled_turn_keeps_the_next_prompt(tail: &str) {
         Ok((prompts == 2).then_some(()))
     });
     // Claude writes the next turn's own frames once the client reads on.
-    turn.read_through(WHOLE_TURN_NEXT);
+    turn.read_through(b"\"session_id\":\"s\",\"turn\":2}\n");
     // Long enough for the recorder to have applied either frame.
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
