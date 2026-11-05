@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rand::RngExt;
 use serde_json::json;
 
@@ -161,6 +161,9 @@ pub struct LaunchParams {
     pub background: bool,
     /// Single foreground Claude print or Codex app-server process on caller pipes.
     pub stdio: bool,
+    /// Absolute executable pathname retained by `launch()` at the stdio install check.
+    /// Callers leave this unset; the install check always replaces it.
+    pub stdio_program: Option<PathBuf>,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub launcher: Option<String>,
@@ -186,6 +189,7 @@ impl Default for LaunchParams {
             initial_prompt: None,
             background: false,
             stdio: false,
+            stdio_program: None,
             cwd: None,
             env: None,
             launcher: None,
@@ -224,6 +228,15 @@ fn find_tool_path(tool: &str) -> Option<String> {
 /// Check if tool CLI is installed (PATH + fallbacks).
 fn is_tool_installed(tool: &str) -> bool {
     find_tool_path(tool).is_some()
+}
+
+/// Resolve once against the supervisor's directory, before the stdio child
+/// changes cwd. Retain the pathname even if that candidate later disappears.
+fn resolve_stdio_program(tool: &str) -> Result<PathBuf> {
+    let found = find_tool_path(tool)
+        .ok_or_else(|| anyhow::anyhow!("'{}' is not installed or not in PATH", tool))?;
+    std::path::absolute(&found)
+        .with_context(|| format!("Failed to make stdio executable path absolute: {found}"))
 }
 
 /// Whether a launch replaces the current process instead of opening a new
@@ -1814,7 +1827,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     let tool_binary = normalized.cli_binary();
-    if !is_tool_installed(tool_binary) {
+    if params.stdio {
+        params.stdio_program = Some(resolve_stdio_program(tool_binary)?);
+    } else if !is_tool_installed(tool_binary) {
         bail!("'{}' is not installed or not in PATH", tool_binary);
     }
 
@@ -2242,6 +2257,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 &params,
                 &instance_env,
                 StdioLaunchIdentity {
+                    program: params
+                        .stdio_program
+                        .as_deref()
+                        .expect("stdio executable validated at install check"),
                     instance_name: &instance_name,
                     process_id: &process_id,
                     batch_id: &batch_id,
@@ -2533,11 +2552,12 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     })
 }
 
-/// What one stdio launch is, as the launcher resolved it: the registered row, its
-/// fresh process id and batch, and who launched it. The supervising hcom process
-/// may itself run inside another launch, whose `HCOM_LAUNCHED_BY` and batch must
-/// never be reported for the child it supervises.
+/// What one stdio launch is, as the launcher resolved it: the validated executable,
+/// registered row, its fresh process id and batch, and who launched it. The
+/// supervising hcom process may itself run inside another launch, whose
+/// `HCOM_LAUNCHED_BY` and batch must never be reported for the child it supervises.
 struct StdioLaunchIdentity<'a> {
+    program: &'a Path,
     instance_name: &'a str,
     process_id: &'a str,
     batch_id: &'a str,
@@ -2555,6 +2575,7 @@ fn launch_stdio(
     identity: StdioLaunchIdentity<'_>,
 ) -> Result<LaunchResult> {
     let StdioLaunchIdentity {
+        program,
         instance_name,
         process_id,
         batch_id,
@@ -2563,17 +2584,9 @@ fn launch_stdio(
     } = identity;
     let working_dir = params.cwd.as_deref().unwrap_or(".");
     let tool = params.tool.as_str();
-    // Resolve either supported tool using the install gate's lookup, including
-    // fallback install directories. Make relative PATH entries absolute before
-    // the child changes to working_dir, where they could name another file.
-    let program = find_tool_path(tool)
-        .map(|found| {
-            std::path::absolute(&found)
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or(found)
-        })
-        .unwrap_or_else(|| tool.to_string());
-    let mut command = std::process::Command::new(&program);
+    // Use the absolute pathname retained at the install check. A disappeared
+    // candidate must fail here rather than selecting another executable.
+    let mut command = std::process::Command::new(program);
     command
         .args(&params.args)
         .env_clear()
@@ -2627,7 +2640,8 @@ fn launch_stdio(
             }),
         )?;
         Ok(())
-    })?;
+    })
+    .with_context(|| format!("Failed to run stdio executable {}", program.display()))?;
     let bound_name = db
         .get_process_binding(process_id)?
         .unwrap_or_else(|| instance_name.to_string());
@@ -5106,6 +5120,93 @@ mod tests {
             .unwrap();
         db.set_process_binding(process_id, session_id, name)
             .unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn stdio_spawn_attempts_the_validated_path_after_it_disappears() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let _env = EnvVarGuard::remove(["PATH", "HCOM_DIR", "HOME"]);
+        unsafe {
+            std::env::set_var("PATH", std::env::join_paths([&first, &second]).unwrap());
+            std::env::set_var("HCOM_DIR", root.path().join("room"));
+            std::env::set_var("HOME", root.path());
+        }
+
+        // Both stdio tools share the same executable identity guarantee.
+        for tool in ["claude", "codex"] {
+            let validated = first.join(tool);
+            let alternate = second.join(tool);
+            for candidate in [&validated, &alternate] {
+                fs::write(
+                    candidate,
+                    "#!/bin/sh\nprintf ran > \"$STDIO_TEST_MARKER\"\n",
+                )
+                .unwrap();
+                fs::set_permissions(candidate, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let params = LaunchParams {
+                tool: tool.into(),
+                stdio: true,
+                stdio_program: Some(resolve_stdio_program(tool).unwrap()),
+                cwd: Some(root.path().to_str().unwrap().into()),
+                ..Default::default()
+            };
+            assert_eq!(params.stdio_program.as_deref(), Some(validated.as_path()));
+            fs::remove_file(&validated).unwrap();
+            assert_eq!(find_tool_path(tool).as_deref(), alternate.to_str());
+
+            let marker = root.path().join(format!("{tool}-ran"));
+            let env =
+                HashMap::from([("STDIO_TEST_MARKER".into(), marker.to_str().unwrap().into())]);
+            let db = launcher_test_db();
+            stdio_launch_row(&db, "luna", "stdio-proc", "stdio-session");
+            let error = launch_stdio(
+                &db,
+                &params,
+                &env,
+                StdioLaunchIdentity {
+                    program: params.stdio_program.as_deref().unwrap(),
+                    instance_name: "luna",
+                    process_id: "stdio-proc",
+                    batch_id: "stdio-batch",
+                    launcher_name: "user",
+                    tag: "",
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotFound,
+                "{error:#}"
+            );
+            assert!(error.to_string().contains(validated.to_str().unwrap()));
+            assert!(!marker.exists(), "must not run the second PATH candidate");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn stdio_executable_resolution_fails_when_no_candidate_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = EnvVarGuard::remove(["PATH", "HOME"]);
+        unsafe {
+            std::env::set_var("PATH", root.path());
+            std::env::set_var("HOME", root.path());
+        }
+        let error = resolve_stdio_program("claude").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "'claude' is not installed or not in PATH"
+        );
     }
 
     fn wait_until(what: &str, mut done: impl FnMut() -> bool) {

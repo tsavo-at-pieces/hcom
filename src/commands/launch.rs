@@ -201,6 +201,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             initial_prompt,
             background,
             stdio: hcom_flags.stdio,
+            stdio_program: None,
             cwd: Some(if let Some(ref dir) = dir_override {
                 let path = std::path::Path::new(dir);
                 if !path.is_dir() {

@@ -799,6 +799,7 @@ fn handle_remote_launch(
         db,
         LaunchParams {
             stdio: false,
+            stdio_program: None,
             tool: request.tool.clone(),
             count: request.count,
             args: prepared.args,

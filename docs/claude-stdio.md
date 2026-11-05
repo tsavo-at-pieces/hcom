@@ -28,9 +28,11 @@ and stderr are inherited, and so is stdout for any other output format and
 for Codex.
 
 hcom prepares its usual per-launch hooks, reserves a fresh process identity,
-and remains the native child's parent. The child runs the executable a lookup
-like hcom's install check resolves, made absolute before the child changes to
-its working directory, with the launched environment minus a parent Claude's
+and remains the native child's parent. The child runs the executable the
+install check validated, retaining its pathname made absolute against hcom's
+current working directory at that check, before the child changes directory.
+If resolution fails or that pathname disappears before spawn, the launch fails.
+The child runs with the launched environment minus a parent Claude's
 instance state (`CLAUDE_CODE_CHILD_SESSION` and the messaging socket and token
 belong to that parent and would stop the new session's transcript). Its hooks
 name the canonical path of the hcom image that launched it, and its batch and
