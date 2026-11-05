@@ -173,6 +173,7 @@ fn identity(ctx: &LaunchCtx, version: &str, declarations: &[String]) -> Result<S
     }
 
     let manifest = std::env::var_os("HCOM_CODEX_CACHE_INPUTS").filter(|v| !v.is_empty());
+    let producer_contract = manifest.is_some();
     if let Some(path) = manifest {
         let path = PathBuf::from(path);
         anyhow::ensure!(path.is_absolute(), "launcher manifest must be absolute");
@@ -229,14 +230,20 @@ fn identity(ctx: &LaunchCtx, version: &str, declarations: &[String]) -> Result<S
             inputs.insert(format!("env.{name}"), value.to_string_lossy().into());
         }
     }
-    inputs.insert(
-        "cwd".into(),
-        fs::canonicalize(&ctx.cwd)?.to_string_lossy().into(),
-    );
-    inputs.insert(
-        "inspection.cwd".into(),
-        std::env::current_dir()?.to_string_lossy().into(),
-    );
+    let inspection_cwd = std::env::current_dir()?;
+    // Only a complete producer contract can prove equivalent trust and relative
+    // config dependencies across bundle locations. Unknown/path-bearing CLI
+    // overrides still retain cwd: their resolution is not inferred here.
+    if !producer_contract || !cwd_independent_overrides(&ctx.args) || relative_setup_selector() {
+        inputs.insert(
+            "cwd".into(),
+            fs::canonicalize(&ctx.cwd)?.to_string_lossy().into(),
+        );
+        inputs.insert(
+            "inspection.cwd".into(),
+            inspection_cwd.to_string_lossy().into(),
+        );
+    }
     // Configuration overrides are validation inputs; prompts and instance names
     // aren't. Keep original spelling/order, since later overrides win.
     inputs.insert(
@@ -244,10 +251,15 @@ fn identity(ctx: &LaunchCtx, version: &str, declarations: &[String]) -> Result<S
         serde_json::to_string(&config_overrides(&ctx.args))?,
     );
     config_dir(&mut inputs, "home", &per_run_home(ctx))?;
-    for (i, dir) in ctx.cwd.ancestors().enumerate() {
-        config_dir(&mut inputs, &format!("project.{i}"), &dir.join(".codex"))?;
+    if producer_contract {
+        project_inputs(&mut inputs, "launch", &ctx.cwd)?;
+        project_inputs(&mut inputs, "inspection", &inspection_cwd)?;
+    } else {
+        for (i, dir) in ctx.cwd.ancestors().enumerate() {
+            config_dir(&mut inputs, &format!("project.{i}"), &dir.join(".codex"))?;
+        }
+        config_input(&mut inputs, "cwd.config", &ctx.cwd.join("config.toml"))?;
     }
-    config_input(&mut inputs, "cwd.config", &ctx.cwd.join("config.toml"))?;
     #[cfg(unix)]
     config_dir(&mut inputs, "system", Path::new("/etc/codex"))?;
     #[cfg(windows)]
@@ -278,6 +290,113 @@ fn identity(ctx: &LaunchCtx, version: &str, declarations: &[String]) -> Result<S
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect())
+}
+
+/// Producer-backed inventory is keyed by existing config locations, not empty
+/// bundle names or their ancestry depth. Rescan on every lookup, including after
+/// locking/inspection, so creation/deletion also changes the inventory.
+fn project_inputs(inputs: &mut BTreeMap<String, String>, label: &str, cwd: &Path) -> Result<()> {
+    let cwd = fs::canonicalize(cwd)?;
+    for ancestor in cwd.ancestors() {
+        let dir = ancestor.join(".codex");
+        match fs::metadata(&dir) {
+            Ok(meta) => {
+                anyhow::ensure!(meta.is_dir(), "project config is not a directory");
+                let key = format!("{label}.project.{}", dir.display());
+                inputs.insert(
+                    format!("{key}.resolved"),
+                    fs::canonicalize(&dir)?.to_string_lossy().into(),
+                );
+                config_dir(inputs, &key, &dir)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let config = cwd.join("config.toml");
+    match fs::metadata(&config) {
+        Ok(_) => image_input(inputs, &format!("{label}.cwd.config"), &config)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+fn relative_setup_selector() -> bool {
+    [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "XDG_CONFIG_HOME",
+        "CODEX_CONFIG_PATH",
+    ]
+    .iter()
+    .any(|key| {
+        std::env::var_os(key).is_some_and(|value| {
+            if *key == "PATH" {
+                std::env::split_paths(&value).any(|p| !p.is_absolute())
+            } else {
+                !Path::new(&value).is_absolute()
+            }
+        })
+    })
+}
+
+/// A deliberately small allowlist. Unknown settings can acquire path semantics
+/// in Codex; preserve the raw cwd rather than guessing from a string's spelling.
+fn cwd_independent_overrides(args: &[String]) -> bool {
+    let selected = config_overrides(args);
+    let mut i = 0;
+    while i < selected.len() {
+        let flag = &selected[i];
+        let raw = if matches!(flag.as_str(), "-c" | "--config") {
+            i += 1;
+            selected.get(i).map(String::as_str)
+        } else {
+            flag.strip_prefix("--config=")
+                .or_else(|| flag.strip_prefix("-c="))
+                .or_else(|| flag.strip_prefix("-c"))
+        };
+        if let Some(raw) = raw {
+            let Ok((key, value)) = super::parse_override(raw) else {
+                return false;
+            };
+            let safe = match key.as_str() {
+                "model"
+                | "model_provider"
+                | "model_reasoning_effort"
+                | "model_reasoning_summary"
+                | "service_tier"
+                | "approval_policy"
+                | "sandbox_mode"
+                | "developer_instructions" => value.is_str(),
+                "projects" => value.as_table().is_some_and(|projects| {
+                    projects.iter().all(|(path, trust)| {
+                        Path::new(path).is_absolute()
+                            && trust.as_table().is_some_and(|table| {
+                                table.len() == 1
+                                    && table.get("trust_level").is_some_and(toml::Value::is_str)
+                            })
+                    })
+                }),
+                "features" => value
+                    .as_table()
+                    .is_some_and(|table| table.values().all(toml::Value::is_bool)),
+                _ if key.starts_with("features.") => value.is_bool(),
+                _ => false,
+            };
+            if !safe {
+                return false;
+            }
+        } else if matches!(flag.as_str(), "-c" | "--config") {
+            return false;
+        } else if matches!(flag.as_str(), "-p" | "--profile" | "--enable" | "--disable") {
+            // Values are names in source configuration, not cwd-relative paths.
+            i += 1;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn config_overrides(args: &[String]) -> Vec<String> {
@@ -660,6 +779,47 @@ mod tests {
             ])),
             args(&["--profile=x", "-cmodel='x'"])
         );
+    }
+
+    #[test]
+    fn relative_or_unknown_overrides_keep_cwd_identity() {
+        let absolute_project = if cfg!(windows) {
+            "projects={'C:/absolute/project'={trust_level='trusted'}}"
+        } else {
+            "projects={'/absolute/project'={trust_level='trusted'}}"
+        };
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for safe in [
+            vec![],
+            vec![
+                "-c",
+                "model_reasoning_effort='high'",
+                "-c",
+                "service_tier='fast'",
+            ],
+            vec!["--config=features.hooks=true"],
+            vec!["-c", absolute_project],
+            vec!["--profile", "named", "--enable", "hooks"],
+        ] {
+            assert!(cwd_independent_overrides(&args(&safe)), "{safe:?}");
+        }
+        for unsafe_args in [
+            vec!["-c", "model_instructions_file='relative.md'"],
+            vec!["--config", "unknown_option='relative'"],
+            vec!["-c", "projects={'relative'={trust_level='trusted'}}"],
+            vec![
+                "-c",
+                "hooks.Stop=[{hooks=[{type='command',command='./hook'}]}]",
+            ],
+            vec!["-c"],
+            vec!["-c", "not-toml"],
+            vec!["-c", "service_tier=7"],
+        ] {
+            assert!(
+                !cwd_independent_overrides(&args(&unsafe_args)),
+                "{unsafe_args:?}"
+            );
+        }
     }
 
     #[test]

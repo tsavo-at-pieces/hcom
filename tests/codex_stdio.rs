@@ -165,6 +165,16 @@ impl CacheFixture {
     }
 
     fn launch(&self, room: &str, manifest: bool) -> std::process::Output {
+        self.launch_at(room, manifest, None, &[])
+    }
+
+    fn launch_at(
+        &self,
+        room: &str,
+        manifest: bool,
+        cwd: Option<&std::path::Path>,
+        native_args: &[&str],
+    ) -> std::process::Output {
         let room = self.h.root_path().join(room);
         fs::create_dir_all(room.join(".tmp/flags")).unwrap();
         fs::write(room.join(".tmp/flags/update_check"), "").unwrap();
@@ -187,6 +197,9 @@ impl CacheFixture {
         if manifest {
             command.env("HCOM_CODEX_CACHE_INPUTS", &self.manifest);
         }
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         command
             .args([
                 "codex",
@@ -196,15 +209,26 @@ impl CacheFixture {
                 "--name",
                 "pezu",
                 "--",
-                "app-server",
             ])
+            .args(native_args)
+            .arg("app-server")
             .stdin(Stdio::null())
             .output()
             .unwrap()
     }
 
     fn launch_ok(&self, room: &str, manifest: bool) -> Value {
-        let output = self.launch(room, manifest);
+        self.launch_ok_at(room, manifest, None, &[])
+    }
+
+    fn launch_ok_at(
+        &self,
+        room: &str,
+        manifest: bool,
+        cwd: Option<&std::path::Path>,
+        native_args: &[&str],
+    ) -> Value {
+        let output = self.launch_at(room, manifest, cwd, native_args);
         assert_eq!(output.status.code(), Some(23), "{output:?}");
         assert_eq!(output.stderr, b"native diagnostic\n", "{output:?}");
         let record: Value =
@@ -312,6 +336,115 @@ fn codex_validation_cache_reuses_across_rooms_and_invalidates_inputs() {
         f.count(),
         6,
         "same-version wrapper change reused stale validation"
+    );
+}
+
+#[test]
+fn codex_validation_cache_reuses_empty_bundles_and_tracks_project_config() {
+    let f = CacheFixture::new();
+    let native_args = [
+        "-c",
+        "model_reasoning_effort='high'",
+        "-c",
+        "service_tier='fast'",
+    ];
+    let project = f.h.root_path().join("panel-bundles");
+    let bundles = [
+        "draft/one",
+        "ratify/retry/two",
+        "draft/three",
+        "ratify/four",
+    ]
+    .map(|name| project.join(name));
+    for bundle in &bundles {
+        fs::create_dir_all(bundle).unwrap();
+    }
+
+    // A panel changes both Popen's cwd and HCOM_DIR on every invocation.
+    // Empty intermediate directories, including their depth, aren't setup.
+    let first = f.launch_ok_at("bundle-room-a", true, Some(&bundles[0]), &native_args);
+    let second = f.launch_ok_at("bundle-room-b", true, Some(&bundles[1]), &native_args);
+    assert_eq!(
+        f.count(),
+        1,
+        "equivalent empty bundle cwds repeated hooks/list"
+    );
+    assert_eq!(
+        first["row"]["directory"],
+        bundles[0].canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        second["row"]["directory"],
+        bundles[1].canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_ne!(first["env"]["HCOM_DIR"], second["env"]["HCOM_DIR"]);
+
+    fs::create_dir(project.join(".codex")).unwrap();
+    let project_config = project.join(".codex/config.toml");
+    fs::write(&project_config, "model = 'project-one'\n").unwrap();
+    f.launch_ok_at(
+        "bundle-room-project-created",
+        true,
+        Some(&bundles[2]),
+        &native_args,
+    );
+    assert_eq!(
+        f.count(),
+        2,
+        "new ancestor project config reused stale validation"
+    );
+
+    fs::write(&project_config, "model = 'project-two'\n").unwrap();
+    f.launch_ok_at(
+        "bundle-room-project-changed",
+        true,
+        Some(&bundles[3]),
+        &native_args,
+    );
+    assert_eq!(
+        f.count(),
+        3,
+        "changed ancestor project config reused stale validation"
+    );
+
+    fs::create_dir(bundles[3].join(".codex")).unwrap();
+    fs::write(
+        bundles[3].join(".codex/config.toml"),
+        "model = 'bundle-local'\n",
+    )
+    .unwrap();
+    f.launch_ok_at(
+        "bundle-room-local-config",
+        true,
+        Some(&bundles[3]),
+        &native_args,
+    );
+    assert_eq!(
+        f.count(),
+        4,
+        "new bundle-local config reused stale validation"
+    );
+}
+
+#[test]
+fn codex_validation_cache_keeps_cwd_for_relative_config_overrides() {
+    let f = CacheFixture::new();
+    let bundles = ["relative-panel-a", "relative-panel-b"].map(|name| f.h.root_path().join(name));
+    for (index, bundle) in bundles.iter().enumerate() {
+        fs::create_dir(bundle).unwrap();
+        fs::write(
+            bundle.join("relative.md"),
+            format!("instructions for panel {index}\n"),
+        )
+        .unwrap();
+    }
+    let native_args = ["-c", "model_instructions_file='relative.md'"];
+    f.launch_ok_at("relative-room-a", true, Some(&bundles[0]), &native_args);
+    f.launch_ok_at("relative-room-b", true, Some(&bundles[1]), &native_args);
+    assert_eq!(
+        f.count(),
+        2,
+        "a relative config path shared validation across different working directories"
     );
 }
 
