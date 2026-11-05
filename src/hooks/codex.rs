@@ -7,8 +7,6 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(any(not(test), unix))]
 use std::process::Stdio;
-#[cfg(not(test))]
-use std::sync::OnceLock;
 #[cfg(any(not(test), unix))]
 use std::sync::mpsc;
 #[cfg(any(not(test), unix))]
@@ -35,6 +33,8 @@ use super::runtime::{self, LaunchCtx, LegacyFile, PerRunAdapter, RuntimeInjectio
 use anyhow::{Context as _, Result as AnyResult, bail};
 
 const HCOM_TRIGGER: &str = "<hcom>";
+
+mod cache;
 // `fork` is its own SessionStart source since Codex 0.155 (earlier releases
 // reported forks as `startup`); without it a forked session never binds hooks.
 //
@@ -273,22 +273,10 @@ fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
         .iter()
         .map(|(event, value)| format!("hooks.{event}={}", toml_literal(value)))
         .collect();
-    let declaration_bytes = serde_json::to_vec(&declarations)?;
     let version = codex_cli_version_output_for_hook_trust()
         .map_err(anyhow::Error::msg)
         .context("Cannot check Codex version for hook trust")?;
-    let cache_key = runtime::content_digest(&[
-        ("version", version.as_bytes()),
-        ("declarations", &declaration_bytes),
-    ]);
-    let cache = runtime::integrations_dir()
-        .join("codex")
-        .join("cache")
-        .join(format!("{cache_key}.json"));
-    let entries: Vec<CodexHookTrustEntry> = if cache.exists() {
-        serde_json::from_slice(&std::fs::read(&cache)?)
-            .with_context(|| format!("Invalid Codex trust cache {}", cache.display()))?
-    } else {
+    let entries = cache::load_or_fetch(ctx, &version, &declarations, &expected, || {
         let mut preflight = vec!["-c".to_string(), "features.hooks=true".to_string()];
         for declaration in &declarations {
             preflight.extend(["-c".to_string(), declaration.clone()]);
@@ -323,10 +311,8 @@ fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
                 CODEX_HOOK_COMMANDS.len()
             );
         }
-        std::fs::create_dir_all(cache.parent().unwrap())?;
-        paths::atomic_write_io(&cache, &serde_json::to_string(&owned)?)?;
-        owned
-    };
+        Ok(owned)
+    })?;
     for entry in entries {
         let mut trust = toml::map::Map::new();
         trust.insert(
@@ -1640,20 +1626,16 @@ fn codex_cli_version_output_for_hook_trust() -> Result<String, String> {
 
     #[cfg(not(test))]
     {
-        static CACHE: OnceLock<Result<String, String>> = OnceLock::new();
-        CACHE
-            .get_or_init(|| {
-                let output = crate::terminal::executable_command("codex")
-                    .arg("--version")
-                    .output()
-                    .map_err(|e| {
-                        format!("could not run codex --version for hook trust check: {e}")
-                    })?;
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                Ok(text.trim().to_string())
-            })
-            .clone()
+        let output = crate::terminal::executable_command("codex")
+            .arg("--version")
+            .output()
+            .map_err(|e| format!("could not run codex --version for hook trust check: {e}"))?;
+        if !output.status.success() {
+            return Err(format!("codex --version failed: {}", output.status));
+        }
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(text.trim().to_string())
     }
 
     #[cfg(test)]
