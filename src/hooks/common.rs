@@ -306,8 +306,24 @@ pub(crate) fn format_hook_messages_for_instance(
 /// Returns formatted text + ack token. Caller must call `commit_delivery_ack`
 /// after the output is successfully written (e.g. stdout flush).
 pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<PreparedDelivery> {
+    // Use one native-recipient snapshot for both the receipt and incarnation
+    // fence. A replacement during the unread lookup invalidates the batch.
+    let recipient = db.get_instance_full(instance_name).ok().flatten()?;
     let raw_messages = db.get_unread_messages(instance_name);
-    prepare_raw_messages(db, instance_name, raw_messages)
+    let current = db.get_instance_full(instance_name).ok().flatten()?;
+    if !same_delivery_recipient(&recipient, &current) {
+        return None;
+    }
+    prepare_raw_messages(db, &recipient, raw_messages)
+}
+
+fn same_delivery_recipient(before: &InstanceRow, after: &InstanceRow) -> bool {
+    before.created_at == after.created_at
+        && before.name == after.name
+        && before.tool == after.tool
+        && before.session_id == after.session_id
+        && before.parent_session_id == after.parent_session_id
+        && before.agent_id == after.agent_id
 }
 
 /// Commit a deferred delivery ack — advance cursor and set status.
@@ -315,14 +331,30 @@ pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
     // Forward-only: a delayed ack must not rewind a newer concurrent delivery.
     // Cursor and announcement move together so a partial ack can't re-announce.
     // A batch read from a row that stop + resume has since replaced is void.
-    match db.ack_hook_delivery(
-        &ack.instance_name,
-        ack.last_event_id,
-        ack.mark_announced,
-        ack.created_at,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
+    let committed = if let Some(receipt) = &ack.receipt {
+        db.ack_hook_delivery_progress(
+            &ack.instance_name,
+            ack.last_event_id,
+            ack.mark_announced,
+            ack.created_at,
+            &receipt.data["recipient"],
+        )
+    } else {
+        db.ack_hook_delivery(
+            &ack.instance_name,
+            ack.last_event_id,
+            ack.mark_announced,
+            ack.created_at,
+        )
+        .map(|valid| (valid, false))
+    };
+    match committed {
+        Ok((true, advanced)) => {
+            if advanced && let Some(receipt) = &ack.receipt {
+                crate::provenance::record(receipt);
+            }
+        }
+        Ok((false, _)) => {
             log::log_info(
                 "hooks",
                 "commit_delivery_ack.row_replaced",
@@ -330,7 +362,10 @@ pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
             );
             return;
         }
-        Err(e) => crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}")),
+        Err(e) => {
+            crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}"));
+            return;
+        }
     }
 
     lifecycle::set_status(
@@ -345,18 +380,101 @@ pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
     );
 }
 
+/// Add only explicit native identifiers, never inferred labels or prompt
+/// content. The recipient was resolved by the hook before preparing its ack.
+pub(crate) fn attach_delivery_native_ids(
+    ack: &mut super::DeliveryAck,
+    payload: &super::HookPayload,
+) {
+    let Some(receipt) = &mut ack.receipt else {
+        return;
+    };
+    let mut ids = serde_json::Map::new();
+    for key in [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+        "agent_id",
+        "agentId",
+        "message_id",
+        "messageId",
+        "messageID",
+        "question_id",
+        "questionId",
+        "questionID",
+        "prompt_id",
+        "promptId",
+        "turn_id",
+        "turnId",
+        "tool_use_id",
+        "toolUseId",
+    ] {
+        if let Some(value) = payload
+            .raw
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            ids.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+    // These identify the hook invocation, not the native message which will
+    // eventually contain this output. They must never be used as a signed
+    // exact-delivery match by an archive verifier.
+    receipt.data["native_context"] = Value::Object(ids);
+    receipt.data["hook_name"] = Value::String(payload.hook_name.clone());
+}
+
+/// Commit only after the caller successfully writes and flushes these exact
+/// stdout bytes. The batch digest and emitted-envelope digest have distinct
+/// scopes (the envelope can include bootstrap text and tool-specific JSON).
+pub(crate) fn commit_delivery_ack_output(db: &HcomDb, ack: &super::DeliveryAck, output: &[u8]) {
+    if ack.receipt.is_none() {
+        commit_delivery_ack(db, ack);
+        return;
+    }
+    let mut ack = ack.clone();
+    if let Some(receipt) = &mut ack.receipt {
+        receipt.data["emitted_stdout_hash"] = Value::String(crate::provenance::digest(output));
+        receipt.data["emitted_stdout_bytes"] = serde_json::json!(output.len());
+    }
+    commit_delivery_ack(db, &ack);
+}
+
+/// Attach the native payload to either hook result variant carrying delivery.
+pub(crate) fn attach_result_native_ids(
+    result: &mut super::HookResult,
+    payload: &super::HookPayload,
+) {
+    match result {
+        super::HookResult::Allow {
+            delivery_ack: Some(ack),
+            ..
+        }
+        | super::HookResult::Block {
+            delivery_ack: Some(ack),
+            ..
+        } => {
+            attach_delivery_native_ids(ack, payload);
+        }
+        _ => {}
+    }
+}
+
 /// Prepare raw messages into a PreparedDelivery without committing cursor/status.
 ///
 /// Cursor advance and status update are deferred to `commit_delivery_ack`.
 fn prepare_raw_messages(
     db: &HcomDb,
-    instance_name: &str,
+    recipient: &InstanceRow,
     raw_messages: Vec<Message>,
 ) -> Option<PreparedDelivery> {
     if raw_messages.is_empty() {
         return None;
     }
 
+    let instance_name = recipient.name.as_str();
     let messages: Vec<Value> = raw_messages.iter().map(message_to_value).collect();
     let deliver = limit_delivery_messages(&messages);
     let formatted = format_messages_json_for_instance(db, &deliver, instance_name);
@@ -376,20 +494,41 @@ fn prepare_raw_messages(
         .unwrap_or("")
         .to_string();
 
+    let receipt = crate::provenance::enabled().then(|| {
+        let mut receipt = crate::provenance::Receipt::new(
+            "delivery",
+            "hook",
+            formatted.as_bytes(),
+            crate::provenance::system_actor(),
+            serde_json::json!({
+                "name": recipient.name,
+                "provider": recipient.tool,
+                "nativeSessionId": recipient.session_id.as_ref().or(recipient.parent_session_id.as_ref()),
+                "agentId": recipient.agent_id,
+                "createdAt": recipient.created_at,
+            }),
+        );
+        receipt.data["event_ids"] = serde_json::json!(
+            deliver
+                .iter()
+                .filter_map(|m| m.get("event_id").and_then(Value::as_i64))
+                .collect::<Vec<_>>()
+        );
+        receipt.data["payload_scope"] = Value::String("formatted_message_batch".to_string());
+        receipt
+    });
+
     Some(PreparedDelivery {
         messages: deliver,
         formatted,
         ack: super::DeliveryAck {
             instance_name: instance_name.to_string(),
-            created_at: db
-                .get_instance_full(instance_name)
-                .ok()
-                .flatten()
-                .map(|row| row.created_at),
+            created_at: Some(recipient.created_at),
             last_event_id: last_id,
             status_context: format!("deliver:{}", sender_display),
             msg_ts,
             mark_announced: false,
+            receipt,
         },
     })
 }
@@ -400,10 +539,12 @@ fn prepare_raw_messages(
 /// Callers that need additional formatting can use the returned messages vec.
 ///
 pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>, Option<String>) {
-    let raw_messages = db.get_unread_messages(instance_name);
-    let Some(prepared) = prepare_raw_messages(db, instance_name, raw_messages) else {
+    let Some(mut prepared) = prepare_pending_messages(db, instance_name) else {
         return (vec![], None);
     };
+    // This legacy convenience API advances before its caller emits output.
+    // It cannot supply evidence of a successful output write.
+    prepared.ack.receipt = None;
     commit_delivery_ack(db, &prepared.ack);
     (prepared.messages, Some(prepared.formatted))
 }
@@ -505,7 +646,7 @@ fn poll_messages_inner(
     let result = poll_loop(
         db,
         instance_name,
-        instance_data.created_at,
+        &instance_data,
         timeout,
         start,
         is_background,
@@ -524,7 +665,7 @@ fn poll_messages_inner(
 fn poll_loop(
     db: &HcomDb,
     instance_name: &str,
-    created_at: f64,
+    recipient: &InstanceRow,
     timeout: Duration,
     start: Instant,
     is_background: bool,
@@ -549,7 +690,7 @@ fn poll_loop(
         let Some(instance_data) = db.get_instance_full(instance_name)? else {
             return Ok(empty());
         };
-        if instance_data.created_at != created_at {
+        if !same_delivery_recipient(recipient, &instance_data) {
             return Ok(empty());
         }
 
@@ -561,7 +702,7 @@ fn poll_loop(
                 return Ok(empty());
             }
 
-            if let Some(prepared) = prepare_raw_messages(db, instance_name, raw_messages) {
+            if let Some(prepared) = prepare_raw_messages(db, recipient, raw_messages) {
                 // Do NOT commit the ack here — the caller must only advance
                 // the cursor after `output` is actually flushed to stdout.
                 // Claude discards stdout JSON on exit 2, so this must be
@@ -1925,8 +2066,17 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let start = Instant::now();
         let timeout = Duration::from_millis(180);
-        let result =
-            poll_loop(&db, "polltest", 0.0, timeout, start, true, Some(&listener)).unwrap();
+        let recipient = db.get_instance_full("polltest").unwrap().unwrap();
+        let result = poll_loop(
+            &db,
+            "polltest",
+            &recipient,
+            timeout,
+            start,
+            true,
+            Some(&listener),
+        )
+        .unwrap();
         assert!(result.timed_out);
         assert!(start.elapsed() >= timeout);
         let writes: i64 = db
@@ -2315,6 +2465,208 @@ mod tests {
         let instance = db.get_instance_full("nova").unwrap().unwrap();
         assert_eq!(instance.status, ST_ACTIVE);
         assert!(instance.status_context.starts_with("deliver:"));
+    }
+
+    #[test]
+    #[serial]
+    fn provenance_delivery_only_records_successful_new_cursor_progress() {
+        let (dir, db) = make_test_db();
+        crate::paths::test_roots::register(dir.path());
+        let receipts = dir.path().join("receipts");
+        let _env = super::super::test_helpers::EnvVarGuard::set("HCOM_PROVENANCE_DIR", &receipts);
+        insert_test_instance(&db, "nova");
+        db.conn().execute(
+            "UPDATE instances SET session_id = 'native-session', agent_id = 'native-agent' WHERE name = 'nova'",
+            [],
+        ).unwrap();
+        insert_test_message(
+            &db,
+            "luna",
+            "bigboss",
+            "exact payload\n",
+            "2026-01-01T00:00:01Z",
+        );
+        let mut prepared = prepare_pending_messages(&db, "nova").unwrap();
+        assert!(prepared.ack.receipt.is_some());
+        let path = receipts.join("assertions.jsonl");
+        assert!(!path.exists(), "preparation is not delivery");
+        let payload = super::super::HookPayload::from_claude(serde_json::json!({
+            "session_id": "native-session", "agent_id": "native-agent",
+            "message_id": "trigger-message", "questionId": "trigger-question",
+            "prompt": "private prompt excluded from identifiers", "from": "bigboss",
+        }));
+        attach_delivery_native_ids(&mut prepared.ack, &payload);
+        let output = b"{\"hookSpecificOutput\":\"exact stdout\"}";
+        commit_delivery_ack_output(&db, &prepared.ack, output);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let record: Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(record["invokingActor"]["actor"], "system");
+        assert_eq!(record["recipient"]["nativeSessionId"], "native-session");
+        assert_eq!(record["recipient"]["agentId"], "native-agent");
+        assert_eq!(
+            record["contentHash"],
+            crate::provenance::digest(prepared.formatted.as_bytes())
+        );
+        assert_eq!(
+            record["emitted_stdout_hash"],
+            crate::provenance::digest(output)
+        );
+        assert_eq!(record["native_context"]["message_id"], "trigger-message");
+        assert_eq!(record["native_context"]["questionId"], "trigger-question");
+        assert!(record["native_context"].get("prompt").is_none());
+        assert!(record["native_context"].get("from").is_none());
+        assert_eq!(
+            record["event_ids"],
+            serde_json::json!([prepared.ack.last_event_id])
+        );
+
+        commit_delivery_ack_output(&db, &prepared.ack, output);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            contents,
+            "a duplicate ack is not another delivery"
+        );
+
+        insert_test_message(&db, "luna", "luna", "next", "2026-01-01T00:00:02Z");
+        let next = prepare_pending_messages(&db, "nova").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 1 WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        commit_delivery_ack_output(&db, &next.ack, output);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            contents,
+            "a replaced row cannot receive the old ack"
+        );
+
+        let next = prepare_pending_messages(&db, "nova").unwrap();
+        let blocker = HcomDb::open_raw(db.path()).unwrap();
+        db.conn().busy_timeout(Duration::ZERO).unwrap();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        commit_delivery_ack_output(&db, &next.ack, output);
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            contents,
+            "failed cursor writes are not delivery"
+        );
+        assert_eq!(db.get_unread_messages("nova").len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn provenance_delivery_is_disabled_without_configuration() {
+        let _env = super::super::test_helpers::EnvVarGuard::unset("HCOM_PROVENANCE_DIR");
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova");
+        insert_test_message(&db, "luna", "luna", "hello", "2026-01-01T00:00:01Z");
+        let prepared = prepare_pending_messages(&db, "nova").unwrap();
+        assert!(prepared.ack.receipt.is_none());
+        commit_delivery_ack_output(&db, &prepared.ack, b"output");
+        assert!(db.get_unread_messages("nova").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn provenance_recipient_snapshot_cannot_be_refreshed_into_a_replacement_ack() {
+        let (dir, db) = make_test_db();
+        crate::paths::test_roots::register(dir.path());
+        let receipts = dir.path().join("receipts");
+        let _env = super::super::test_helpers::EnvVarGuard::set("HCOM_PROVENANCE_DIR", &receipts);
+        insert_test_instance(&db, "nova");
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = 'original' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        insert_test_message(&db, "luna", "luna", "hello", "2026-01-01T00:00:01Z");
+        let original = db.get_instance_full("nova").unwrap().unwrap();
+        let messages = db.get_unread_messages("nova");
+
+        // A stop/resume in between the unread lookup and output formatting
+        // must not refresh the ack fence to the new recipient's incarnation.
+        db.conn().execute("UPDATE instances SET created_at = 1, session_id = 'replacement' WHERE name = 'nova'", []).unwrap();
+        let prepared = prepare_raw_messages(&db, &original, messages).unwrap();
+        assert_eq!(prepared.ack.created_at, Some(original.created_at));
+        assert_eq!(
+            prepared.ack.receipt.as_ref().unwrap().data["recipient"]["nativeSessionId"],
+            "original"
+        );
+        commit_delivery_ack_output(&db, &prepared.ack, b"output");
+        assert_eq!(db.get_unread_messages("nova").len(), 1);
+        assert!(!receipts.join("assertions.jsonl").exists());
+
+        // Polling also fences a native session switch within a live row.
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 0 WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        let result = poll_loop(
+            &db,
+            "nova",
+            &original,
+            Duration::from_secs(1),
+            Instant::now(),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(result.ack.is_none());
+        assert!(!result.delivered);
+        commit_delivery_ack_output(&db, &prepared.ack, b"output");
+        assert_eq!(
+            db.get_cursor("nova"),
+            0,
+            "same-row session switch invalidates the ack"
+        );
+        assert!(!receipts.join("assertions.jsonl").exists());
+
+        // Claude children use their parent's native session ID. Agent ID is
+        // part of the fence even while the session and incarnation stay fixed.
+        db.conn().execute(
+            "INSERT INTO instances (name, tool, session_id, created_at) VALUES ('parent', 'claude', 'original', 0)",
+            [],
+        ).unwrap();
+        db.conn().execute("UPDATE instances SET session_id = NULL, parent_session_id = 'original', agent_id = 'child-a' WHERE name = 'nova'", []).unwrap();
+        let child = prepare_pending_messages(&db, "nova").unwrap();
+        assert_eq!(
+            child.ack.receipt.as_ref().unwrap().data["recipient"]["nativeSessionId"],
+            "original"
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET agent_id = 'child-b' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        commit_delivery_ack_output(&db, &child.ack, b"output");
+        assert_eq!(
+            db.get_cursor("nova"),
+            0,
+            "native agent switch invalidates the ack"
+        );
+        assert!(!receipts.join("assertions.jsonl").exists());
+        db.conn()
+            .execute(
+                "UPDATE instances SET agent_id = 'child-a' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        commit_delivery_ack_output(&db, &child.ack, b"output");
+        assert_eq!(db.get_cursor("nova"), child.ack.last_event_id);
+        assert_eq!(
+            std::fs::read_to_string(receipts.join("assertions.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 
     #[test]

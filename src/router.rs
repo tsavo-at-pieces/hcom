@@ -39,6 +39,7 @@ const COMMANDS: &[&str] = &[
     "relay",
     "run",
     "update",
+    "receipt-sign",
 ];
 
 fn is_command(name: &str) -> bool {
@@ -694,7 +695,7 @@ pub fn dispatch() -> anyhow::Result<()> {
 
     // Check for updates on CLI commands (not hooks/pty/relay — those need to be fast/silent).
     // Skip for `hcom update` itself — it handles its own output.
-    let is_update_cmd = matches!(&action, Action::Command { cmd, .. } if cmd == "update");
+    let is_update_cmd = matches!(&action, Action::Command { cmd, .. } if matches!(cmd.as_str(), "update" | "receipt-sign"));
     if !is_update_cmd
         && matches!(
             action,
@@ -796,6 +797,7 @@ pub fn dispatch() -> anyhow::Result<()> {
                     | "relay"
                     | "run"
                     | "update"
+                    | "receipt-sign"
             ) =>
         {
             let exit_code = dispatch_native_command(cmd, args);
@@ -917,6 +919,12 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // "relay daemon" subcommand doesn't need DB or identity context
     if cmd == "relay" && cmd_argv.first().map(|s| s.as_str()) == Some("daemon") {
         return crate::commands::daemon::cmd_daemon(&cmd_argv[1..]);
+    }
+
+    // Native receipt adapters do not participate in message delivery. Avoid
+    // DB lifecycle side effects and keep their stdout exactly one JSON value.
+    if cmd == "receipt-sign" {
+        return crate::provenance::signing::cmd_receipt_sign(&cmd_argv);
     }
 
     // Open DB (includes schema migration/compat check)

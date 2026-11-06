@@ -899,6 +899,8 @@ fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload
         None => return hook_noop(),
     };
 
+    crate::provenance::native_prompt(db, &instance.name, payload);
+
     let prompt = payload
         .raw
         .get("prompt")
@@ -1057,7 +1059,7 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
                     && stdout.flush().is_ok()
                     && let Some(ack) = delivery_ack.as_ref()
                 {
-                    common::commit_delivery_ack(db, ack);
+                    common::commit_delivery_ack_output(db, ack, json.to_string().as_bytes());
                 }
             }
             0
@@ -1110,12 +1112,13 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     }
 
     let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
-    let result = common::dispatch_with_panic_guard("codex", hook_name, hook_noop(), || {
+    let mut result = common::dispatch_with_panic_guard("codex", hook_name, hook_noop(), || {
         get_codex_handler(hook_name)
             .map(|handler| handler(&db, &ctx, &payload))
             .unwrap_or_else(hook_noop)
     });
 
+    common::attach_result_native_ids(&mut result, &payload);
     let exit_code = dispatch_result_to_stdout(&db, hook_name, result);
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     log::log_info(

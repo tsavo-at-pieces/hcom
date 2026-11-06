@@ -238,6 +238,9 @@ pub struct DeliveryAck {
     /// activation delivery, so the one-shot bootstrap is only consumed once
     /// the message that carries it is confirmed written to stdout.
     pub mark_announced: bool,
+    /// Private opt-in evidence, emitted only after stdout succeeds and this
+    /// batch actually advances the original recipient's cursor.
+    pub receipt: Option<crate::provenance::Receipt>,
 }
 
 /// Normalized hook payload — unified across all tools.

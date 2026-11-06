@@ -1109,6 +1109,55 @@ impl HcomDb {
         Ok(changed > 0)
     }
 
+    /// As `ack_hook_delivery`, additionally report whether this call advanced
+    /// the cursor. The guarded UPDATE makes that fact atomic even when two
+    /// successful hook writes race. `(valid_row, advanced)` distinguishes an
+    /// already-acknowledged batch from a stop/resume replacement.
+    pub fn ack_hook_delivery_progress(
+        &self,
+        name: &str,
+        event_id: i64,
+        announce: bool,
+        created_at: Option<f64>,
+        recipient: &serde_json::Value,
+    ) -> Result<(bool, bool)> {
+        let provider = recipient
+            .get("provider")
+            .and_then(serde_json::Value::as_str);
+        let session = recipient
+            .get("nativeSessionId")
+            .and_then(serde_json::Value::as_str);
+        let agent = recipient.get("agentId").and_then(serde_json::Value::as_str);
+        let changed = self.conn.execute(
+            "UPDATE instances SET last_event_id = ?,
+             name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
+             WHERE name = ? AND (? IS NULL OR created_at = ?)
+             AND COALESCE(last_event_id, 0) < ? AND tool IS ?
+             AND COALESCE(NULLIF(session_id, ''), NULLIF(parent_session_id, '')) IS ?
+             AND NULLIF(agent_id, '') IS ?",
+            params![
+                event_id, announce, name, created_at, created_at, event_id, provider, session,
+                agent
+            ],
+        )?;
+        if changed > 0 {
+            return Ok((true, true));
+        }
+        // Preserve announcement behavior for a no-op batch while retaining
+        // the incarnation fence if stop/resume happened between statements.
+        let valid = self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?),
+             name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
+             WHERE name = ? AND (? IS NULL OR created_at = ?) AND tool IS ?
+             AND COALESCE(NULLIF(session_id, ''), NULLIF(parent_session_id, '')) IS ?
+             AND NULLIF(agent_id, '') IS ?",
+            params![
+                event_id, announce, name, created_at, created_at, provider, session, agent
+            ],
+        )?;
+        Ok((valid > 0, false))
+    }
+
     /// Update specific fields on an instance row.
     /// Uses a JSON Value map for flexible field specification.
     pub fn update_instance_fields(
@@ -1280,6 +1329,70 @@ mod tests {
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
     use crate::shared::time::now_epoch_i64;
     use rusqlite::params;
+
+    #[test]
+    fn provenance_cursor_progress_is_atomic_and_preserves_announcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.db");
+        let db = HcomDb::open_at(&path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, last_event_id) VALUES ('nova', 'claude', 1, 0)",
+                [],
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_raw(&path).unwrap();
+                    barrier.wait();
+                    db.ack_hook_delivery_progress(
+                        "nova",
+                        10,
+                        false,
+                        Some(1.0),
+                        &serde_json::json!({"provider": "claude"}),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(results.iter().all(|(valid, _)| *valid));
+        assert_eq!(results.iter().filter(|(_, advanced)| *advanced).count(), 1);
+        assert_eq!(
+            db.ack_hook_delivery_progress(
+                "nova",
+                5,
+                true,
+                Some(1.0),
+                &serde_json::json!({"provider": "claude"})
+            )
+            .unwrap(),
+            (true, false)
+        );
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 10);
+        assert_eq!(row.name_announced, 1);
+        assert_eq!(
+            db.ack_hook_delivery_progress(
+                "nova",
+                11,
+                false,
+                Some(2.0),
+                &serde_json::json!({"provider": "claude"})
+            )
+            .unwrap(),
+            (false, false)
+        );
+        assert_eq!(db.get_cursor("nova"), 10);
+    }
 
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
         // Use open_raw here: open_at would repair the table we deliberately dropped.

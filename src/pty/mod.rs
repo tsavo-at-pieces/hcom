@@ -13,6 +13,8 @@ mod console_input;
 #[cfg(unix)]
 mod forward;
 mod inject;
+#[cfg(any(unix, windows))]
+mod receipts;
 pub mod screen;
 #[cfg(any(unix, windows))]
 mod shared;
@@ -674,19 +676,25 @@ impl Proxy {
         let spawn_started = Instant::now();
         let slave_fd = pty.slave.as_raw_fd();
         let master_fd = pty.master.as_raw_fd();
+        let mut child_command = Command::new(command);
+        child_command.args(args).envs(
+            config
+                .env_vars
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        );
+        // Direct `hcom pty` launches bypass the launcher environment filter.
+        // Neither inherited nor explicitly forwarded signer configuration may
+        // become part of the agent child's environment.
+        for key in crate::provenance::signing::ENV_VARS {
+            child_command.env_remove(key);
+        }
 
         // SAFETY: pre_exec closure runs in the child process after fork() but before exec().
         // All operations are async-signal-safe (setsid, ioctl, dup2, close).
         // slave_fd and master_fd are i32 (Copy), captured by value before the OwnedFds are moved.
         let mut child = unsafe {
-            Command::new(command)
-                .args(args)
-                .envs(
-                    config
-                        .env_vars
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str())),
-                )
+            child_command
                 .pre_exec(move || {
                     // Create new session
                     if libc::setsid() == -1 {
@@ -828,6 +836,8 @@ impl Proxy {
         let output_writer = TerminalOutput::new(stdout_fd.as_fd())?;
         let mut terminal_output = PendingWrite::default();
         let mut child_input = ChildInput::default();
+        let injection_receipts =
+            receipts::InjectionReceipts::new(&self.config, Some(self.child.id()));
         let mut output_eof = false;
         let mut child_exited = false;
 
@@ -1112,8 +1122,9 @@ impl Proxy {
                 && let Some(revents) = poll_fds[idx].revents()
             {
                 if revents.contains(PollFlags::POLLOUT) {
-                    for origin in child_input.flush(&self.pty_master)? {
-                        match origin {
+                    for completion in child_input.flush(&self.pty_master)? {
+                        injection_receipts.completed(completion.receipt);
+                        match completion.origin {
                             InputOrigin::User => {
                                 if !matches!(self.config.target.name(), "cursor" | "codex") {
                                     self.screen.clear_approval();
@@ -1379,7 +1390,8 @@ impl Proxy {
                     {
                         inject::InjectResult::Inject(text) => {
                             if !child_exited {
-                                child_input.push(text.as_bytes(), Some(InputOrigin::Injected));
+                                let receipt = injection_receipts.prepare(text.as_bytes());
+                                child_input.push_injected(text.as_bytes(), receipt);
                             }
                         }
                         inject::InjectResult::Query(client) => match client.command {

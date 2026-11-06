@@ -139,12 +139,16 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         return 0;
     }
 
-    let (exit_code, stdout, delivery_ack, timing) = common::dispatch_with_panic_guard(
+    let (exit_code, stdout, mut delivery_ack, timing) = common::dispatch_with_panic_guard(
         "claude",
         hook_type,
         (0, String::new(), None, DispatchTiming::default()),
         || route_claude_hook(&db, &ctx, hook_type, &mut payload),
     );
+
+    if let Some(ack) = &mut delivery_ack {
+        common::attach_delivery_native_ids(ack, &payload);
+    }
 
     // Output result
     if !stdout.is_empty() {
@@ -178,7 +182,7 @@ fn write_hook_output(
     writer.write_all(stdout.as_bytes())?;
     writer.flush()?;
     if let Some(ack) = delivery_ack {
-        common::commit_delivery_ack(db, ack);
+        common::commit_delivery_ack_output(db, ack, stdout.as_bytes());
     }
     Ok(())
 }
@@ -2159,6 +2163,7 @@ fn handle_userpromptsubmit(
     updates: &serde_json::Map<String, Value>,
     instance_data: &InstanceRow,
 ) -> (i32, String, Option<DeliveryAck>) {
+    crate::provenance::native_prompt(db, instance_name, payload);
     let name_announced = instance_data.name_announced != 0;
     let mut contexts = Vec::new();
     let mut system_message = None;
@@ -4539,6 +4544,35 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(delivery_cursor(&db), 0);
         assert_eq!(db.get_unread_messages("nova").len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provenance_failed_output_or_flush_never_records_delivery() {
+        let (dir, db) = make_delivery_test_db();
+        crate::paths::test_roots::register(dir.path());
+        let receipts = dir.path().join("receipts");
+        let _env = crate::hooks::test_helpers::EnvVarGuard::set("HCOM_PROVENANCE_DIR", &receipts);
+        let (output, ack) = get_posttooluse_messages(&db, "nova").unwrap();
+        assert!(ack.receipt.is_some());
+        let stdout = serde_json::to_string(&output).unwrap();
+        assert!(write_hook_output(&db, &mut FailingWriter, &stdout, Some(&ack)).is_err());
+
+        struct FlushFailure;
+        impl std::io::Write for FlushFailure {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "flush failed",
+                ))
+            }
+        }
+        assert!(write_hook_output(&db, &mut FlushFailure, &stdout, Some(&ack)).is_err());
+        assert_eq!(delivery_cursor(&db), 0);
+        assert!(!receipts.join("assertions.jsonl").exists());
     }
 
     #[test]

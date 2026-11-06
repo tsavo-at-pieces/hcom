@@ -53,6 +53,29 @@ const FILTERS_HEADER: &[HelpEntry] = &[(
     "",
 )];
 
+const RECEIPT_SIGN_HELP: &[HelpEntry] = &[
+    (
+        "receipt-sign < complete-payload.json",
+        "Sign and persist a native adapter's completed occurrence assertion",
+    ),
+    (
+        "",
+        "Requires HCOM_PROVENANCE_DIR, HCOM_PROVENANCE_ISSUER and HCOM_PROVENANCE_KEY_FILE.",
+    ),
+    (
+        "",
+        "Reads a complete TeamRouter receipt payload from stdin; outputs the signed envelope.",
+    ),
+    (
+        "",
+        "Only agent/system with hcom/automation origins. Never owner claims.",
+    ),
+    (
+        "",
+        "The adapter must already know the exact native occurrence. See docs/receipt-signing.md.",
+    ),
+];
+
 const EVENTS_QUERY: &[HelpEntry] = &[
     (
         "",
@@ -1194,6 +1217,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "relay",
     "run",
     "update",
+    "receipt-sign",
     "claude",
     "gemini",
     "codex",
@@ -1401,6 +1425,7 @@ fn command_help_raw(name: &str) -> String {
         "update" => Some(&[UPDATE_HELP]),
         "hooks" => Some(HOOKS_PAGE),
         "term" => Some(TERM_PAGE),
+        "receipt-sign" => Some(&[RECEIPT_SIGN_HELP]),
         _ => SUBCOMMAND_HELP
             .iter()
             .find(|(topic, _)| *topic == name)

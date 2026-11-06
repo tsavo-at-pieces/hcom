@@ -395,6 +395,8 @@ brew uninstall hcom
 
 ## Contributing
 
+Optional private [transcript provenance receipts](docs/provenance.md) can support TeamRouter archives without changing messaging or terminal input. Collection and signing are off by default.
+
 Issues and PRs welcome. Build from source and dev setup: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License

@@ -544,7 +544,7 @@ pub fn dispatch_qoder_hook_native(hook_name: &str) -> i32 {
         return 0;
     }
     let payload = HookPayload::from_qoder(hook_type_for_command(hook_name), raw);
-    let (output, delivery_ack) =
+    let (output, mut delivery_ack) =
         common::dispatch_with_panic_guard("qoder", hook_name, (json!({}), None), || {
             route(&db, &ctx, hook_name, &payload)
         });
@@ -552,12 +552,15 @@ pub fn dispatch_qoder_hook_native(hook_name: &str) -> i32 {
     if output.as_object().is_some_and(|o| o.is_empty()) {
         return 0;
     }
+    if let Some(ack) = &mut delivery_ack {
+        common::attach_delivery_native_ids(ack, &payload);
+    }
     let mut stdout = std::io::stdout().lock();
     if serde_json::to_writer(&mut stdout, &output).is_ok()
         && stdout.flush().is_ok()
         && let Some(ack) = delivery_ack.as_ref()
     {
-        common::commit_delivery_ack(&db, ack);
+        common::commit_delivery_ack_output(&db, ack, output.to_string().as_bytes());
     }
     0
 }

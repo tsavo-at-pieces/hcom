@@ -132,6 +132,10 @@ impl Proxy {
         for (k, v) in &config.env_vars {
             cmd.env(k, v);
         }
+        // Also covers direct `hcom pty` calls that bypass launcher filtering.
+        for key in crate::provenance::signing::ENV_VARS {
+            cmd.env_remove(key);
+        }
         // Pin the ConPTY child's working directory. The Unix runner `.sh` does
         // `cd {cwd}` then `exec hcom`, so the openpty child inherits the launch
         // dir; the Windows runner `.ps1` uses `Set-Location` then invokes
@@ -957,6 +961,8 @@ impl Proxy {
         let target = self.config.target.clone();
         let screen_state = self.screen_state.clone();
         let current_status = self.current_status.clone();
+        let receipts =
+            super::receipts::InjectionReceipts::new(&self.config, self.child.process_id());
         let instance = self.config.instance_name.clone();
         let approval_clear_requested = self.approval_clear_requested.clone();
         let screen_snapshot = self.screen_snapshot.clone();
@@ -979,9 +985,13 @@ impl Proxy {
                     let completed = match inject_server.read_client(index) {
                         Ok(InjectResult::Inject(text)) => {
                             trace::bytes(Hop::Inject, text.as_bytes());
+                            let receipt = receipts.prepare(text.as_bytes());
                             if let Ok(mut w) = writer.lock() {
-                                let _ = w.write_all(text.as_bytes());
-                                let _ = w.flush();
+                                let written = w.write_all(text.as_bytes()).is_ok();
+                                let flushed = w.flush().is_ok();
+                                if written && flushed {
+                                    receipts.completed(receipt);
+                                }
                             }
                             // An injected answer reaches the PTY directly and
                             // bypasses the stdin handler. Publish the cleared

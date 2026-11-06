@@ -1325,7 +1325,16 @@ pub fn create_bash_script(
 
     // Unset tool markers and identity vars to prevent inheritance
     writeln!(f, "unset {}", tool_marker_vars().join(" "))?;
-    writeln!(f, "unset {}", HCOM_IDENTITY_VARS.join(" "))?;
+    writeln!(
+        f,
+        "unset {}",
+        HCOM_IDENTITY_VARS
+            .iter()
+            .chain(crate::provenance::signing::ENV_VARS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    )?;
     if let Some(tool) = tool_id.and_then(|id| id.parse::<crate::tool::Tool>().ok()) {
         let vars = tool.spec().instance_state_env;
         if !vars.is_empty() {
@@ -1505,6 +1514,7 @@ pub fn create_powershell_script(
     let scrub: Vec<String> = tool_marker_vars()
         .iter()
         .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(crate::provenance::signing::ENV_VARS.iter())
         .chain(instance_state_env.iter())
         .map(|v| format!("Env:{v}"))
         .collect();
@@ -1625,6 +1635,7 @@ where
     let strip: std::collections::HashSet<String> = tool_marker_vars()
         .iter()
         .chain(HCOM_IDENTITY_VARS)
+        .chain(crate::provenance::signing::ENV_VARS)
         .chain(TERMINAL_CONTEXT_VARS)
         .chain(TERMINAL_COLOR_OVERRIDE_VARS)
         .chain(&["HCOM_LAUNCHED_PRESET"])
@@ -3503,7 +3514,11 @@ mod tests {
         create_bash_script(&bash, &env, None, "true", true, Some("claude"), false).unwrap();
         let ps = tmp.path().join("launch.ps1");
         create_powershell_script(&ps, &env, None, "true", true, Some("claude"), false).unwrap();
-        for var in crate::integration_spec::CLAUDE.instance_state_env {
+        for var in crate::integration_spec::CLAUDE
+            .instance_state_env
+            .iter()
+            .chain(crate::provenance::signing::ENV_VARS)
+        {
             assert!(
                 std::fs::read_to_string(&bash)
                     .unwrap()

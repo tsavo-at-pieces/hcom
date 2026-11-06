@@ -269,6 +269,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn injection_decoding_preserves_legacy_bytes_at_receipt_boundary() {
+        assert_eq!(
+            InjectServer::process_inject_data("café\r\n".as_bytes()),
+            "café\r"
+        );
+        assert_eq!(InjectServer::process_inject_data(b"two\n\n"), "two\n");
+        assert_eq!(InjectServer::process_inject_data(b"\xe9\r"), "é\r");
+        assert_eq!(InjectServer::process_inject_data(b"\n"), "");
+    }
+
+    #[test]
     fn accept_returns_false_when_queue_is_empty() {
         let mut server = InjectServer::new().unwrap();
 

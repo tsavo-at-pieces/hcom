@@ -488,6 +488,18 @@ where
         }
     }
 
+    // An agent can collect unsigned assertions, but signing credentials belong
+    // to the native adapter. Do not reintroduce them through the env extras file.
+    env.retain(|key, _| {
+        !crate::provenance::signing::ENV_VARS.iter().any(|v| {
+            if cfg!(windows) {
+                key.eq_ignore_ascii_case(v)
+            } else {
+                key == v
+            }
+        })
+    });
+
     env
 }
 
@@ -525,6 +537,11 @@ fn run_here_env_strip_set() -> std::collections::HashSet<String> {
     // A new plugin host must claim ownership itself; an inherited marker would
     // make hcom's OpenCode/Kilo plugin stay inert in the process hcom launched.
     strip.insert(crate::hooks::runtime::PLUGIN_HOST_PID_ENV.to_string());
+    strip.extend(
+        crate::provenance::signing::ENV_VARS
+            .iter()
+            .map(|v| (*v).to_string()),
+    );
 
     strip
 }
@@ -1010,6 +1027,7 @@ fn create_runner_script_windows(
         tool_marker_vars()
             .iter()
             .chain(HCOM_IDENTITY_VARS.iter())
+            .chain(crate::provenance::signing::ENV_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
             .copied()
@@ -1044,6 +1062,7 @@ fn create_runner_script_windows(
     let unset_names: Vec<String> = tool_marker_vars()
         .iter()
         .chain(HCOM_IDENTITY_VARS.iter())
+        .chain(crate::provenance::signing::ENV_VARS.iter())
         .chain(instance_state_env.iter())
         .map(|v| format!("Env:{v}"))
         .collect();
@@ -1233,6 +1252,7 @@ pub fn create_runner_script(
         tool_marker_vars()
             .iter()
             .chain(HCOM_IDENTITY_VARS.iter())
+            .chain(crate::provenance::signing::ENV_VARS.iter())
             .chain(instance_state_env.iter())
             .chain(crate::terminal::TERMINAL_COLOR_VARS.iter())
             .copied()
@@ -1326,7 +1346,12 @@ pub fn create_runner_script(
         native_bin_str,
         crate::tools::args_common::shell_quote(cwd),
         tool_marker_vars().join(" "),
-        HCOM_IDENTITY_VARS.join(" "),
+        HCOM_IDENTITY_VARS
+            .iter()
+            .chain(crate::provenance::signing::ENV_VARS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" "),
         instance_state_env.join(" "),
         env_block,
         sensitive_env_source,
@@ -3961,6 +3986,10 @@ mod tests {
         // HCOM identity
         assert!(strip.contains("HCOM_PROCESS_ID"));
         assert!(strip.contains("HCOM_LAUNCHED"));
+        for var in crate::provenance::signing::ENV_VARS {
+            assert!(strip.contains(*var));
+            assert!(run_here_env_strip_set().contains(*var));
+        }
         // Tool markers
         assert!(strip.contains("CLAUDECODE"));
         assert!(strip.contains("CLAUDE_ENV_FILE"));
@@ -4196,6 +4225,37 @@ mod tests {
 
         assert_eq!(env.get("NO_COLOR").map(String::as_str), Some("1"));
         assert!(!env.contains_key("HCOM_PROCESS_ID"));
+    }
+
+    #[test]
+    #[serial]
+    fn receipt_signing_configuration_never_enters_child_environment() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let _key = EnvVarGuard::set("HCOM_PROVENANCE_KEY_FILE", "/adapter/private-key.pem");
+        let _issuer = EnvVarGuard::set("HCOM_PROVENANCE_ISSUER", "adapter-issuer");
+        let _sink = EnvVarGuard::set("HCOM_PROVENANCE_DIR", "/adapter/assertions");
+        std::fs::write(
+            hcom_dir.join("env"),
+            "HCOM_PROVENANCE_KEY_FILE=/extras/key.pem\nHCOM_PROVENANCE_ISSUER=extras-issuer\n",
+        )
+        .unwrap();
+        let config = crate::config::HcomConfig::default();
+        for regime in [
+            LaunchEnvRegime::HumanShell,
+            LaunchEnvRegime::RunHere,
+            LaunchEnvRegime::ContaminatedParent,
+        ] {
+            let child = build_launch_env_with_resolver(&config, regime, || {
+                Some(std::env::vars().collect())
+            });
+            for var in crate::provenance::signing::ENV_VARS {
+                assert!(!child.contains_key(*var));
+            }
+            assert_eq!(
+                child.get("HCOM_PROVENANCE_DIR").map(String::as_str),
+                Some("/adapter/assertions")
+            );
+        }
     }
 
     #[test]

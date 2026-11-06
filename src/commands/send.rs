@@ -393,6 +393,17 @@ pub fn send_message(
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
 ) -> Result<(i64, Vec<String>), String> {
+    send_message_with_actor(db, identity, message, envelope, explicit_targets, None)
+}
+
+fn send_message_with_actor(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    message: &str,
+    envelope: Option<&MessageEnvelope>,
+    explicit_targets: Option<&[String]>,
+    invoking_actor: Option<serde_json::Value>,
+) -> Result<(i64, Vec<String>), String> {
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
@@ -458,6 +469,29 @@ pub fn send_message(
     let event_id = db
         .log_event("message", &routing_instance, &data)
         .map_err(|e| format!("Failed to write message to database: {e}"))?;
+
+    // Private local evidence only: no additional event or relay wire fields.
+    // The external --from label is independent from the invoking native actor.
+    if crate::provenance::enabled() {
+        let actor = invoking_actor.unwrap_or_else(|| crate::provenance::sender_actor(identity));
+        let mut receipt = crate::provenance::Receipt::new(
+            "submission",
+            "hcom_event",
+            message.as_bytes(),
+            actor,
+            serde_json::Value::Null,
+        );
+        receipt.data["event_id"] = serde_json::json!(event_id);
+        receipt.data["displayFrom"] = serde_json::json!(identity.name);
+        receipt.data["recipients"] = serde_json::Value::Array(
+            delivery
+                .delivered_to
+                .iter()
+                .map(|name| crate::provenance::recipient(db, name))
+                .collect(),
+        );
+        crate::provenance::record(&receipt);
+    }
 
     // Auto-create request-watch subscriptions for targeted requests
     if let Some(env) = envelope {
@@ -1111,12 +1145,15 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         || envelope.thread.is_some()
         || envelope.bundle_id.is_some();
 
-    let (event_id, delivered_to) = match send_message(
+    let invoking_actor =
+        crate::provenance::enabled().then(|| crate::provenance::invoking_actor(db, ctx));
+    let (event_id, delivered_to) = match send_message_with_actor(
         db,
         &sender_identity,
         &message,
         if has_envelope { Some(&envelope) } else { None },
         targets_to_pass,
+        invoking_actor,
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -1550,6 +1587,67 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    #[serial]
+    fn provenance_submission_preserves_actor_without_changing_wire() {
+        let (db, path, _env) = setup_test_db();
+        let temp = tempfile::tempdir().unwrap();
+        crate::paths::test_roots::register(temp.path());
+        let sink = temp.path().join("receipts");
+        let _receipts = crate::hooks::test_helpers::EnvVarGuard::set("HCOM_PROVENANCE_DIR", &sink);
+        db.conn().execute("INSERT INTO instances (name, session_id, tool, created_at) VALUES ('luna', 'native-recipient', 'codex', 1)", []).unwrap();
+        let display = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let actor = serde_json::json!({"actor":"agent", "name":"bali", "nativeSessionId":"native-invoker", "agentId":"child-id"});
+        let payload = "exact UTF-8 café\n";
+        let (event_id, _) = send_message_with_actor(
+            &db,
+            &display,
+            payload,
+            None,
+            Some(&["luna".into()]),
+            Some(actor.clone()),
+        )
+        .unwrap();
+        let data: String = db
+            .conn()
+            .query_row("SELECT data FROM events WHERE id = ?", [event_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(wire["from"], "bigboss");
+        assert_eq!(wire["sender_kind"], "external");
+        assert!(wire.get("invokingActor").is_none());
+        let records = std::fs::read_to_string(sink.join("assertions.jsonl")).unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_str(records.lines().next().unwrap()).unwrap();
+        assert_eq!(receipt["invokingActor"], actor);
+        assert_eq!(receipt["displayFrom"], "bigboss");
+        assert_eq!(
+            receipt["contentHash"],
+            crate::provenance::digest(payload.as_bytes())
+        );
+        assert_eq!(
+            receipt["recipients"][0]["nativeSessionId"],
+            "native-recipient"
+        );
+        assert!(!sink.join("receipts.jsonl").exists());
+        assert!(send_message_with_actor(&db, &display, "", None, None, Some(actor)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(sink.join("assertions.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        cleanup_test_db(path);
     }
 
     #[test]

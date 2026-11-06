@@ -655,7 +655,7 @@ pub fn dispatch_cursor_hook_native(hook_name: &str) -> i32 {
     // blocks the user's prompt on beforeSubmitPrompt. The extra key is ignored by
     // every other cursor hook (sessionStart accepts it explicitly; stop/sessionEnd/
     // postToolUse/pretooluse ignore unknown output fields), so one fallback is safe.
-    let (output, delivery_ack) = common::dispatch_with_panic_guard(
+    let (output, mut delivery_ack) = common::dispatch_with_panic_guard(
         "cursor",
         hook_name,
         (json!({ "continue": true }), None),
@@ -669,12 +669,15 @@ pub fn dispatch_cursor_hook_native(hook_name: &str) -> i32 {
             _ => (json!({}), None),
         },
     );
+    if let Some(ack) = &mut delivery_ack {
+        common::attach_delivery_native_ids(ack, &payload);
+    }
     let mut stdout = std::io::stdout().lock();
     if serde_json::to_writer(&mut stdout, &output).is_ok()
         && stdout.flush().is_ok()
         && let Some(ack) = delivery_ack.as_ref()
     {
-        common::commit_delivery_ack(&db, ack);
+        common::commit_delivery_ack_output(&db, ack, output.to_string().as_bytes());
     }
     0
 }

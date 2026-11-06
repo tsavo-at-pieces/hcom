@@ -976,6 +976,9 @@ fn ack_ext_delivery(db: &HcomDb, name: &str, prompt: &str) -> bool {
             status_context: inflight.status_context,
             msg_ts: inflight.msg_ts,
             mark_announced: false,
+            // The persisted extension batch predates an exact incarnation
+            // receipt token; preserve its existing acknowledgement contract.
+            receipt: None,
         },
     );
     log::log_info(
@@ -1050,7 +1053,7 @@ pub fn dispatch_copilot_hook_native(hook_name: &str) -> i32 {
         return 0;
     }
     let payload = HookPayload::from_copilot_native(hook_type_for_command(hook_name), raw);
-    let (output, delivery_ack) =
+    let (output, mut delivery_ack) =
         common::dispatch_with_panic_guard("copilot", hook_name, (json!({}), None), || {
             match hook_name {
                 "copilot-sessionstart" => (handle_sessionstart(&db, &ctx, &payload), None),
@@ -1073,12 +1076,15 @@ pub fn dispatch_copilot_hook_native(hook_name: &str) -> i32 {
                 _ => (json!({}), None),
             }
         });
+    if let Some(ack) = &mut delivery_ack {
+        common::attach_delivery_native_ids(ack, &payload);
+    }
     let mut stdout = std::io::stdout().lock();
     if serde_json::to_writer(&mut stdout, &output).is_ok()
         && stdout.flush().is_ok()
         && let Some(ack) = delivery_ack.as_ref()
     {
-        common::commit_delivery_ack(&db, ack);
+        common::commit_delivery_ack_output(&db, ack, output.to_string().as_bytes());
     }
     0
 }

@@ -61,6 +61,13 @@ pub(super) enum InputOrigin {
 pub(super) struct ChildInput {
     pending: PendingWrite,
     completions: VecDeque<(u64, InputOrigin)>,
+    receipts: VecDeque<(u64, crate::provenance::Receipt)>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct InputCompletion {
+    pub origin: InputOrigin,
+    pub receipt: Option<crate::provenance::Receipt>,
 }
 
 impl ChildInput {
@@ -77,7 +84,24 @@ impl ChildInput {
                 .push_back((self.pending.written + self.len() as u64, origin));
         }
     }
-    pub fn flush<F: AsFd>(&mut self, fd: &F) -> Result<Vec<InputOrigin>> {
+    pub fn push_injected(&mut self, bytes: &[u8], receipt: Option<crate::provenance::Receipt>) {
+        self.push(bytes, Some(InputOrigin::Injected));
+        if !bytes.is_empty()
+            && let Some(receipt) = receipt
+        {
+            if self.receipts.len() < 64 {
+                self.receipts
+                    .push_back((self.pending.written + self.len() as u64, receipt));
+            } else {
+                crate::log::log_warn(
+                    "provenance",
+                    "pty.pending",
+                    "PTY receipt dropped: pending write metadata queue full",
+                );
+            }
+        }
+    }
+    pub fn flush<F: AsFd>(&mut self, fd: &F) -> Result<Vec<InputCompletion>> {
         self.pending.flush(fd)?;
         let mut completed = Vec::new();
         while self
@@ -85,7 +109,17 @@ impl ChildInput {
             .front()
             .is_some_and(|(end, _)| *end <= self.pending.written)
         {
-            completed.push(self.completions.pop_front().unwrap().1);
+            let (end, origin) = self.completions.pop_front().unwrap();
+            let receipt = if self
+                .receipts
+                .front()
+                .is_some_and(|(receipt_end, _)| *receipt_end == end)
+            {
+                self.receipts.pop_front().map(|(_, receipt)| receipt)
+            } else {
+                None
+            };
+            completed.push(InputCompletion { origin, receipt });
         }
         Ok(completed)
     }
@@ -210,7 +244,80 @@ mod tests {
             while reader.read(&mut buf).is_ok_and(|n| n > 0) {}
             completed.extend(input.flush(&writer).unwrap());
         }
-        assert_eq!(completed, [InputOrigin::Injected, InputOrigin::User]);
+        assert_eq!(
+            completed.iter().map(|c| c.origin).collect::<Vec<_>>(),
+            [InputOrigin::Injected, InputOrigin::User]
+        );
+        assert!(completed.iter().all(|c| c.receipt.is_none()));
+    }
+
+    #[test]
+    fn injection_receipt_waits_for_full_write_and_never_attaches_to_user_input() {
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let bytes = vec![b'x'; QUEUE_LIMIT];
+        let receipt = crate::provenance::Receipt::new(
+            "delivery",
+            "pty_write",
+            &bytes,
+            crate::provenance::system_actor(),
+            serde_json::json!({"name": "luna"}),
+        );
+        let mut input = ChildInput::default();
+        input.push_injected(&bytes, Some(receipt.clone()));
+        assert!(input.flush(&writer).unwrap().is_empty());
+        input.push(b"human input", Some(InputOrigin::User));
+        // An empty decoded injection must not steal the prior completion.
+        input.push_injected(b"", Some(receipt.clone()));
+        let mut completed = Vec::new();
+        let mut buf = [0u8; 65536];
+        while !input.is_empty() {
+            while reader.read(&mut buf).is_ok_and(|n| n > 0) {}
+            completed.extend(input.flush(&writer).unwrap());
+        }
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].receipt, Some(receipt));
+        assert_eq!(completed[0].origin, InputOrigin::Injected);
+        assert_eq!(completed[1].origin, InputOrigin::User);
+        assert!(completed[1].receipt.is_none());
+    }
+
+    #[test]
+    fn failed_pty_write_does_not_complete_receipt() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        drop(reader);
+        let mut input = ChildInput::default();
+        input.push_injected(
+            b"text",
+            Some(crate::provenance::Receipt::new(
+                "delivery",
+                "pty_write",
+                b"text",
+                crate::provenance::system_actor(),
+                serde_json::json!({"name": "luna"}),
+            )),
+        );
+        assert!(input.flush(&writer).is_err());
+        assert_eq!(input.completions.len(), 1);
+    }
+
+    #[test]
+    fn injection_receipt_metadata_is_bounded_without_dropping_input() {
+        let mut input = ChildInput::default();
+        let receipt = crate::provenance::Receipt::new(
+            "delivery",
+            "pty_write",
+            b"x",
+            crate::provenance::system_actor(),
+            serde_json::json!({"name": "luna"}),
+        );
+        for _ in 0..65 {
+            input.push_injected(b"x", Some(receipt.clone()));
+        }
+        assert_eq!(input.receipts.len(), 64);
+        assert_eq!(input.completions.len(), 65);
+        assert_eq!(input.len(), 65);
     }
 
     #[test]

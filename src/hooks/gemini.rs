@@ -332,6 +332,7 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
     };
 
     let instance_name = &instance.name;
+    crate::provenance::native_prompt(db, instance_name, payload);
 
     // Keep directory current — but for agy, prefer workspacePaths over the
     // hook subprocess cwd (which is agy's internal config dir, not the project).
@@ -788,7 +789,7 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
 
     // Execute handler
     let handler_start = Instant::now();
-    let result = common::dispatch_with_panic_guard(
+    let mut result = common::dispatch_with_panic_guard(
         "gemini",
         hook_name,
         HookResult::Allow {
@@ -815,6 +816,8 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         ),
     );
 
+    common::attach_result_native_ids(&mut result, &payload);
+
     // Output result JSON to stdout
     let exit_code = result.exit_code();
     let output_json = serialize_hook_result(&payload.tool, hook_name, &result);
@@ -827,7 +830,7 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
                 ..
             } = &result
         {
-            common::commit_delivery_ack(&db, ack);
+            common::commit_delivery_ack_output(&db, ack, json.to_string().as_bytes());
         }
     }
 

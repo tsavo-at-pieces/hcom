@@ -1425,9 +1425,18 @@ pub(super) fn run(
             && in_flight.is_none()
             && Instant::now() >= requeue_at
             && !matches!(current_status.as_str(), "stopped" | "inactive")
-            && let Some(prepared) = common::prepare_pending_messages(db, current_name)
+            && let Some(mut prepared) = common::prepare_pending_messages(db, current_name)
         {
             let prompt_id = format!("{HCOM_PROMPT_ID_PREFIX}{}", uuid::Uuid::new_v4());
+            if let Some(receipt) = &mut prepared.ack.receipt {
+                receipt.data["transport"] = json!("native_acp");
+                // Queue IDs are operational observations, not an archive
+                // transcript occurrence ID or a signed delivery assertion.
+                receipt.data["native_context"] = json!({
+                    "sessionId": &session,
+                    "promptId": &prompt_id,
+                });
+            }
             match conn.send(
                 "session/prompt",
                 json!({
@@ -1498,6 +1507,7 @@ mod tests {
                 status_context: "deliver:luna".into(),
                 msg_ts: String::new(),
                 mark_announced: false,
+                receipt: None,
             },
             removed_at: removed.then(Instant::now),
             detached_at: None,

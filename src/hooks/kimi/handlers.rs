@@ -1,4 +1,4 @@
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -154,6 +154,7 @@ fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload
     };
     let instance_name = &instance.name;
     update_position(db, ctx, payload, instance_name);
+    crate::provenance::native_prompt(db, instance_name, payload);
 
     // Bootstrap is delivered here, NOT at SessionStart: kimi only injects
     // UserPromptSubmit hook output into model context — SessionStart output is
@@ -467,7 +468,7 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
         }
     };
 
-    let result = common::dispatch_with_panic_guard(
+    let mut result = common::dispatch_with_panic_guard(
         "kimi",
         hook_name,
         HookResult::Allow {
@@ -477,6 +478,8 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
         },
         || handler(&db, &ctx, &payload),
     );
+
+    common::attach_result_native_ids(&mut result, &payload);
 
     let exit_code = match &result {
         HookResult::Allow { .. } => 0,
@@ -498,9 +501,12 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
                     "message": ctx,
                 }
             });
-            println!("{}", output);
-            if let Some(ack) = delivery_ack {
-                common::commit_delivery_ack(&db, &ack);
+            let mut stdout = std::io::stdout().lock();
+            if writeln!(stdout, "{output}").is_ok()
+                && stdout.flush().is_ok()
+                && let Some(ack) = delivery_ack
+            {
+                common::commit_delivery_ack_output(&db, &ack, format!("{output}\n").as_bytes());
             }
         }
         HookResult::Block {
@@ -514,9 +520,12 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
                 }
             });
             eprintln!("{}", reason);
-            println!("{}", output);
-            if let Some(ack) = delivery_ack {
-                common::commit_delivery_ack(&db, &ack);
+            let mut stdout = std::io::stdout().lock();
+            if writeln!(stdout, "{output}").is_ok()
+                && stdout.flush().is_ok()
+                && let Some(ack) = delivery_ack
+            {
+                common::commit_delivery_ack_output(&db, &ack, format!("{output}\n").as_bytes());
             }
         }
         _ => {}

@@ -97,16 +97,56 @@ pub fn inject_text_remote_result(
     text: &str,
     enter: bool,
 ) -> Result<String, String> {
+    inject_text_with_actor(db, name, text, enter, None)
+}
+
+fn inject_text_with_actor(
+    db: &HcomDb,
+    name: &str,
+    text: &str,
+    enter: bool,
+    ctx: Option<&CommandContext>,
+) -> Result<String, String> {
+    let provenance = crate::provenance::enabled().then(|| {
+        (
+            crate::provenance::invoking_actor(db, ctx),
+            crate::provenance::recipient(db, name),
+        )
+    });
+    inject_text_with_receipts(db, name, text, enter, |bytes| {
+        if let Some((actor, recipient)) = &provenance {
+            crate::provenance::record(&crate::provenance::Receipt::new(
+                "submission",
+                "pty_tcp",
+                bytes,
+                actor.clone(),
+                recipient.clone(),
+            ));
+        }
+    })
+}
+
+/// A successful socket write proves submission only. The PTY proxy separately
+/// records completed writes; the legacy raw TCP protocol carries no receipt ID.
+fn inject_text_with_receipts(
+    db: &HcomDb,
+    name: &str,
+    text: &str,
+    enter: bool,
+    mut submitted: impl FnMut(&[u8]),
+) -> Result<String, String> {
     let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
 
     if !text.is_empty() {
         inject_raw(port, text.as_bytes())?;
+        submitted(text.as_bytes());
     }
     if enter {
         if !text.is_empty() {
             wait_for_text_rendered(port, text);
         }
         inject_raw(port, b"\r")?;
+        submitted(b"\r");
     }
 
     let label = match (text.is_empty(), enter) {
@@ -138,8 +178,14 @@ fn wait_for_text_rendered(port: i32, text: &str) {
 }
 
 /// Inject text into PTY via inject port (CLI wrapper).
-fn inject_text(db: &HcomDb, name: &str, text: &str, enter: bool) -> i32 {
-    match inject_text_remote_result(db, name, text, enter) {
+fn inject_text(
+    db: &HcomDb,
+    name: &str,
+    text: &str,
+    enter: bool,
+    ctx: Option<&CommandContext>,
+) -> i32 {
+    match inject_text_with_actor(db, name, text, enter, ctx) {
         Ok(msg) => {
             println!("{msg}");
             0
@@ -385,7 +431,7 @@ fn handle_screen(db: &HcomDb, argv: &[String]) -> i32 {
     }
 }
 
-pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> i32 {
+pub fn cmd_term(db: &HcomDb, args: &TermArgs, ctx: Option<&CommandContext>) -> i32 {
     let argv = &args.args;
     let sub = argv.first().map(|s| s.as_str());
 
@@ -429,7 +475,7 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
                 "Remote term inject completed",
             );
         }
-        return inject_text(db, &name, &text, enter);
+        return inject_text(db, &name, &text, enter, ctx);
     }
 
     if sub == Some("debug") {
@@ -556,6 +602,67 @@ mod tests {
 
         assert_eq!(result, "Injected 6 chars to luna");
         assert_eq!(received, "status");
+    }
+
+    #[test]
+    fn injection_submissions_preserve_exact_wire_bytes_and_enter_order() {
+        let db = test_db();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES ('luna', 'inject', ?1, 0)",
+                [port],
+            )
+            .unwrap();
+        let payload = "café\n";
+        let server = thread::spawn(move || {
+            let mut received = Vec::new();
+            while received.len() < 2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).unwrap();
+                if bytes == b"\0SCREEN\n" {
+                    stream
+                        .write_all(
+                            serde_json::json!({"input_text": payload})
+                                .to_string()
+                                .as_bytes(),
+                        )
+                        .unwrap();
+                } else {
+                    received.push(bytes);
+                }
+            }
+            received
+        });
+        let mut submissions = Vec::new();
+        inject_text_with_receipts(&db, "luna", payload, true, |bytes| {
+            submissions.push(bytes.to_vec());
+        })
+        .unwrap();
+        assert_eq!(submissions, [payload.as_bytes(), b"\r"].map(Vec::from));
+        assert_eq!(server.join().unwrap(), submissions);
+    }
+
+    #[test]
+    fn failed_injection_has_no_submission_receipt() {
+        let db = test_db();
+        // Port 0 cannot be a listening TCP endpoint.
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES ('luna', 'inject', 0, 0)",
+                [],
+            )
+            .unwrap();
+        let mut submissions = Vec::new();
+        assert!(
+            inject_text_with_receipts(&db, "luna", "text", false, |bytes| {
+                submissions.push(bytes.to_vec());
+            })
+            .is_err()
+        );
+        assert!(submissions.is_empty());
     }
 
     #[test]
